@@ -1,0 +1,115 @@
+# ==============================================================================
+# Python Cache and Bytecode
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ==============================================================================
+# System Files (macOS / Windows / Linux)
+# ==============================================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# ==============================================================================
+# Virtual Environments & Packages
+# ==============================================================================
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+ai_env/
+conda-env/
+
+# ==============================================================================
+# IDEs / Editors
+# ==============================================================================
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.ipynb_checkpoints/
+.jupyter/
+.cursorrules
+
+# ==============================================================================
+# Deep Learning / Model Checkpoints / Weights
+# ==============================================================================
+# Ignore all raw model files, checkpoints, and serialized architectures
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pb
+*.tflite
+*.weights
+*.h5
+*.joblib
+*.pkl
+*.pickle
+
+# ==============================================================================
+# Experiment Tracking & Logs (Hydra, Tensorboard, WandB)
+# ==============================================================================
+# Hydra output folders for local run logs and snapshots
+outputs/
+multirun/
+
+# Tensorboard logs
+runs/
+.tensorboard/
+
+# Weights & Biases logs
+wandb/
+
+# MLflow tracking
+mlruns/
+
+# General log files
+*.log
+*.log.jsonl
+events.out.tfevents.*
+
+# ==============================================================================
+# Dataset / Data / Dataframes
+# ==============================================================================
+# If datasets are placed inside the directory, keep them ignored
+data_inputs/
+datasets/
+raw_data/
+*.csv
+*.xlsx
+*.parquet
+
+# Exception: Keep your Hydra config dataset directory intact
+!conf/data/
