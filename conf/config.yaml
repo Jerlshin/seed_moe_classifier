@@ -1,0 +1,7 @@
+defaults:
+  - data: hierarchical_seeds
+  - experiment: pretrain_swinv2_dino
+  - _self_
+
+seed: 42
+device: "cuda"

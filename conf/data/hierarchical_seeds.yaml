@@ -1,0 +1,8 @@
+root_path: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Dataset/Hierarchical_SeedData/Cropped_Samples"
+image_size: 224
+local_crop_size: 96
+batch_size: 32
+num_workers: 8
+
+num_seed_types: 4        # Rice, Millet, Amaranthus, Mustard
+num_sub_varieties: 27     # 13 Rice, 8 Millet, 3 Amaranthus, 3 Mustard

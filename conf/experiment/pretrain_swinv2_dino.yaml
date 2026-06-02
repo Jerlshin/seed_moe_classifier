@@ -1,0 +1,16 @@
+model:
+  backbone_name: "vit_small_patch16_224"
+  pretrained: false
+  dynamic_img_size: true
+  input_dim: 384
+  projection_hidden_dim: 512
+  projection_bottleneck_dim: 64
+  projection_out_dim: 2048
+
+training:
+  epochs: 100
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  momentum_teacher: 0.996
+  warmup_teacher_temp_epochs: 10
+  save_path: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Output/Pretrain_SwinV2_DINO"
