@@ -1,0 +1,23 @@
+[project]
+name = "seed-moe-classifier"
+version = "0.1.0"
+description = "Hierarchical seed classifier with DINO pretraining and MoE finetuning."
+requires-python = ">=3.11"
+dependencies = [
+    "hydra-core",
+    "lightly",
+    "numpy",
+    "omegaconf",
+    "psutil",
+    "scikit-learn",
+    "timm",
+    "torch",
+    "torchvision",
+]
+
+[project.optional-dependencies]
+tracking = [
+    "pynvml",
+    "tensorboard",
+    "wandb",
+]

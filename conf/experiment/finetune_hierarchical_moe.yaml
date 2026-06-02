@@ -1,0 +1,30 @@
+model:
+  name: "hierarchical_moe"
+  backbone_checkpoint: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Output/Pretrain_SwinV2_DINO/dino_pretrained_backbone.pth"
+  num_seed_types: "${data.num_seed_types}"
+  num_sub_varieties: "${data.num_sub_varieties}"
+
+training:
+  epochs: 100
+  max_batches: null
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  save_path: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Output/Finetune_Hierarchical_MoE"
+  optimizer:
+    name: "AdamW"
+  scheduler:
+    name: "cosine"
+    warmup_epochs: 5
+
+validation:
+  enabled: true
+  every_epochs: 1
+  metrics:
+    - "loss"
+    - "accuracy"
+    - "f1_macro"
+    - "f1_weighted"
+  curves:
+    roc: true
+    precision_recall: true
+    calibration: true

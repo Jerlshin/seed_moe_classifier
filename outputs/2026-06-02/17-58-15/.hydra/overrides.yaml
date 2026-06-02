@@ -1,0 +1,11 @@
+- experiment.training.epochs=1
+- experiment.training.max_batches=1
+- experiment.training.save_path=/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/seed-moe-classifier/outputs/smoke_default
+- data.batch_size=1
+- data.num_workers=0
+- device=cpu
+- tracking.tensorboard.enabled=false
+- tracking.artifacts.log_parameter_histograms=false
+- tracking.artifacts.log_gradient_histograms=false
+- tracking.artifacts.log_embeddings=false
+- tracking.artifacts.log_attention_maps=false

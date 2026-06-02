@@ -1,0 +1,9 @@
+2026-06-02 17:58:34 | INFO | seed_moe.moe_finetune | ========== Starting Hierarchical MoE Finetuning ==========
+2026-06-02 17:58:34 | INFO | seed_moe.moe_finetune | Saved run configuration snapshots.
+2026-06-02 17:58:34 | INFO | seed_moe.moe_finetune | Selected training device: cpu
+2026-06-02 17:58:34 | INFO | seed_moe.moe_finetune | Finetune instrumentation is ready. Model/data training code is not implemented yet.
+2026-06-02 17:58:34 | ERROR | seed_moe.moe_finetune | Hierarchical MoE finetuning failed.
+Traceback (most recent call last):
+  File "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/seed-moe-classifier/src/train/moe_finetune.py", line 47, in main
+    raise NotImplementedError(
+NotImplementedError: src/train/moe_finetune.py has logging/tracking scaffolding, but the Hierarchical MoE model, supervised datasets, and train/validation loops are not implemented in this repository yet.

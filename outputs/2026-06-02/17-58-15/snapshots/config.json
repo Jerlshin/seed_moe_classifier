@@ -1,0 +1,92 @@
+{
+  "data": {
+    "batch_size": 1,
+    "image_size": 224,
+    "local_crop_size": 96,
+    "num_seed_types": 4,
+    "num_sub_varieties": 27,
+    "num_workers": 0,
+    "root_path": "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Dataset/Hierarchical_SeedData/Cropped_Samples"
+  },
+  "device": "cpu",
+  "experiment": {
+    "model": {
+      "backbone_name": "vit_small_patch16_224",
+      "dynamic_img_size": true,
+      "input_dim": 384,
+      "pretrained": false,
+      "projection_bottleneck_dim": 64,
+      "projection_hidden_dim": 512,
+      "projection_out_dim": 2048
+    },
+    "training": {
+      "epochs": 1,
+      "learning_rate": 0.0005,
+      "max_batches": 1,
+      "momentum_teacher": 0.996,
+      "optimizer": {
+        "name": "AdamW"
+      },
+      "save_path": "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/seed-moe-classifier/outputs/smoke_default",
+      "scheduler": {
+        "name": null
+      },
+      "warmup_teacher_temp_epochs": 10,
+      "weight_decay": 0.0001
+    }
+  },
+  "seed": 42,
+  "tracking": {
+    "artifacts": {
+      "log_attention_maps": false,
+      "log_embeddings": false,
+      "log_gradient_histograms": false,
+      "log_gradient_norms": true,
+      "log_parameter_histograms": false,
+      "max_attention_images": 4,
+      "max_embedding_samples": 256
+    },
+    "console": true,
+    "experiment_name": "seed-moe",
+    "intervals": {
+      "attention_every_epochs": 5,
+      "device_every_steps": 10,
+      "embedding_every_epochs": 5,
+      "gradient_histogram_every_epochs": 1,
+      "histogram_every_epochs": 1,
+      "log_every_steps": 10
+    },
+    "log_level": "INFO",
+    "output_dir": "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/seed-moe-classifier/outputs/2026-06-02/17-58-15",
+    "run_name": null,
+    "snapshot": {
+      "enabled": true,
+      "redact_env_keys": [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASS",
+        "CREDENTIAL"
+      ],
+      "save_cli_args": true,
+      "save_environment": true,
+      "save_json": true,
+      "save_yaml": true
+    },
+    "structured_jsonl": true,
+    "tensorboard": {
+      "enabled": false,
+      "log_dir": "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/seed-moe-classifier/outputs/2026-06-02/17-58-15/tensorboard"
+    },
+    "wandb": {
+      "enabled": false,
+      "entity": null,
+      "group": null,
+      "log_model": false,
+      "mode": "offline",
+      "project": "seed-moe-classifier",
+      "tags": []
+    }
+  }
+}

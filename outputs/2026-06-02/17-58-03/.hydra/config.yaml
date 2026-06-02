@@ -1,0 +1,77 @@
+data:
+  root_path: /Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Dataset/Hierarchical_SeedData/Cropped_Samples
+  image_size: 224
+  local_crop_size: 96
+  batch_size: 1
+  num_workers: 0
+  num_seed_types: 4
+  num_sub_varieties: 27
+experiment:
+  model:
+    backbone_name: vit_tiny_patch16_224
+    pretrained: false
+    dynamic_img_size: true
+    input_dim: 192
+    projection_hidden_dim: 512
+    projection_bottleneck_dim: 64
+    projection_out_dim: 2048
+  training:
+    epochs: 1
+    max_batches: 1
+    learning_rate: 0.0005
+    weight_decay: 0.0001
+    momentum_teacher: 0.996
+    warmup_teacher_temp_epochs: 10
+    save_path: /Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/seed-moe-classifier/outputs/smoke
+    optimizer:
+      name: AdamW
+    scheduler:
+      name: null
+tracking:
+  experiment_name: seed-moe
+  run_name: null
+  output_dir: ${hydra:runtime.output_dir}
+  log_level: INFO
+  console: true
+  structured_jsonl: true
+  snapshot:
+    enabled: true
+    save_yaml: true
+    save_json: true
+    save_cli_args: true
+    save_environment: true
+    redact_env_keys:
+    - KEY
+    - TOKEN
+    - SECRET
+    - PASSWORD
+    - PASS
+    - CREDENTIAL
+  tensorboard:
+    enabled: false
+    log_dir: ${hydra:runtime.output_dir}/tensorboard
+  wandb:
+    enabled: false
+    project: seed-moe-classifier
+    entity: null
+    mode: offline
+    group: null
+    tags: []
+    log_model: false
+  intervals:
+    log_every_steps: 10
+    device_every_steps: 10
+    histogram_every_epochs: 1
+    gradient_histogram_every_epochs: 1
+    embedding_every_epochs: 5
+    attention_every_epochs: 5
+  artifacts:
+    log_parameter_histograms: false
+    log_gradient_histograms: false
+    log_gradient_norms: true
+    log_embeddings: false
+    log_attention_maps: false
+    max_embedding_samples: 256
+    max_attention_images: 4
+seed: 42
+device: cpu
