@@ -1,8 +1,62 @@
-root_path: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Dataset/Hierarchical_SeedData/Cropped_Samples"
-image_size: 224
-local_crop_size: 96
-batch_size: 32
-num_workers: 8
+# Seed dataset and augmentation pipeline (paper Sections 3 and 4).
+#
+# Layout expected under `root_path`:
+#
+#   root/<seed_type>/<sub_variety>/*.png
+#
+# Labels come from *sorted* directory names, and sub-variety labels are global
+# (0..26 across all seed types). Adding or renaming a folder shifts every index
+# and invalidates existing checkpoints.
 
-num_seed_types: 4        # Rice, Millet, Amaranthus, Mustard
-num_sub_varieties: 27     # 13 Rice, 8 Millet, 3 Amaranthus, 3 Mustard
+root_path: "${oc.env:SEED_DATA_ROOT,data/Hierarchical_SeedData/Cropped_Samples}"
+dataset_format: "image_folder"   # or "pickle_batches" for flattened-RGB batch files
+
+# Must match the backbone's window resolution (256 for swinv2_*_window16_256).
+image_size: 256
+local_crop_size: 101
+
+batch_size: 16                   # Table 1
+num_workers: 2
+pin_memory: true
+drop_last: true
+save_csv_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/metadata/seed_dataset.csv"
+
+# Paper Section 3: 4 seed types, 27 sub-varieties (13 rice, 8 millet, 3 + 3).
+num_seed_types: 4
+num_sub_varieties: 27
+
+# Multi-crop augmentation (paper Section 6.1).
+augmentation:
+  # 2 global crops, scale (0.4, 1.0); 4 local crops, scale (0.05, 0.4).
+  global_crops_scale: [0.4, 1.0]
+  local_crops_scale: [0.05, 0.4]
+  local_crops_number: 4
+  horizontal_flip_prob: 0.5
+
+  # Colour jitter magnitudes are stated explicitly in the paper: brightness
+  # +/-0.4, contrast +/-0.4, saturation +/-0.2, hue +/-0.1.
+  color_jitter_brightness: 0.4
+  color_jitter_contrast: 0.4
+  color_jitter_saturation: 0.2
+  color_jitter_hue: 0.1
+
+  # The paper says the pipeline "follows the standard DINOv2 protocol", whose
+  # application probabilities are 0.8 for jitter and 0.2 for grayscale. An
+  # earlier notebook used 0.01/0.01 to preserve seed colour; drop these back if
+  # colour turns out to be the dominant cue for your sub-varieties.
+  color_jitter_prob: 0.8
+  grayscale_prob: 0.2
+
+  # Global crop 1: blur p=1.0. Global crop 2: blur p=0.1 + solarization p=0.2.
+  global_blur_prob_1: 1.0
+  global_blur_prob_2: 0.1
+  solarization_prob: 0.2
+  # Local crops: blur p=0.5.
+  local_blur_prob: 0.5
+
+  # SwinV2 windows require a fixed input size, so local crops are resized back
+  # up to `image_size` after being cropped at `local_crop_size`.
+  resize_local_to_global: true
+
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]

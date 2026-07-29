@@ -1,0 +1,14 @@
+# DINO self-distillation loss (paper Section 4, Eqs. 1-3, Table 1).
+
+name: "dino"
+
+# Eq. 2: teacher temperature ramps linearly over the first
+# `warmup_teacher_temp_epochs`, then holds at `teacher_temp`.
+warmup_teacher_temp: 0.02
+teacher_temp: 0.04
+warmup_teacher_temp_epochs: 5
+
+student_temp: 0.1
+
+# Eq. 3: C_t = m * C_{t-1} + (1 - m) * qbar
+center_momentum: 0.9

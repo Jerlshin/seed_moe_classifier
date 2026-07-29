@@ -1,13 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "seed-moe-classifier"
-version = "0.1.0"
-description = "Hierarchical seed classifier with DINO pretraining and MoE finetuning."
+version = "0.2.0"
+description = "Hierarchical seed classifier with DINOv2 pretraining and Mixture-of-Experts finetuning."
 requires-python = ">=3.11"
 dependencies = [
     "hydra-core",
     "lightly",
+    "matplotlib",
     "numpy",
     "omegaconf",
+    "pillow",
     "psutil",
     "scikit-learn",
     "timm",
@@ -20,4 +26,26 @@ tracking = [
     "pynvml",
     "tensorboard",
     "wandb",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::FutureWarning",
+]
+markers = [
+    "slow: tests that download weights or run a full training stage",
 ]

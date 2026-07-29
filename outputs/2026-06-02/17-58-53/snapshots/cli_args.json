@@ -1,5 +1,0 @@
-[
-  "src/train/moe_finetune.py",
-  "experiment=finetune_hierarchical_moe",
-  "tracking.tensorboard.enabled=false"
-]

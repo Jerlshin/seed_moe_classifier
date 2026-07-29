@@ -1,0 +1,29 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained ResNet-50, trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_resnet50
+#   python scripts/run_baselines.py --models resnet50
+#
+# The conventional CNN reference point. Everything except the model is inherited
+# from the finetune experiment, so the data pipeline, the split, the optimiser
+# family and the evaluation are identical to the proposed framework's.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_resnet50"
+  group: "baseline"
+  variant: "resnet50"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/resnet50"
+    # The whole network trains from ImageNet weights, so the learning rate that
+    # suits a small head on a frozen encoder would be far too high here.
+    learning_rate: 0.00003
+
+model:
+  head:
+    baseline_model: "resnet50"

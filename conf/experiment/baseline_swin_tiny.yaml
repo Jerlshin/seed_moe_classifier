@@ -1,0 +1,35 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained Swin Transformer Tiny, trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_swin_tiny
+#   python scripts/run_baselines.py --models swin_tiny
+#
+# Shares the shifted-window inductive bias with the proposed SwinV2 encoder but
+# arrives supervised from ImageNet rather than self-supervised on seed imagery.
+# The gap against the full model therefore isolates the combined contribution of
+# DINOv2 pretraining and the hierarchical head, with the backbone family held
+# roughly constant.
+#
+# swin_tiny_patch4_window7_224 has a fixed 224 window geometry, so the input size
+# is overridden here rather than inherited from the SwinV2 pipeline's 256.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_swin_tiny"
+  group: "baseline"
+  variant: "swin_tiny"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/swin_tiny"
+    learning_rate: 0.00003
+
+data:
+  image_size: 224
+
+model:
+  head:
+    baseline_model: "swin_tiny"

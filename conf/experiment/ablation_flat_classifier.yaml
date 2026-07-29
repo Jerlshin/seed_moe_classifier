@@ -1,0 +1,36 @@
+# @package _global_
+#
+# Ablation: remove the hierarchy and classify 27 sub-varieties directly.
+#
+#   python -m src.trainers.moe_finetune experiment=ablation_flat_classifier
+#
+# Distinct from the six component-wise variants in scripts/run_ablations.py,
+# which each remove one block. This one removes the *coarse stage's influence*:
+# the seed-type head still runs and is still scored, but contributes nothing to
+# the gradient, so the difference against the full model is the combined
+# contribution of coarse supervision and expert specialisation.
+
+defaults:
+  - finetune_hierarchical_moe
+
+experiment:
+  name: "ablation_flat_classifier"
+  group: "ablation"
+  variant: "flat_classifier"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/ablations/flat_classifier"
+
+model:
+  head:
+    # One dense block: the MoE degenerates to a single transformer block,
+    # isolating the contribution of expert specialisation.
+    use_moe: false
+    use_kl_loss: false
+
+  loss:
+    lambda_seed: 0.0        # no coarse supervision
+    lambda_kl: 0.0          # no hierarchy consistency
+    lambda_cosine: 0.0      # no residual compactness
+    lambda_moe_load: 0.0    # meaningless without a router
+    lambda_moe_sparsity: 0.0
+    lambda_arcface: 1.0     # ArcFace alone drives the flat classifier

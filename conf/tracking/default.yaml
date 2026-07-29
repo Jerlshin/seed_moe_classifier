@@ -1,3 +1,11 @@
+# Experiment tracking. Three sinks: events.jsonl (always), TensorBoard, W&B.
+#
+#   tensorboard --logdir outputs/hydra
+#   wandb sync outputs/hydra/<date>/<time>/wandb/offline-run-*
+#
+# W&B defaults to `offline` so a run never blocks on network or credentials.
+# Switch to `online` once `wandb login` has been run.
+
 experiment_name: "seed-moe"
 run_name: null
 output_dir: "${hydra:runtime.output_dir}"
@@ -10,7 +18,7 @@ snapshot:
   save_yaml: true
   save_json: true
   save_cli_args: true
-  save_environment: true
+  save_environment: false
   redact_env_keys:
     - "KEY"
     - "TOKEN"
@@ -24,27 +32,38 @@ tensorboard:
   log_dir: "${hydra:runtime.output_dir}/tensorboard"
 
 wandb:
-  enabled: false
+  enabled: true
   project: "seed-moe-classifier"
   entity: null
-  mode: "offline"
+  mode: "offline"      # "online" | "offline" | "disabled"
   group: null
   tags: []
-  log_model: false
+  log_model: false     # upload checkpoints as W&B artifacts
 
 intervals:
   log_every_steps: 10
-  device_every_steps: 10
-  histogram_every_epochs: 1
-  gradient_histogram_every_epochs: 1
+  device_every_steps: 50
+  histogram_every_epochs: 5
+  gradient_histogram_every_epochs: 5
   embedding_every_epochs: 5
   attention_every_epochs: 5
+  figure_every_epochs: 5   # confusion matrices, expert utilisation, t-SNE
 
 artifacts:
-  log_parameter_histograms: true
-  log_gradient_histograms: true
+  # Parameter/gradient histograms are large; keep them off for long runs.
+  log_parameter_histograms: false
+  log_gradient_histograms: false
   log_gradient_norms: true
-  log_embeddings: true
-  log_attention_maps: true
-  max_embedding_samples: 256
-  max_attention_images: 4
+
+  # Paper Section 6 qualitative results.
+  log_confusion_matrices: true
+  log_expert_utilization: true
+  log_per_class_tables: true
+  log_tsne: true
+  log_embeddings: false
+  log_attention_maps: false
+
+  max_embedding_samples: 64
+  max_attention_images: 2
+  max_tsne_samples: 2000
+  tsne_perplexity: 30.0

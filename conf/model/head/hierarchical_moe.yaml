@@ -1,0 +1,72 @@
+# Hierarchical head: seed type -> MoE -> residual -> cross-attention -> ArcFace.
+# Paper Section 5, Eqs. 4-13. This node is passed whole to `build_hierarchical_moe`.
+
+name: "hierarchical_moe"
+
+# Eq. 4. `feature_dim` is what reaches the head. With DinoV2SwinV2Encoder that
+# is already z, so it equals `embed_dim` and the head's input projection is an
+# identity. They are kept as separate keys so the head still works when fed raw
+# backbone features (feature dumps, notebooks).
+feature_dim: 384
+embed_dim: 384
+
+num_seed_types: ${data.num_seed_types}       # Eq. 5, |s| = 4
+num_sub_varieties: ${data.num_sub_varieties} # Eq. 13, 27 classes
+
+# Eq. 8: six transformer experts.
+#
+# top_k = 2 (REVISED). The submitted manuscript routed the top 4 of 6. The
+# revision routes 2, which halves the experts evaluated per sample and so the
+# active parameter count, at unchanged total capacity. Set `top_k: 4` to
+# reproduce the submitted configuration; src/utils/efficiency.py reports both
+# active-parameter figures side by side for the cost table.
+num_experts: 6
+top_k: 2
+moe_hidden_dim: 512
+moe_sparse_dispatch: true
+
+num_heads: 8
+dropout_rate: 0.1
+
+# Eq. 9: depth of the MLP projecting p_s back into the feature space.
+seed_projection_depth: 2
+
+# Eq. 13: angular margin m and feature scale s.
+arcface_scale: 30.0
+arcface_margin: 0.5
+arcface_easy_margin: false
+
+# ---------------------------------------------------------------------------
+# Component toggles, driving the component-wise ablation suite.
+#
+# Setting one to false replaces or bypasses exactly one block, and the disabled
+# block is never allocated, so an ablation's parameter count reflects the model
+# actually trained. See scripts/run_ablations.py.
+#
+#   use_moe             false -> one dense transformer block, no routing
+#   use_arcface         false -> linear head; the objective becomes plain CE
+#   use_residual        false -> h' = h; Eq. 9 seed-type fusion removed
+#   use_cross_attention false -> h'' = h'; Eqs. 11-12 skipped
+#   use_kl_loss         false -> Eq. 10 not computed (read by model/loss too)
+#
+# `use_kl_loss` lives here rather than under model/loss so all five switches
+# have one home; conf/model/loss/arcface_kl.yaml interpolates it.
+# ---------------------------------------------------------------------------
+use_moe: true
+use_arcface: true
+use_residual: true
+use_cross_attention: true
+use_kl_loss: true
+
+# Architecture variants.
+#   seed_classifier_variant: "mlp" is the paper's Eq. 5; "se_gated" adds a
+#     squeeze-excitation branch and a feature gate (ablation only).
+#   sub_embedding_variant:   "mlp" is a residual MLP before ArcFace;
+#     "identity" feeds h'' straight in.
+#   cross_attention_variant: "paper" is Eq. 12; "gated" is an ablation block.
+seed_classifier_variant: "mlp"
+sub_embedding_variant: "mlp"
+cross_attention_variant: "paper"
+
+# Optional hidden layer inside the Eq. 4 projection; null keeps it linear.
+input_projection_hidden_dim: null

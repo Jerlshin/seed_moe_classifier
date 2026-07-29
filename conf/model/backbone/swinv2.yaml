@@ -1,0 +1,43 @@
+# Swin Transformer V2 backbone (paper Section 4, Table 1).
+#
+# This is the *only* backbone on the DINOv2 path. The comparative ViT-S/14 entry
+# from the submitted manuscript has been removed for the revision, and
+# `validate_swinv2_name` in src/models/builder.py rejects any name that is not a
+# SwinV2 variant, so a run cannot silently fall back to a different encoder.
+# Supervised comparison backbones (ResNet-50, Swin-T) live in
+# conf/experiment/baseline_*.yaml and go through src/models/baselines.py.
+#
+# `feature_dim` is the backbone's own output width, NOT the paper's z. SwinV2-Base
+# emits 1024 channels; DinoV2SwinV2Encoder projects that down to the 384-D z of
+# Eq. 4, so `encoder(images).shape[-1] == 384` regardless of which variant is
+# chosen here. Use `swinv2_tiny_window16_256` / `swinv2_small_window16_256`
+# (both 768) for a lighter run -- update `feature_dim` to match.
+#
+# `data.image_size` must equal the window resolution in the model name (256).
+
+name: "swinv2_base_window16_256"
+feature_dim: 1024
+pretrained: false
+dynamic_img_size: true
+
+# Optional hidden layer inside the Eq. 4 projection to z; null keeps it linear.
+projection_hidden_dim: null
+projection_dropout: 0.0
+
+# Stage-2 only: DINO-pretrained weights produced by the pretrain stage.
+#
+# Resolution order:
+#   1. $SEED_PRETRAIN_BACKBONE, if set.
+#   2. The shared publication path, which the pretrain stage writes and every
+#      ablation and baseline run reads. Pinning one file here is what makes the
+#      component-wise comparison valid: each variant starts from byte-identical
+#      encoder weights.
+checkpoint_path: "${oc.env:SEED_PRETRAIN_BACKBONE,${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_pretrained.pth}"
+checkpoint_strict: false
+
+# The paper fine-tunes the encoder in stage 2 (Section 4, final paragraph). This
+# repository freezes it by default because the two-stage recipe trains only the
+# head; set `freeze: false` to follow the paper and fine-tune end to end. Note
+# that the Eq. 4 projection to z is trainable either way -- freezing applies to
+# the SwinV2 trunk only.
+freeze: true

@@ -1,24 +1,27 @@
 # ==============================================================================
 # Python Cache and Bytecode
 # ==============================================================================
+# Directory patterns below are anchored with a leading "/" so they only match at
+# the repository root. An unanchored "lib/" or "build/" would also match
+# "src/.../lib/", which is how a source directory ends up silently untracked.
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+/share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -82,18 +85,18 @@ conda-env/
 # Experiment Tracking & Logs (Hydra, Tensorboard, WandB)
 # ==============================================================================
 # Hydra output folders for local run logs and snapshots
-outputs/
-multirun/
+/outputs/
+/multirun/
 
 # Tensorboard logs
-runs/
+/runs/
 .tensorboard/
 
-# Weights & Biases logs
+# Weights & Biases logs (written into each Hydra run directory)
 wandb/
 
 # MLflow tracking
-mlruns/
+/mlruns/
 
 # General log files
 *.log
@@ -103,13 +106,15 @@ events.out.tfevents.*
 # ==============================================================================
 # Dataset / Data / Dataframes
 # ==============================================================================
-# If datasets are placed inside the directory, keep them ignored
-data_inputs/
-datasets/
-raw_data/
-*.csv
+# Datasets dropped into the repository root. These MUST stay anchored: an
+# unanchored "datasets/" also matches the source package "src/datasets/", which
+# would silently untrack every new module added there.
+/data/
+/data_inputs/
+/datasets/
+/raw_data/
 *.xlsx
 *.parquet
 
-# Exception: Keep your Hydra config dataset directory intact
-!conf/data/
+# Generated metadata manifests (see data.save_csv_path), not source data.
+*.csv

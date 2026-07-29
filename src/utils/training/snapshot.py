@@ -22,9 +22,11 @@ def _redact_environment(env: dict[str, str], patterns: list[str]) -> dict[str, s
 
 def snapshot_run_configuration(cfg: DictConfig, output_dir: str | Path) -> dict[str, Path]:
     snapshot_dir = Path(output_dir) / "snapshots"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-
     snapshot_cfg = OmegaConf.select(cfg, "tracking.snapshot", default={})
+    if not snapshot_cfg.get("enabled", True):
+        return {}
+
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
     cfg_container: dict[str, Any] = OmegaConf.to_container(cfg, resolve=True)  # type: ignore[assignment]
     written: dict[str, Path] = {}
 

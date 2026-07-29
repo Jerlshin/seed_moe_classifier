@@ -1,30 +1,66 @@
-model:
-  name: "hierarchical_moe"
-  backbone_checkpoint: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Output/Pretrain_SwinV2_DINO/dino_pretrained_backbone.pth"
-  num_seed_types: "${data.num_seed_types}"
-  num_sub_varieties: "${data.num_sub_varieties}"
+# @package _global_
+#
+# Stage 2: hierarchical MoE finetuning (paper Section 5).
+#
+#   python main.py finetune
+#
+# Uses the root defaults for `model/head` (hierarchical_moe) and `model/loss`
+# (arcface_kl); this file only owns the training loop. Every ablation and
+# baseline experiment inherits from it, so anything changed here changes them
+# all -- which is the point: the variants must differ only in the one thing
+# being ablated.
 
-training:
-  epochs: 100
-  max_batches: null
-  learning_rate: 0.0001
-  weight_decay: 0.0001
-  save_path: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Output/Finetune_Hierarchical_MoE"
-  optimizer:
-    name: "AdamW"
-  scheduler:
-    name: "cosine"
-    warmup_epochs: 5
+experiment:
+  name: "finetune_hierarchical_moe"
+  stage: "finetune"
 
-validation:
-  enabled: true
-  every_epochs: 1
-  metrics:
-    - "loss"
-    - "accuracy"
-    - "f1_macro"
-    - "f1_weighted"
-  curves:
-    roc: true
-    precision_recall: true
-    calibration: true
+  # Written into summary.json and used by scripts/generate_plots.py to group
+  # rows of the comparison table. `variant` defaults to `name`.
+  group: "proposed"
+  variant: null
+
+  training:
+    epochs: 100
+    max_batches: null
+
+    # Section 6.2 reports "consistent performance across all folds"; set
+    # num_folds > 1 to switch from a single split to StratifiedKFold.
+    num_folds: 1
+    test_size: 0.2
+
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+    clip_grad: 3.0
+    amp: false                     # only honoured on CUDA
+    horizontal_flip_prob: 0.0
+
+    save_interval: 50
+    keep_last_n_checkpoints: 1
+    save_optimizer_state: false
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/finetune_hierarchical_moe"
+
+    optimizer:
+      name: "AdamW"
+    scheduler:
+      name: "cosine"
+      eta_min: 0.0
+
+  validation:
+    enabled: true
+    every_epochs: 1
+    # Metric used to select the best checkpoint. "loss" minimises;
+    # anything else maximises.
+    monitor: "loss"
+
+  # Computational efficiency measurement, run once against the best checkpoint.
+  # Profiles encoder + head together, which is the only combination whose
+  # latency a deployment would actually observe.
+  efficiency:
+    enabled: true
+    measure_flops: true
+    measure_latency: true
+    # batch_sizes[0] doubles as the FLOP-counting batch, so keep 1 first to get
+    # a clean per-sample figure.
+    batch_sizes: [1, 8, 32]
+    warmup: 3
+    iterations: 10

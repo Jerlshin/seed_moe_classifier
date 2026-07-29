@@ -1,0 +1,394 @@
+"""Cross-run reporting: prediction dumps, summary tables, publication figures.
+
+:mod:`src.utils.metrics` scores one set of predictions and
+:mod:`src.utils.visualization` draws one figure. This module is the layer above
+both: it defines the on-disk contract that lets a *later* process compare runs
+that finished hours apart, on different machines, without re-running any of them.
+
+The contract has two files per run, written into that run's ``save_path``:
+
+``test_predictions.npz``
+    Raw held-out predictions, scores, 384-D embeddings, routed expert indices
+    and class names. Keeping the raw arrays -- rather than only the figures --
+    means a reviewer asking for a differently-normalised confusion matrix or a
+    re-coloured t-SNE costs a second of replotting instead of a full retrain.
+
+``summary.json``
+    Scalar metrics, the efficiency report, the loss history and the component
+    flags. :func:`collect_run_summaries` globs these into the comparison table.
+
+Column order in ``summary_metrics.csv`` follows the revision request exactly
+(:data:`REQUESTED_COLUMNS`); anything additionally useful is appended after
+those, so the requested table can be sliced off the left without editing.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from src.utils.metrics import HierarchicalEvaluation, tsne_projection
+from src.utils.visualization import (
+    plot_confusion_matrix,
+    plot_expert_utilization,
+    plot_loss_curves,
+    plot_metric_heatmap,
+    plot_misclassification_rates,
+    plot_tsne,
+    save_figure,
+)
+
+PREDICTIONS_FILENAME = "test_predictions.npz"
+SUMMARY_FILENAME = "summary.json"
+
+#: The exact columns the revision asks for, in the order requested.
+REQUESTED_COLUMNS = [
+    "Model/Variant",
+    "Accuracy",
+    "Precision",
+    "Recall",
+    "Macro F1",
+    "Micro F1",
+    "KL Alignment Rate (%)",
+    "Total Params (M)",
+    "Active Params (M)",
+    "Inference Latency (ms)",
+]
+
+#: Additional context appended to the right of the requested columns.
+EXTRA_COLUMNS = [
+    "Seed-Type Accuracy",
+    "Seed-Type Macro F1",
+    "Sub-Variety AUC (macro OvR)",
+    "Experts",
+    "Top-K",
+    "Throughput (FPS)",
+    "GFLOPs/sample",
+    "Peak Memory (MB)",
+    "Group",
+    "Run Directory",
+]
+
+
+# ------------------------------------------------------------------- summaries
+
+
+@dataclass
+class RunSummary:
+    """One finished training run, as persisted to ``summary.json``.
+
+    ``metrics`` holds the flattened scalars produced by
+    :meth:`~src.utils.metrics.HierarchicalEvaluation.scalar_metrics`, keyed
+    ``seed_type/...``, ``sub_variety/...`` and ``kl_alignment/...``.
+    """
+
+    name: str
+    group: str = "experiment"
+    run_dir: str = ""
+    metrics: dict[str, float] = field(default_factory=dict)
+    efficiency: dict[str, Any] = field(default_factory=dict)
+    history: dict[str, list[float]] = field(default_factory=dict)
+    component_flags: dict[str, bool] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
+    artifacts: dict[str, str] = field(default_factory=dict)
+
+    def save(self, directory: str | Path) -> str:
+        """Write ``summary.json`` into ``directory`` and return its path."""
+        path = Path(directory) / SUMMARY_FILENAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_json_safe(asdict(self)), indent=2, sort_keys=True), encoding="utf-8")
+        return str(path)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "RunSummary":
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        known = {key: payload.get(key) for key in cls.__dataclass_fields__ if key in payload}
+        return cls(**known)
+
+    # ------------------------------------------------------------ table rows
+
+    def _metric(self, key: str, default: float = float("nan")) -> float:
+        value = self.metrics.get(key, default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _efficiency(self, *path: str) -> Any:
+        node: Any = self.efficiency
+        for key in path:
+            if not isinstance(node, Mapping) or key not in node:
+                return None
+            node = node[key]
+        return node
+
+    def _primary_latency(self) -> Mapping[str, Any] | None:
+        latencies = self._efficiency("latencies")
+        if not latencies:
+            return None
+        return min(latencies, key=lambda entry: entry.get("batch_size", 0))
+
+    def as_row(self) -> dict[str, Any]:
+        """One row of ``summary_metrics.csv``.
+
+        The headline accuracy/precision/recall/F1 columns describe the
+        **sub-variety** task: it is the 27-class problem the architecture exists
+        to solve, and the one where the variants actually separate. Seed-type
+        numbers follow in the extra columns rather than being averaged in, which
+        would blend two tasks of very different difficulty into one meaningless
+        figure.
+        """
+        latency = self._primary_latency() or {}
+        alignment = self._metric("kl_alignment/overall")
+        return {
+            "Model/Variant": self.name,
+            "Accuracy": self._metric("sub_variety/accuracy"),
+            "Precision": self._metric("sub_variety/precision_macro"),
+            "Recall": self._metric("sub_variety/recall_macro"),
+            "Macro F1": self._metric("sub_variety/f1_macro"),
+            "Micro F1": self._metric("sub_variety/f1_micro"),
+            "KL Alignment Rate (%)": alignment * 100.0 if alignment == alignment else alignment,
+            "Total Params (M)": self._efficiency("parameters", "total_millions"),
+            "Active Params (M)": self._efficiency("parameters", "active_millions"),
+            "Inference Latency (ms)": latency.get("latency_ms_per_sample"),
+            "Seed-Type Accuracy": self._metric("seed_type/accuracy"),
+            "Seed-Type Macro F1": self._metric("seed_type/f1_macro"),
+            "Sub-Variety AUC (macro OvR)": self._metric("sub_variety/auc_macro_ovr"),
+            "Experts": self._efficiency("parameters", "num_experts"),
+            "Top-K": self._efficiency("parameters", "top_k"),
+            "Throughput (FPS)": latency.get("throughput_fps"),
+            "GFLOPs/sample": self._efficiency("gflops_per_sample"),
+            "Peak Memory (MB)": self._efficiency("peak_memory_mb"),
+            "Group": self.group,
+            "Run Directory": self.run_dir,
+        }
+
+
+def collect_run_summaries(roots: Iterable[str | Path]) -> list[RunSummary]:
+    """Load every ``summary.json`` found under ``roots``, sorted by group then name."""
+    summaries: list[RunSummary] = []
+    for root in roots:
+        base = Path(root)
+        if not base.exists():
+            continue
+        candidates = [base / SUMMARY_FILENAME] if (base / SUMMARY_FILENAME).exists() else []
+        candidates.extend(sorted(base.glob(f"*/{SUMMARY_FILENAME}")))
+        candidates.extend(sorted(base.glob(f"*/*/{SUMMARY_FILENAME}")))
+        for path in dict.fromkeys(candidates):  # de-duplicate, keep order
+            try:
+                summaries.append(RunSummary.load(path))
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+    return sorted(summaries, key=lambda summary: (summary.group, summary.name))
+
+
+def write_summary_csv(
+    path: str | Path,
+    summaries: Sequence[RunSummary],
+    float_format: str = "{:.4f}",
+) -> str:
+    """Write the comparison table and return its path.
+
+    Missing measurements are written as empty cells rather than ``nan``: a blank
+    reads unambiguously as "not measured", whereas ``nan`` in a results table
+    invites a reader to treat it as a failed run.
+    """
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    columns = REQUESTED_COLUMNS + EXTRA_COLUMNS
+
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        for summary in summaries:
+            row = summary.as_row()
+            writer.writerow({column: _format_cell(row.get(column), float_format) for column in columns})
+    return str(output)
+
+
+def _format_cell(value: Any, float_format: str) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return ""
+        return float_format.format(value)
+    return str(value)
+
+
+# ----------------------------------------------------------------- predictions
+
+
+def save_test_predictions(
+    directory: str | Path,
+    seed_true: Sequence[int],
+    seed_pred: Sequence[int],
+    sub_true: Sequence[int],
+    sub_pred: Sequence[int],
+    seed_type_names: Sequence[str],
+    sub_variety_names: Sequence[str],
+    subvariety_to_seed_type: Sequence[int],
+    sub_scores: np.ndarray | None = None,
+    embeddings: np.ndarray | None = None,
+    expert_indices: np.ndarray | None = None,
+    filename: str = PREDICTIONS_FILENAME,
+) -> str:
+    """Persist raw held-out predictions so figures can be regenerated offline."""
+    output = Path(directory) / filename
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    payload: dict[str, np.ndarray] = {
+        "seed_true": np.asarray(seed_true, dtype=np.int64),
+        "seed_pred": np.asarray(seed_pred, dtype=np.int64),
+        "sub_true": np.asarray(sub_true, dtype=np.int64),
+        "sub_pred": np.asarray(sub_pred, dtype=np.int64),
+        "seed_type_names": np.array(list(seed_type_names), dtype=object),
+        "subvariety_names": np.array(list(sub_variety_names), dtype=object),
+        "subvariety_to_seed_type": np.asarray(list(subvariety_to_seed_type), dtype=np.int64),
+    }
+    if sub_scores is not None:
+        payload["sub_scores"] = np.asarray(sub_scores, dtype=np.float32)
+    if embeddings is not None:
+        payload["embeddings"] = np.asarray(embeddings, dtype=np.float32)
+    if expert_indices is not None:
+        payload["expert_indices"] = np.asarray(expert_indices, dtype=np.int64)
+
+    np.savez_compressed(output, **payload)
+    return str(output)
+
+
+def load_test_predictions(path: str | Path) -> dict[str, np.ndarray]:
+    """Load a ``test_predictions.npz`` written by :func:`save_test_predictions`."""
+    with np.load(Path(path), allow_pickle=True) as archive:
+        return {key: archive[key] for key in archive.files}
+
+
+# --------------------------------------------------------------------- figures
+
+
+def save_publication_figures(
+    evaluation: HierarchicalEvaluation,
+    output_dir: str | Path,
+    prefix: str = "",
+    embeddings: np.ndarray | None = None,
+    seed_labels: Sequence[int] | None = None,
+    sub_labels: Sequence[int] | None = None,
+    history: Mapping[str, Sequence[float]] | None = None,
+    dpi: int = 300,
+    tsne_perplexity: float = 30.0,
+    max_tsne_samples: int = 2000,
+) -> dict[str, str]:
+    """Write every publication figure for one run and return ``{name: path}``.
+
+    Confusion matrices are row-normalised. With 27 sub-varieties at very
+    different supports, raw counts make a frequent class look accurate purely by
+    being frequent; normalising by true-class support is what makes the diagonal
+    comparable down the rows.
+
+    Rendered at ``dpi=300`` -- print resolution -- rather than the 150 used for
+    the live training-log figures.
+
+    Args:
+        evaluation: Scored predictions for the run.
+        output_dir: Directory to write into.
+        prefix: Filename prefix, normally the variant name.
+        embeddings: 384-D embeddings for the t-SNE panels.
+        seed_labels / sub_labels: True labels colouring those panels.
+        history: Named loss series for the train-vs-validation figure.
+        dpi: Output resolution.
+        tsne_perplexity / max_tsne_samples: t-SNE configuration.
+    """
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"{prefix}_" if prefix else ""
+    written: dict[str, str] = {}
+
+    def write(name: str, figure) -> None:
+        written[name] = save_figure(figure, directory / f"{stem}{name}.png", dpi=dpi)
+
+    seed_names = [entry.name for entry in evaluation.per_class_seed]
+    sub_names = [entry.name for entry in evaluation.per_class_sub]
+
+    write(
+        "confusion_seed_type",
+        plot_confusion_matrix(
+            evaluation.seed_confusion,
+            seed_names,
+            title="Seed-type confusion (row-normalised)",
+        ),
+    )
+    write(
+        "confusion_sub_variety",
+        plot_confusion_matrix(
+            evaluation.sub_confusion,
+            sub_names,
+            title="Sub-variety confusion (row-normalised)",
+            # 27 classes: annotating every cell is unreadable, but the full,
+            # unabbreviated tick labels are kept on both axes.
+            annotate_threshold=0,
+        ),
+    )
+    write("metric_heatmap_sub_variety", plot_metric_heatmap(evaluation.per_class_sub))
+    write("misclassification_sub_variety", plot_misclassification_rates(evaluation.sub_misclassification))
+    write("expert_utilization", plot_expert_utilization(evaluation.expert_utilization))
+
+    if history:
+        series = {name: list(values) for name, values in history.items() if len(values) > 0}
+        if series:
+            write(
+                "loss_curves",
+                plot_loss_curves(series, title="Training vs. validation loss", xlabel="Epoch"),
+            )
+
+    if embeddings is not None and len(embeddings) > 0:
+        projection = tsne_projection(
+            embeddings, perplexity=tsne_perplexity, max_samples=max_tsne_samples
+        )
+        if projection is not None:
+            count = projection.shape[0]
+            if seed_labels is not None:
+                write(
+                    "tsne_seed_type",
+                    plot_tsne(
+                        projection,
+                        list(seed_labels)[:count],
+                        seed_names,
+                        title="t-SNE of learned embeddings, by seed type",
+                        annotate_clusters=True,
+                    ),
+                )
+            if sub_labels is not None:
+                write(
+                    "tsne_sub_variety",
+                    plot_tsne(
+                        projection,
+                        list(sub_labels)[:count],
+                        sub_names,
+                        title="t-SNE of learned embeddings, by sub-variety",
+                        annotate_clusters=True,
+                    ),
+                )
+
+    return written
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)

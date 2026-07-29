@@ -1,21 +1,44 @@
-model:
-  backbone_name: "vit_small_patch16_224"
-  pretrained: false
-  dynamic_img_size: true
-  input_dim: 384
-  projection_hidden_dim: 512
-  projection_bottleneck_dim: 64
-  projection_out_dim: 2048
+# @package _global_
+#
+# Stage 1: DINOv2 self-supervised pretraining (paper Section 4, Table 1).
+#
+#   python main.py pretrain
+#
+# Every value below that Table 1 states is annotated with `# Table 1`.
 
-training:
-  epochs: 100
-  max_batches: null
-  learning_rate: 0.0005
-  weight_decay: 0.0001
-  momentum_teacher: 0.996
-  warmup_teacher_temp_epochs: 10
-  save_path: "/Users/jerlshin/FieldOfInterest/ResearchWork/HierarchicalMoE_Capstone/Output/Pretrain_SwinV2_DINO"
-  optimizer:
-    name: "AdamW"
-  scheduler:
-    name: null
+defaults:
+  - override /model/head: dino
+  - override /model/loss: dino
+
+experiment:
+  name: "pretrain_swinv2_dino"
+  stage: "pretrain"
+
+  training:
+    epochs: 300                    # Table 1
+    max_batches: null              # cap batches/epoch for smoke runs
+    learning_rate: 0.0005          # Section 6.1: "initial learning rate of 0.0005"
+    weight_decay: 0.01
+    momentum_teacher: 0.996        # Table 1
+    clip_grad: 3.0                 # Table 1: "Clip Gradient 3"
+    freeze_last_layer_epochs: 1    # Section 6.1: last layer frozen for first epoch
+
+    save_interval: 50
+    keep_last_n_checkpoints: 1
+    save_full_checkpoints: false
+    save_teacher_in_checkpoints: false
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_swinv2_dino"
+
+    # Where the finished backbone is published for every downstream run. The
+    # ablation and baseline suites all read this one file, so each variant starts
+    # from byte-identical encoder weights and the comparison measures the
+    # architecture rather than a second roll of the self-supervised dice.
+    # Set to null to skip publishing.
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_pretrained.pth"
+
+    optimizer:
+      name: "AdamW"                # Section 6.1
+    scheduler:
+      name: "cosine"               # Section 6.1: "cosine decay scheduler"
+      t_max: null                  # defaults to `epochs`
+      eta_min: 0.0

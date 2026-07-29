@@ -1,8 +1,33 @@
+# Root Hydra config.
+#
+# Every group below is genuinely composed: overriding `model/head` or
+# `model/loss` on the command line changes the run. Experiment files under
+# conf/experiment/ are `# @package _global_` and select the head and loss
+# appropriate to their stage.
+#
+#   python main.py finetune model.loss.lambda_kl=0.5
+#   python main.py finetune model.head.top_k=4          # submitted Top-4 routing
+#   python main.py finetune model.head.use_moe=false    # component ablation
+#
+# `model/backbone` has a single option: SwinV2 is the only encoder on the DINOv2
+# path. Supervised comparison backbones are selected through the baseline
+# experiments (conf/experiment/baseline_*.yaml), not through this group.
+
 defaults:
   - data: hierarchical_seeds
-  - experiment: pretrain_swinv2_dino
+  - model/backbone: swinv2
+  - model/head: hierarchical_moe
+  - model/loss: arcface_kl
+  - experiment: finetune_hierarchical_moe
   - tracking: default
   - _self_
 
 seed: 42
 device: "auto"
+
+hydra:
+  run:
+    dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+  sweep:
+    dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/multirun"
+    subdir: "${hydra.job.num}"

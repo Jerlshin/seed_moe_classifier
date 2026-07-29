@@ -1,0 +1,23 @@
+# DINO projection head (paper Section 4).
+#
+# "The DINO projection head consists of a multi-layer perceptron (MLP) with batch
+# normalization and GELU activation functions. The final embeddings are
+# normalized to facilitate stable self-distillation."
+#
+# `out_dim` is Table 1's "DINO Output Dimension".
+
+name: "dino_projection"
+
+in_dim: ${model.backbone.feature_dim}
+hidden_dim: 2048
+bottleneck_dim: 256
+out_dim: 65536
+num_layers: 3
+
+# Paper explicitly specifies batch normalization inside the head.
+use_batch_norm: true
+
+# Weight-normalised final layer with a frozen gain, as in the DINO reference
+# implementation; combined with `freeze_last_layer_epochs` this is what keeps
+# the first epoch stable.
+norm_last_layer: true

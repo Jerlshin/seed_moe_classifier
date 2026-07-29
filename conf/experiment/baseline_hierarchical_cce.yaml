@@ -1,0 +1,37 @@
+# @package _global_
+#
+# Baseline: two-stage hierarchical classification with plain cross-entropy.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_hierarchical_cce
+#   python scripts/run_baselines.py --models hierarchical_cce
+#
+# Coarse seed-type head, then a fine sub-variety head fed the seed-type-aware
+# feature -- but with no MoE, no cross-attention and no ArcFace. This is the
+# "simple hierarchy" control: it isolates how much of the framework's advantage
+# comes from being hierarchical at all, versus from the specific machinery
+# layered on top.
+#
+# Needs no baseline code. It is the proposed model with three toggles flipped,
+# which means it shares the encoder, the DINOv2 weights, the data pipeline and
+# the evaluation with the full model exactly. `use_residual` stays on because
+# without it the two stages would not be connected and this would stop being a
+# hierarchical baseline.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_hierarchical_cce"
+  group: "baseline"
+  variant: "hierarchical_cce"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/hierarchical_cce"
+
+model:
+  head:
+    use_moe: false               # dense block, no routing
+    use_arcface: false           # linear head + categorical cross-entropy
+    use_cross_attention: false   # no Q/K/V refinement
+    use_residual: true           # keep the coarse-to-fine link
+    use_kl_loss: false           # no hierarchy-consistency term

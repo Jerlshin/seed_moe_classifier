@@ -1,0 +1,32 @@
+# Supervised comparison baseline: ImageNet backbone + two linear heads.
+#
+# Paired with `model/loss: flat_cce`. Built by src/models/baselines.py, not by
+# `build_hierarchical_moe` -- the finetune trainer dispatches on `name`.
+#
+# Two heads rather than one 27-way head. A flat sub-variety classifier would make
+# the hierarchical alignment rate identically 1.0, because the seed type would be
+# *derived* from the sub-variety prediction and the two could not disagree by
+# construction. Independent heads make that column a real measurement, directly
+# comparable with the proposed model's.
+
+name: "flat_supervised"
+
+# Key of BASELINE_MODELS ("resnet50", "swin_tiny") or any timm identifier.
+baseline_model: "resnet50"
+pretrained: true
+
+num_seed_types: ${data.num_seed_types}
+num_sub_varieties: ${data.num_sub_varieties}
+
+# Projected to the same width as the proposed model's z so the t-SNE panels and
+# the embedding column of the results table stay comparable across rows.
+embed_dim: 384
+dropout_rate: 0.1
+
+# Declared so anything interpolating the component toggles resolves. A baseline
+# has none of these blocks by definition.
+use_moe: false
+use_arcface: false
+use_residual: false
+use_cross_attention: false
+use_kl_loss: false

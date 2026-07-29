@@ -1,0 +1,48 @@
+# Combined hierarchical objective (paper Section 5).
+#
+#   L = lambda_seed     * L_seed      (Eq. 7)
+#     + lambda_arcface  * L_ArcFace   (Eq. 13)
+#     + lambda_kl       * L_KL        (Eq. 10)
+#     + lambda_moe_load * L_load      (Sec 5.2, entropy load balancing)
+#     + lambda_moe_sparsity * L_L1    (Sec 5.2, Top-K sparsity)
+#     + lambda_cosine   * L_cos       (Sec 1, residual compactness)
+#     + lambda_sub_ce   * L_sub_CE    (auxiliary, off by default)
+
+name: "combined_arcface_kl_moe"
+
+# The `wo_kl` ablation switch. Interpolated from the head so all five component
+# toggles have a single home; setting model.head.use_kl_loss=false here means
+# Eq. 10 is not computed at all, rather than computed and multiplied by zero.
+use_kl_loss: ${model.head.use_kl_loss}
+
+lambda_seed: 1.0
+lambda_arcface: 1.0
+lambda_kl: 1.0
+lambda_moe_load: 0.01
+lambda_moe_sparsity: 0.01
+lambda_cosine: 0.1
+
+# The paper classifies sub-varieties with ArcFace alone, so the auxiliary plain
+# cross-entropy is disabled. A small value (e.g. 0.1) can help ArcFace converge
+# in the first epochs if the margin makes early training unstable.
+lambda_sub_ce: 0.0
+
+seed_label_smoothing: 0.0
+arcface_label_smoothing: 0.0
+
+# Eq. 10 direction is D_KL(P_seed || P_sub). Setting this true stops the
+# gradient into the seed branch, so KL only reshapes the sub-variety head.
+detach_kl_seed_target: false
+
+# "off_topk" penalises routing mass outside the Top-K selection, which is what
+# "restricts the selection to only the top-K most relevant experts" describes.
+# "topk" reproduces the earlier behaviour of penalising the selected weights.
+moe_sparsity_mode: "off_topk"
+
+# Divide the entropy term by log(num_experts) so it is bounded in [-1, 0] and
+# lambda_moe_load keeps its meaning if the expert count changes.
+normalize_moe_entropy: true
+
+# "residual" keeps h' aligned with h across the Eq. 9 residual connection.
+# "intra_class" instead pulls embeddings toward their class centroid.
+cosine_mode: "residual"
