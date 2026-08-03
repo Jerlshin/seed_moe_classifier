@@ -1,14 +1,48 @@
-# DINO self-distillation loss (paper Section 4, Eqs. 1-3, Table 1).
+# Self-distillation loss (paper Section 4, Eqs. 1-3, Table 1).
+#
+# Stage 1 is DINO (Caron et al., 2021) with a SwinV2 trunk, plus the two DINOv2
+# components that do not need patch tokens: KoLeo and Sinkhorn-Knopp centering.
+# It is NOT full DINOv2 -- there is no iBOT patch objective and no untied heads --
+# and the paper says so.
 
-name: "dino"
+name: "dino_self_distillation"
 
-# Eq. 2: teacher temperature ramps linearly over the first
-# `warmup_teacher_temp_epochs`, then holds at `teacher_temp`.
-warmup_teacher_temp: 0.02
-teacher_temp: 0.04
-warmup_teacher_temp_epochs: 5
+# ---------------------------------------------------------------------------
+# Collapse control, RECALIBRATED. Sharpening (low teacher temperature) and
+# centering are opposing forces; the submitted configuration set BOTH in the
+# collapsing direction at once.
+#
+# (a) Sharpening was ~2x stronger than reference: 0.02 -> 0.04 against DINO's
+#     0.04 -> 0.07, i.e. a converged teacher roughly twice as sharp as DINO's.
+# (b) Centering was noise-dominated: C in R^65536 as an EMA at m = 0.9 (a ~10
+#     step window) over 2 global crops x batch 16 = 32 teacher vectors per step
+#     is ~320 effective samples for 65,536 dimensions -- 0.005 samples per
+#     dimension, against DINO's 0.31 at batch 1024.
+#
+# A partially collapsed run has a perfectly plausible loss curve, so Fig. 6 will
+# not reveal any of this. The trainer logs teacher entropy and the prototype
+# marginal's KL to uniform, which will.
+# ---------------------------------------------------------------------------
+warmup_teacher_temp: 0.04
+teacher_temp: 0.07
+warmup_teacher_temp_epochs: 30
 
 student_temp: 0.1
 
-# Eq. 3: C_t = m * C_{t-1} + (1 - m) * qbar
-center_momentum: 0.9
+# Centering: "sinkhorn" | "ema".
+#
+# Sinkhorn-Knopp normalises the teacher's assignment to be doubly stochastic
+# WITHIN the batch, so nothing is estimated across steps and (b) above stops
+# being a problem at all. "ema" is Eq. 3, C_t = m*C_{t-1} + (1-m)*qbar.
+centering: "sinkhorn"
+sinkhorn_iterations: 3
+
+# Only consulted by centering: "ema". Raised from 0.9 (a ~10-step window) to a
+# ~100-step one, which is the least that makes the estimate meaningful.
+center_momentum: 0.99
+
+# KoLeo regulariser (DINOv2): encourages uniform feature span within a batch, so
+# near-duplicate samples do not collapse onto each other. Particularly apt here,
+# where 27 sub-varieties of four crops are near-duplicates by construction.
+# Applied to the bottleneck, not the prototype logits.
+lambda_koleo: 0.1

@@ -1,6 +1,6 @@
 # Swin Transformer V2 backbone (paper Section 4, Table 1).
 #
-# This is the *only* backbone on the DINOv2 path. The comparative ViT-S/14 entry
+# This is the *only* backbone on the self-supervised path. The comparative ViT-S/14 entry
 # from the submitted manuscript has been removed for the revision, and
 # `validate_swinv2_name` in src/models/builder.py rejects any name that is not a
 # SwinV2 variant, so a run cannot silently fall back to a different encoder.

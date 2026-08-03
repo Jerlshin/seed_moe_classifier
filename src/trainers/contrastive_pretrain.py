@@ -1,4 +1,9 @@
-"""Stage 1: DINOv2 self-supervised pretraining (paper Section 4, Table 1).
+"""Stage 1: DINO-style self-supervised pretraining (paper Section 4, Table 1).
+
+DINO (Caron et al., 2021) with a SwinV2 trunk, plus the two DINOv2 components
+that do not require patch tokens -- KoLeo and Sinkhorn-Knopp centering. It is
+**not** DINOv2: there is no iBOT patch objective and no untied heads. See
+``src/losses/dino.py``.
 
     python main.py pretrain
     python main.py pretrain data.batch_size=2 experiment.training.epochs=1 \
@@ -11,7 +16,11 @@ Per training step:
 3. The DINO loss scores every cross-view pair (Eq. 1).
 4. Backprop into the student only; clip gradients at 3.0 (Table 1); cancel the
    projection head's final-layer gradients during the first epoch.
-5. Advance the teacher by EMA at momentum 0.996 (Table 1).
+5. Advance the teacher by EMA at a cosine-scheduled momentum (0.996 -> 1.0).
+
+Gradients accumulate over ``gradient_accumulation_steps`` micro-batches before
+stepping, because every collapse guard in DINO is a batch statistic and
+``batch_size=16`` is far below the regime they were designed for.
 
 The run ends by writing two files: ``dino_pretrained_final.pth`` (full state) and
 ``dino_pretrained_backbone.pth`` (a bare ``student_backbone`` state dict). The
@@ -20,6 +29,7 @@ latter is the **only** handoff to stage 2.
 
 from __future__ import annotations
 
+import math
 import os
 import random
 import shutil
@@ -60,10 +70,24 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
+
+def cosine_value(start: float, end: float, step: int, total: int) -> float:
+    """Cosine interpolation from ``start`` to ``end`` over ``total`` steps.
+
+    DINO schedules both the teacher momentum (0.996 -> 1.0) and the weight decay
+    (0.04 -> 0.4) this way. The point of the momentum schedule is a fast-adapting
+    teacher early and a stable target late; a constant value gives neither end of
+    that trade-off, which is what the submitted configuration did.
+    """
+    if total <= 1 or start == end:
+        return float(end if total <= 1 else start)
+    progress = min(max(step, 0), total) / total
+    return float(end + (start - end) * (1.0 + math.cos(math.pi * progress)) / 2.0)
 
 
 def build_scheduler(optimizer: optim.Optimizer, cfg: DictConfig):
@@ -204,7 +228,18 @@ def main(cfg: DictConfig) -> None:
             student_temp=float(cfg.model.loss.student_temp),
             center_momentum=float(cfg.model.loss.center_momentum),
             num_global_crops=2,
+            centering=str(OmegaConf.select(cfg, "model.loss.centering", default="sinkhorn")),
+            sinkhorn_iterations=int(
+                OmegaConf.select(cfg, "model.loss.sinkhorn_iterations", default=3)
+            ),
+            lambda_koleo=float(OmegaConf.select(cfg, "model.loss.lambda_koleo", default=0.0)),
         ).to(device)
+        logger.info(
+            "Stage 1 objective: DINO self-distillation | centering=%s koleo=%s prototypes=%s",
+            criterion.centering,
+            criterion.lambda_koleo,
+            int(cfg.model.head.out_dim),
+        )
 
         optimizer = optim.AdamW(
             student_parameters,
@@ -222,7 +257,26 @@ def main(cfg: DictConfig) -> None:
         # ------------------------------------------------------- loop config
         epochs = int(cfg.experiment.training.epochs)
         max_batches = OmegaConf.select(cfg, "experiment.training.max_batches", default=None)
-        momentum = float(cfg.experiment.training.momentum_teacher)
+        momentum_start = float(cfg.experiment.training.momentum_teacher)
+        momentum_final = OmegaConf.select(
+            cfg, "experiment.training.momentum_teacher_final", default=None
+        )
+        weight_decay_start = float(cfg.experiment.training.weight_decay)
+        weight_decay_final = OmegaConf.select(
+            cfg, "experiment.training.weight_decay_final", default=None
+        )
+        accumulation_steps = max(
+            int(OmegaConf.select(cfg, "experiment.training.gradient_accumulation_steps", default=1)), 1
+        )
+        # Every collapse guard in DINO is a batch statistic, so the number that
+        # matters is the effective batch, not `data.batch_size`.
+        logger.info(
+            "Effective batch: %s x %s accumulation = %s images (%s teacher views/step)",
+            int(cfg.data.batch_size),
+            accumulation_steps,
+            int(cfg.data.batch_size) * accumulation_steps,
+            int(cfg.data.batch_size) * accumulation_steps * 2,
+        )
         clip_grad = cfg.experiment.training.clip_grad
         save_interval = int(cfg.experiment.training.save_interval)
         save_full_checkpoints = bool(cfg.experiment.training.save_full_checkpoints)
@@ -235,8 +289,14 @@ def main(cfg: DictConfig) -> None:
         global_step = 0
         loss_history: list[float] = []
 
-        logger.info("Training for %s epochs at lr=%s, teacher momentum=%s.",
-                    epochs, cfg.experiment.training.learning_rate, momentum)
+        momentum = momentum_start
+        logger.info(
+            "Training for %s epochs at lr=%s, teacher momentum=%s -> %s.",
+            epochs,
+            cfg.experiment.training.learning_rate,
+            momentum_start,
+            momentum_final if momentum_final is not None else "(constant)",
+        )
 
         for epoch in range(epochs):
             epoch_started = time.perf_counter()
@@ -253,38 +313,71 @@ def main(cfg: DictConfig) -> None:
                 # Teacher sees only the two global crops (paper Fig. 7).
                 with torch.no_grad():
                     teacher_out = [model.forward_teacher(view) for view in views[:2]]
-                student_out = [model.forward_student(view) for view in views]
-                loss = criterion(student_out, teacher_out, epoch=epoch)
+                student_pairs = [model.forward_student(view, return_bottleneck=True) for view in views]
+                student_out = [logits for logits, _ in student_pairs]
+                # KoLeo measures uniformity of the *representation*, so it reads
+                # the bottleneck of the global views, not the prototype logits.
+                student_embeddings = (
+                    torch.cat([bottleneck for _, bottleneck in student_pairs[:2]], dim=0)
+                    if criterion.lambda_koleo > 0
+                    else None
+                )
+                loss = criterion(
+                    student_out,
+                    teacher_out,
+                    epoch=epoch,
+                    # Explicit view identifiers. Matching by position is only
+                    # correct while the student's first two views are the two
+                    # globals in the teacher's order -- an invariant nothing
+                    # enforced, and one whose violation would silently skip a
+                    # global-local pair and include a same-view pair.
+                    student_view_ids=transform.view_ids,
+                    teacher_view_ids=transform.global_view_ids,
+                    student_embeddings=student_embeddings,
+                )
 
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
+                if batch_idx % accumulation_steps == 0:
+                    optimizer.zero_grad(set_to_none=True)
+                (loss / accumulation_steps).backward()
 
+                is_step = (batch_idx + 1) % accumulation_steps == 0
                 gradient_norm = None
-                if artifacts.log_gradient_norms and global_step % log_every_steps == 0:
-                    gradient_norm = tracker.log_gradient_norms(model, global_step)
-
                 clipped_norm = None
-                if clip_grad is not None and float(clip_grad) > 0:
-                    clipped_norm = torch.nn.utils.clip_grad_norm_(
-                        student_parameters, max_norm=float(clip_grad)
+
+                if is_step:
+                    if artifacts.log_gradient_norms and global_step % log_every_steps == 0:
+                        gradient_norm = tracker.log_gradient_norms(model, global_step)
+
+                    if clip_grad is not None and float(clip_grad) > 0:
+                        clipped_norm = torch.nn.utils.clip_grad_norm_(
+                            student_parameters, max_norm=float(clip_grad)
+                        )
+
+                    # Section 6.1: last layer frozen for the first epoch. Cancelled
+                    # *after* clipping and *before* step(), matching the reference
+                    # implementation's ordering.
+                    model.student_head.cancel_last_layer_gradients(current_epoch=epoch)
+
+                    if (
+                        artifacts.log_gradient_histograms
+                        and int(intervals.gradient_histogram_every_epochs) > 0
+                        and (epoch + 1) % int(intervals.gradient_histogram_every_epochs) == 0
+                        and batch_idx == 0
+                    ):
+                        tracker.log_gradient_histograms(model, global_step)
+
+                    optimizer.step()
+
+                    # EMA teacher update, cosine-scheduled 0.996 -> 1.0 (DINO).
+                    momentum = (
+                        cosine_value(momentum_start, float(momentum_final), epoch, epochs)
+                        if momentum_final is not None
+                        else momentum_start
                     )
-
-                # Section 6.1: last layer frozen for the first epoch.
-                model.student_head.cancel_last_layer_gradients(current_epoch=epoch)
-
-                if (
-                    artifacts.log_gradient_histograms
-                    and int(intervals.gradient_histogram_every_epochs) > 0
-                    and (epoch + 1) % int(intervals.gradient_histogram_every_epochs) == 0
-                    and batch_idx == 0
-                ):
-                    tracker.log_gradient_histograms(model, global_step)
-
-                optimizer.step()
-
-                # EMA teacher update (Table 1: momentum 0.996).
-                update_momentum(model.student_backbone, model.teacher_backbone, m=momentum)
-                update_momentum(model.student_head, model.teacher_head, m=momentum)
+                    update_momentum(model.student_backbone, model.teacher_backbone, m=momentum)
+                    update_momentum(model.student_head, model.teacher_head, m=momentum)
+                else:
+                    momentum = momentum_start
 
                 total_loss += float(loss.detach())
                 batches_seen += 1
@@ -295,6 +388,11 @@ def main(cfg: DictConfig) -> None:
                         "loss": float(loss.detach()),
                         "lr": lr,
                         "teacher_temp": criterion.teacher_temperature(epoch),
+                        "teacher_momentum": momentum,
+                        "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                        # The loss curve of a partially collapsed run looks
+                        # perfectly plausible. These are the numbers that do not.
+                        **criterion.last_metrics,
                     }
                     if gradient_norm is not None:
                         step_metrics["gradient_norm"] = gradient_norm
@@ -346,6 +444,15 @@ def main(cfg: DictConfig) -> None:
             if scheduler is not None:
                 scheduler.step()
             new_lr = optimizer.param_groups[0]["lr"]
+
+            # Weight decay is cosine-scheduled 0.04 -> 0.4 in DINO. The submitted
+            # constant 0.01 sat below even the schedule's starting value.
+            if weight_decay_final is not None:
+                decay = cosine_value(
+                    weight_decay_start, float(weight_decay_final), epoch + 1, epochs
+                )
+                for group in optimizer.param_groups:
+                    group["weight_decay"] = decay
 
             tracker.log_metrics(
                 {

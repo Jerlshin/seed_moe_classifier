@@ -39,13 +39,75 @@ def test_cross_attention_applies_layernorm_to_the_residual():
 
 
 def test_cross_attention_returns_weights_only_when_requested():
-    block = CrossAttention(dim=32, num_heads=4, dropout=0.0)
-    query = torch.randn(4, 1, 32)
-    assert block(query, query, query, need_weights=False).attn_weights is None
-    weights = block(query, query, query, need_weights=True).attn_weights
+    """Real weights in ``attention`` mode; ``None`` -- never a constant -- in ``affine``.
+
+    Over a length-1 key sequence ``softmax(QK^T/sqrt(d))`` is identically 1.0 for
+    any Q and K, so the "attention map" the submitted code exposed through
+    ``HierarchicalOutput.attn_weights`` was a constant image. Any figure drawn
+    from it showed nothing. The affine path returns ``None`` so that cannot
+    happen by accident.
+    """
+    grid = CrossAttention(dim=32, num_heads=4, dropout=0.0, mode="attention")
+    query = torch.randn(4, 9, 32)
+    assert grid(query, query, query, need_weights=False).attn_weights is None
+    weights = grid(query, query, query, need_weights=True).attn_weights
     assert weights is not None
-    # Single key/value token: attention over one key is trivially 1.0.
+    assert weights.shape[-1] == 9
+    # A genuine distribution over 9 keys, not the scalar 1.
     assert torch.allclose(weights.sum(dim=-1), torch.ones_like(weights.sum(dim=-1)), atol=1e-5)
+    assert not torch.allclose(weights, torch.ones_like(weights))
+
+    pooled = CrossAttention(dim=32, num_heads=4, dropout=0.0, mode="affine")
+    single = torch.randn(4, 1, 32)
+    assert pooled(single, single, single, need_weights=True).attn_weights is None
+
+
+def test_affine_mode_allocates_no_unreachable_parameters():
+    """Q and K over one token can never receive gradient, so they are not built.
+
+    ``nn.MultiheadAttention(384, 8)`` packs 295,680 parameters into its Q and K
+    slices. Over a length-1 sequence they contribute nothing to the output and
+    ``dA/dW_Q = dA/dW_K = 0`` exactly -- yet they were counted in both the "Total
+    Params" and "Active Params" columns of the results table. The affine mode
+    substitutes the single Linear that spans the identical function class.
+    """
+    attention = CrossAttention(dim=64, num_heads=4, dropout=0.0, mode="attention")
+    affine = CrossAttention(dim=64, num_heads=4, dropout=0.0, mode="affine")
+    assert affine.attn is None
+    assert attention.attn is not None
+    assert sum(p.numel() for p in affine.parameters()) < sum(
+        p.numel() for p in attention.parameters()
+    )
+
+
+def test_length_one_attention_is_provably_affine():
+    """The claim itself, verified rather than argued.
+
+    One backward through a length-1 attention must leave the Q and K slices of
+    ``in_proj_weight`` with exactly zero gradient. This is the test that turns
+    F-03 from an analytical argument into a measurement -- and it is why the
+    pooled path does not build them.
+    """
+    torch.manual_seed(0)
+    block = CrossAttention(dim=16, num_heads=2, dropout=0.0, mode="attention")
+    single = torch.randn(3, 1, 16, requires_grad=True)
+    block(single, single, single).features.sum().backward()
+
+    # in_proj_weight packs [Q; K; V] row-wise.
+    grad = block.attn.in_proj_weight.grad
+    assert grad is not None
+    query_key_norm = grad[: 2 * 16].abs().sum()
+    value_norm = grad[2 * 16 :].abs().sum()
+
+    # Analytically the Q/K gradient is exactly zero; the fused attention kernel
+    # leaves float dust, so the assertion is that it is negligible *against the
+    # V gradient* rather than against an absolute epsilon.
+    assert value_norm > 0
+    assert query_key_norm < value_norm * 1e-6
+
+    # And the map itself is the constant 1.0, whatever Q and K contain.
+    weights = block(single, single, single, need_weights=True).attn_weights
+    assert torch.allclose(weights, torch.ones_like(weights), atol=1e-6)
 
 
 def test_cross_attention_rejects_unknown_variant():

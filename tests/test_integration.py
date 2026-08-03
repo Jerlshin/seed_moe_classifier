@@ -98,7 +98,9 @@ def trainer_pieces(dataset):
 
 
 def test_splits_are_disjoint_and_cover_the_dataset(dataset):
-    splits, test_indices = split_dataset(dataset, test_size=0.2, num_folds=1, seed=42)
+    splits, test_indices, _ = split_dataset(
+        dataset, test_size=0.2, num_folds=1, seed=42, protocol="stratified"
+    )
     (train_indices, val_indices) = splits[0]
 
     assert not set(train_indices) & set(val_indices)
@@ -108,27 +110,82 @@ def test_splits_are_disjoint_and_cover_the_dataset(dataset):
 
 
 def test_kfold_produces_the_requested_number_of_folds(dataset):
-    splits, _ = split_dataset(dataset, test_size=0.2, num_folds=3, seed=42)
+    splits, _, _ = split_dataset(
+        dataset, test_size=0.2, num_folds=3, seed=42, protocol="stratified"
+    )
     assert len(splits) == 3
     for train_indices, val_indices in splits:
         assert not set(train_indices) & set(val_indices)
 
 
-def test_stratification_key_encodes_both_levels(dataset):
+def test_stratification_key_is_the_sub_variety_label(dataset):
+    """The composite ``seed * 1000 + sub`` key induced exactly these strata.
+
+    The repository used to justify the composite key by claiming that
+    "stratifying on sub-variety alone would not guarantee seed-type balance".
+    That is false: sub-variety labels are global and each has exactly one parent,
+    so ``seed = parent(sub)`` is a deterministic function of ``sub`` and the map
+    ``sub -> seed*1000 + sub`` is a bijection. Same partition, simpler key, and
+    the stated reason no longer says something untrue.
+    """
     labels = stratification_labels(dataset)
     assert len(labels) == len(dataset)
-    for key, (_, seed_label, sub_label) in zip(labels, dataset.samples):
-        assert key == seed_label * 1000 + sub_label
+    for key, (_, _, sub_label) in zip(labels, dataset.samples):
+        assert key == sub_label
+
+    composite = np.array([s * 1000 + b for _, s, b in dataset.samples])
+    # A bijection induces identical strata: equal keys iff equal composite keys.
+    assert len(set(zip(labels.tolist(), composite.tolist()))) == len(set(labels.tolist()))
+
+
+def test_grouped_splitting_keeps_source_photographs_on_one_side(dataset):
+    """The protocol the real dataset needs: 9,357 crops from 81 photographs.
+
+    Under crop-level splitting, near-duplicate views of the same physical seeds
+    -- same lighting, same background, overlapping bounding boxes -- land on both
+    sides of the boundary, and the reported accuracy is substantially a
+    memorisation score.
+    """
+    splits, test_indices, report = split_dataset(
+        dataset, test_size=0.3, num_folds=1, seed=42, protocol="grouped"
+    )
+    groups = dataset.source_groups()
+    train_groups = set(groups[splits[0][0]].tolist())
+    test_groups = set(groups[test_indices].tolist())
+
+    assert not (train_groups & test_groups)
+    assert report["shared_source_groups"] == 0
+    assert report["protocol"] == "grouped"
+
+
+def test_split_report_quantifies_leakage_under_the_ungrouped_protocol(dataset):
+    """The stratified protocol is retained, but it must carry its own indictment.
+
+    Reporting the leak is what turns it from a hidden flaw into a measured
+    result: ``leakage_ungrouped`` in the ablation suite runs exactly this and the
+    delta against ``full_model`` is the number the paper should quote.
+    """
+    _, _, report = split_dataset(
+        dataset, test_size=0.3, num_folds=1, seed=42, protocol="stratified"
+    )
+    assert report["protocol"] == "stratified"
+    assert report["shared_source_groups"] >= 0
+    assert 0.0 <= report["leaked_test_fraction"] <= 1.0
 
 
 def test_split_manifest_round_trips(dataset, tmp_path):
-    splits, test_indices = split_dataset(dataset, test_size=0.2, num_folds=1, seed=42)
-    path = save_split_manifest(tmp_path, splits, test_indices, dataset)
+    splits, test_indices, _ = split_dataset(
+        dataset, test_size=0.2, num_folds=1, seed=42, protocol="stratified"
+    )
+    path = save_split_manifest(tmp_path, splits, test_indices, dataset, protocol="stratified")
 
     payload = np.load(path, allow_pickle=True)
     assert "fold_1_train_indices" in payload
     assert np.array_equal(payload["test_indices"], test_indices)
     assert list(payload["subvariety_to_seed_type"]) == dataset.get_subvariety_to_seed_type()
+    # Persisted so a reviewer can verify the grouping rather than trusting the name.
+    assert np.array_equal(payload["source_groups"], dataset.source_groups())
+    assert str(payload["split_protocol"]) == "stratified"
 
 
 # --------------------------------------------------------------- epoch loop

@@ -174,57 +174,125 @@ that is where a collapsing DINO run collapses first:
 
 ## 5. `CustomDINOLoss` — Eqs. 1-3 (`src/losses/dino.py`)
 
-```python
-CustomDINOLoss(out_dim, num_crops, warmup_teacher_temp, teacher_temp,
-               warmup_teacher_temp_epochs, num_epochs, student_temp=0.1,
-               center_momentum=0.9, num_global_crops=2)
-```
+### What stage 1 actually is
 
-**Cross-view objective (Eq. 1):**
+This module implements **DINO (Caron et al., 2021) with a SwinV2 trunk**, plus
+two of DINOv2's four additions. It is not DINOv2, and nothing in the tree claims
+it is any more.
+
+| DINOv2 component | Present? |
+| --- | --- |
+| iBOT patch-level masked-prediction objective | **No** — needs token-level student/teacher outputs and a masking pipeline |
+| KoLeo regulariser | **Yes** (`koleo_regularizer`) |
+| Sinkhorn-Knopp centering replacing softmax-with-EMA-centering | **Yes** (`sinkhorn_knopp`), and it is the default |
+| Untied image-level / patch-level head weights | N/A — one head |
+
+The submitted tree named this DINOv2 throughout, down to the published checkpoint
+filename. That is a missing-method claim with a known magnitude, not a cosmetic
+naming choice: DINOv2's own ablations credit the iBOT term with ~3 % on dense
+tasks and KoLeo with >8 % on retrieval. The honest description — used in the
+class docstrings, the config names and the paper — is **"DINO-style
+self-distillation with the KoLeo and Sinkhorn components of DINOv2"**.
+
+### Cross-view objective (Eq. 1)
 
 $$
 \mathcal{L}_{\text{DINO}} = -\frac{1}{N}\sum_i \sum_{v \neq q} q_v \cdot \log p_v
 $$
 
-Implemented in `compute_dino_loss` (`dino.py:115-144`) as a double loop over
-`(teacher_view, student_view)` pairs, **skipping same-view pairs**:
+Only *cross-view* pairs contribute: a student view is never scored against the
+teacher's output for that same view, which is what forces invariance to the
+augmentation rather than memorisation of it. With 2 global and 4 local crops that
+is `2 x 6 - 2 = 10` terms.
+
+**View identity is now explicit.** The submitted code skipped same-view pairs
+with `if student_index == teacher_index`, which is correct only while the
+student's first two views happen to be the two globals in the teacher's order —
+an invariant nothing enforced. If `_concat_outputs` ordering ever changed, a
+global-local pair would be silently skipped and a same-view pair silently
+included, with no error. `forward` now takes `student_view_ids` and
+`teacher_view_ids`, supplied by `DataAugmentationDINO.view_ids` /
+`.global_view_ids`, and a test asserts exactly 10 terms.
+
+### Collapse control — both guards were set toward collapse
+
+DINO prevents collapse by balancing two opposing forces: **sharpening** (a low
+teacher temperature pulls targets toward one-hot) and **centering** (subtracting a
+running mean pushes them toward uniform). The submitted configuration set both in
+the collapsing direction simultaneously.
+
+**(a) Sharpening was ~2x stronger than reference.** Config: `warmup_teacher_temp
+0.02 -> teacher_temp 0.04`. DINO: `0.04 -> 0.07`. A teacher at `tau = 0.04` is
+roughly twice as sharp as DINO's converged 0.07, for the whole run.
+
+**(b) Centering was noise-dominated.** `C` lives in `R^65536` and was an EMA at
+`m = 0.9` — an effective window of ~10 steps — over `2 global crops x batch 16 =
+32` teacher vectors per step:
+
+| | Submitted | DINO reference |
+| --- | --- | --- |
+| Teacher vectors per step | 32 | 2,048 (batch 1024 x 2) |
+| Effective samples in `C` | ~320 | ~20,480 |
+| Samples per estimated dimension | **0.005** | 0.31 |
+
+That is **1/64th** the sample density DINO has, for the same 65,536 dimensions.
+The counterweight to sharpening was essentially noise.
+
+### The corrections
+
+| Parameter | Submitted | Revision | Why |
+| --- | --- | --- | --- |
+| `warmup_teacher_temp -> teacher_temp` | 0.02 -> 0.04 | **0.04 -> 0.07** | match DINO; sharpening is the collapse-inducing force |
+| `warmup_teacher_temp_epochs` | 5 | **30** | DINO's ramp length |
+| `centering` | softmax + EMA | **`sinkhorn`** | normalises *within the batch*; nothing estimated across steps |
+| `center_momentum` | 0.9 | **0.99** | only used by the `ema` path; window 10 -> 100 steps |
+| `out_dim` | 65,536 | **8,192** | see §4 |
+| `lambda_koleo` | — | **0.1** | uniform feature span within a batch |
+
+### Sinkhorn-Knopp centering
 
 ```python
-for teacher_index, teacher_probs in enumerate(teacher_chunks):      # 2 global
-    for student_index, student_logits in enumerate(student_chunks):  # 6 total (2 global + 4 local)
-        if student_index == teacher_index:
-            continue    # no cross-view signal from scoring a view against itself
-        loss = torch.sum(-teacher_probs * F.log_softmax(student_logits, dim=-1), dim=-1)
+sinkhorn_knopp(logits, temperature, iterations=3) -> assignments  # [batch, out_dim]
 ```
 
-With 2 global crops (teacher) and 6 total student views, this produces
-`2 × 6 − 2 = 10` cross-view terms, averaged. Skipping same-view pairs is what
-forces the representation to become invariant to the augmentation rather than
-to memorize a single view.
+Alternately normalises prototype and sample marginals so the assignment is doubly
+stochastic **within the batch**. Because nothing is estimated across steps, (b)
+above stops being a problem at all rather than being mitigated.
 
-**Temperature schedule (Eq. 2), `teacher_temperature(epoch)`:** ramps
-linearly from `warmup_teacher_temp` (0.02) to `teacher_temp` (0.04) over the
-first `warmup_teacher_temp_epochs` (5) epochs via
-`np.linspace(...)`, then holds constant (`dino.py:78-93`). A cold (low-
-temperature) teacher early on would produce overly sharp targets the student
-could collapse onto before it has learned anything.
+Computed entirely in **log space** with `logsumexp`. The direct form
+`exp(logits / tau)` overflows immediately at these temperatures — unit-scale
+logits at `tau = 0.04` reach `exp(25)` — and a single `inf` turns the whole
+assignment into `nan`, silently, because the result is detached and only surfaces
+later as a `nan` loss. This was caught by a test on the first run.
 
-**Centering (Eq. 3), `update_center`:**
+### KoLeo regulariser
 
 $$
-C_t = m \cdot C_{t-1} + (1-m) \cdot \bar{q}, \qquad m = 0.9
+\mathcal{L}_{\text{koleo}} = -\frac{1}{n}\sum_i \log\Big(\min_{j \neq i} \lVert z_i - z_j \rVert\Big)
 $$
 
-subtracted from the teacher logits **before** the softmax in
-`compute_dino_loss` (`dino.py:123,126`). Sharpening (low temperature) pushes
-toward one-hot outputs; centering alone would push toward a uniform output.
-The two forces in opposition are what keeps the representation from
-collapsing in either direction.
+Encourages a uniform span of the feature sphere within a batch, so
+distinct-but-similar samples do not collapse onto each other. That is precisely
+the failure mode a *fine-grained* task cannot tolerate: 27 sub-varieties of four
+crops are near-duplicates by construction.
 
-Both `student_output` and `teacher_output` may be passed as either a list of
-per-view tensors or one pre-stacked tensor; `_concat_outputs`
-(`dino.py:155-162`) normalizes either form into one `[views * batch, dim]`
-tensor before chunking.
+Applied to the **bottleneck**, not the 65k-wide prototype logits — uniformity is a
+property of the representation, and measuring it in prototype space would measure
+the head's output distribution instead. `DINOHead.forward(x,
+return_bottleneck=True)` supplies it.
+
+### Collapse diagnostics
+
+A partially collapsed run has a **perfectly plausible-looking loss curve**, so
+Fig. 6 will not reveal any of the above. `collapse_metrics()` reports, every
+logged step:
+
+* `teacher_entropy` — falling toward 0 means the targets have sharpened to one-hot
+* `teacher_entropy_max` — `log(out_dim)`, for scale
+* `prototype_kl_to_uniform` — rising means the batch is using a shrinking subset
+  of the prototypes
+
+Either alone is the signature the loss curve hides.
 
 ## 6. `contrastive_pretrain.py` training loop (per step)
 
@@ -267,23 +335,59 @@ reads this one published file, which is what keeps the comparison suite valid
 
 ## 7. Hyperparameters (`conf/experiment/pretrain_swinv2_dino.yaml`, `conf/model/loss/dino.yaml`)
 
-| Setting | Value | Source |
+| Key | Value | Source |
 | --- | --- | --- |
+| `backbone.name` | `swinv2_base_window16_256` | Table 1 |
+| `data.batch_size` | 16 | Table 1 |
+| `gradient_accumulation_steps` | **4** | revision — effective batch 64 |
 | `epochs` | 300 | Table 1 |
-| `learning_rate` | 0.0005 | Section 6.1 |
-| `weight_decay` | 0.01 | |
-| `momentum_teacher` | 0.996 | Table 1 |
+| `learning_rate` | 0.0005, cosine decay | Section 6.1 |
 | `clip_grad` | 3.0 | Table 1 |
 | `freeze_last_layer_epochs` | 1 | Section 6.1 |
-| `optimizer.name` | AdamW | Section 6.1 |
-| `scheduler.name` | cosine | Section 6.1: "cosine decay scheduler" |
-| `warmup_teacher_temp` → `teacher_temp` | 0.02 → 0.04 | Table 1 |
-| `warmup_teacher_temp_epochs` | 5 | Table 1 |
-| `center_momentum` | 0.9 | Eq. 3 |
-| `student_temp` | 0.1 | |
-| `out_dim` (DINOHead) | 65,536 | Table 1 |
+| `momentum_teacher` | 0.996 -> **1.0, cosine** | Table 1 start, DINO schedule |
+| `weight_decay` | **0.04 -> 0.4, cosine** | DINO schedule (was constant 0.01) |
+| `head.out_dim` | **8192** | revision (Table 1: 65,536) |
+| `head.use_batch_norm` | **`"layer"`** | revision (Section 4 says batch) |
+| `loss.warmup_teacher_temp -> teacher_temp` | **0.04 -> 0.07 over 30 epochs** | revision (Table 1: 0.02 -> 0.04 over 5) |
+| `loss.centering` | **`sinkhorn`** | revision |
+| `loss.lambda_koleo` | **0.1** | revision |
 
-Logged every step (subject to `tracking.intervals.log_every_steps`): loss,
-learning rate, current teacher temperature (making the Eq. 2 schedule
-directly visible), gradient norms; every epoch: mean loss, duration, a loss
-curve figure (paper Fig. 6) every `figure_every_epochs`.
+`tests/conftest.py` carries both the submitted and the revised value for every
+one of these as named constants (`SUBMITTED_TEACHER_TEMP` /
+`REVISED_TEACHER_TEMP`, and so on), so a test asserting a bare number cannot
+silently become a claim about whichever the reader assumed.
+
+### Why the effective batch matters
+
+Every collapse guard in DINO is a **batch statistic**. Batch 16 is far below the
+regime they were designed for, so gradient accumulation raises the effective batch
+to 64 before stepping — which also raises the teacher-vector count per optimiser
+step from 32 to 128.
+
+### The local-crop resolution confound — measured, and not removable
+
+`local_crop_size: 101` crops are resized back up to 256 because SwinV2's shifted
+windows need a fixed resolution. Every local view therefore carries a systematic
+low-pass signature that global views do not, and the student can distinguish local
+from global by blur alone — a shortcut that partially substitutes for the
+local-to-global correspondence the multi-crop objective exists to teach. The
+per-view blur probabilities (global-1: 1.0, global-2: 0.1, local: 0.5) aggravate
+it.
+
+`dynamic_img_size=True` does **not** remove this. timm accepts the flag for
+SwinV2, but the attention still asserts the native resolution:
+
+```text
+>>> model = timm.create_model("swinv2_tiny_window16_256", dynamic_img_size=True)
+>>> model(torch.randn(2, 3, 101, 101))
+AssertionError: Input height (101) doesn't match model (256).
+```
+
+That is measured, and `tests/test_models.py` pins it, so nobody re-derives the
+hypothesis from the flag's name.
+
+The confound is therefore documented rather than removed.
+`augmentation.match_view_lowpass: true` mitigates it by putting the *global* crops
+through the same downsample-then-upsample cycle, so the artefact carries no
+discriminative signal. It is off by default because it changes the submitted
+recipe, and it is the honest fix if the shortcut turns out to matter.

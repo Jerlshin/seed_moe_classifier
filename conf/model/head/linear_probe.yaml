@@ -1,0 +1,33 @@
+# Linear probe on the frozen self-supervised encoder.
+#
+# Two linear layers, nothing else: Linear(384, 4) and Linear(384, 27), plain CE.
+# Built by src/models/baselines.py; the finetune trainer dispatches on `name`.
+#
+# This is the control a reviewer asks for before any other: does any of the head
+# machinery beat a linear layer on the same features? It shares the encoder path
+# with the proposed model exactly, so the gap is attributable to the head rather
+# than to a different representation.
+#
+# Note that `baseline_hierarchical_cce` is NOT this control -- it keeps
+# use_residual, so it retains the coarse-to-fine link and the SubVarietyEmbedding
+# MLP. That is a composed point in the ablation lattice, not an independent
+# baseline.
+
+name: "linear_probe"
+
+feature_dim: 384
+embed_dim: 384
+
+num_seed_types: ${data.num_seed_types}
+num_sub_varieties: ${data.num_sub_varieties}
+
+# The probe pools tokens itself; the encoder is built in pooled mode for it.
+token_mode: "pooled"
+
+# Declared so anything interpolating the component toggles resolves. A probe has
+# none of these blocks by definition.
+use_moe: false
+use_arcface: false
+use_residual: false
+use_cross_attention: false
+use_kl_loss: false

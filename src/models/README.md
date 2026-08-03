@@ -40,7 +40,7 @@ Two consequences that matter in practice:
 and is called from both `BackboneFeatureExtractor` and `DINO.__init__`. The
 comparative ViT-S/14 path from the submitted manuscript has been removed, so a
 run cannot silently fall back to a different encoder. Supervised comparison
-backbones belong in `baselines.py`, never on the DINOv2 path.
+backbones belong in `baselines.py`, never on the self-supervised path.
 
 ## `HierarchicalSeedClassifier` (`builder.py`)
 
@@ -79,7 +79,7 @@ Two details that are easy to implement wrongly, and that have dedicated tests:
 | Flag | Effect when `False` |
 | --- | --- |
 | `use_moe` | `DenseExpertBlock` replaces the router — one always-on block |
-| `use_arcface` | `LinearSubVarietyHead` replaces ArcFace; the objective becomes CE |
+| `use_arcface` | resolves `sub_head_variant` to `linear` unless set explicitly; the objective becomes CE. Prefer `sub_head_variant=normface` to ablate the **margin alone** |
 | `use_residual` | `seed_projection` is `None`; `h' = h`, `projected_seed` is zeros |
 | `use_cross_attention` | `cross_attention` is `None`; `h'' = h'` |
 
@@ -98,7 +98,7 @@ but is consumed by the loss builder; see [`../losses/README.md`](../losses/READM
 ranking, and the KL hierarchy term. `sub_margin_logits` carry the angular margin
 on the target class and are what the ArcFace cross-entropy consumes. Passing no
 labels (i.e. at evaluation) makes them identical, so metrics are never inflated
-by a training-time margin. With `use_arcface=False` they are always identical,
+by a training-time margin. With a margin-free head (`normface`, `linear`) they are always identical,
 which is exactly why the loss needs no branch for that ablation.
 
 ## `BackboneFeatureExtractor` (`builder.py`)
@@ -111,7 +111,7 @@ use this directly only when the unprojected feature is what you want (e.g.
   two-stage recipe. `train()` is overridden so a frozen backbone can never be
   put back into train mode by an enclosing `model.train()` call.
 * `freeze=False` fine-tunes the encoder jointly with the head, which is what
-  Section 4 describes. See `PAPER_AUDIT.md` §6.1.
+  Section 4 describes. See `PAPER_AUDIT.md` §7.1.
 * `load_checkpoint` returns the missing/unexpected key report. `strict=False` is
   the default, so without this a mismatched checkpoint would load quietly and
   surface only as unexplained metrics; the trainer logs the report.

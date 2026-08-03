@@ -12,7 +12,13 @@ predictions -- and produces, into ``outputs/reports/``:
 * ``summary_metrics.csv``: one row per variant or baseline, with the columns the
   revision requests (accuracy, precision, recall, macro/micro F1, KL alignment
   rate, total and active parameters, inference latency) plus seed-type metrics,
-  AUC, throughput, FLOPs and peak memory.
+  AUC, ECE, expert-label NMI, dead-expert count, throughput, FLOPs and peak
+  memory. Repeated seeds of one variant collapse into **mean +- SD**, and each
+  variant carries **McNemar's exact p-value against ``full_model``** with a
+  Holm-Bonferroni adjustment across the family. The paired test is available
+  because every variant trains on the byte-identical test split -- which makes
+  it both valid and strictly more powerful than comparing independent intervals.
+* ``summary_metrics_per_run.csv``: the un-aggregated table, one row per run.
 * ``{variant}_confusion_seed_type.png``: 4-class matrix, row-normalised.
 * ``{variant}_confusion_sub_variety.png``: all 27 sub-varieties with full,
   unabbreviated tick labels on both axes.
@@ -43,6 +49,7 @@ from src.utils.evaluation import (
     RunSummary,
     collect_run_summaries,
     load_test_predictions,
+    paired_significance,
     save_publication_figures,
     write_summary_csv,
 )
@@ -70,7 +77,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-figures", action="store_true", help="Write only summary_metrics.csv.")
     parser.add_argument("--tsne-perplexity", type=float, default=30.0)
     parser.add_argument("--max-tsne-samples", type=int, default=2000)
+    parser.add_argument(
+        "--reference",
+        default="full_model",
+        help="Variant every other is tested against with McNemar's exact test.",
+    )
     return parser.parse_args()
+
+
+def prediction_paths(summaries: list[RunSummary]) -> dict[str, list[str]]:
+    """``{variant: [test_predictions.npz, ...]}`` for the paired significance test."""
+    paths: dict[str, list[str]] = {}
+    for summary in summaries:
+        candidate = summary.artifacts.get("predictions") or (
+            Path(summary.run_dir) / PREDICTIONS_FILENAME
+        )
+        if Path(candidate).exists():
+            paths.setdefault(summary.name, []).append(str(candidate))
+    return paths
 
 
 def regenerate_figures(summary: RunSummary, output_dir: Path, args: argparse.Namespace) -> int:
@@ -101,6 +125,7 @@ def regenerate_figures(summary: RunSummary, output_dir: Path, args: argparse.Nam
         sub_scores=data.get("sub_scores"),
         top_k_indices=data.get("expert_indices"),
         num_experts=int(summary.efficiency.get("parameters", {}).get("num_experts", 6) or 6),
+        tokens_per_sample=int(data.get("tokens_per_sample", 1)),
     )
 
     written = save_publication_figures(
@@ -137,8 +162,31 @@ def main() -> int:
     for summary in summaries:
         print(f"  [{summary.group}] {summary.name} <- {summary.run_dir}")
 
-    csv_path = write_summary_csv(output_dir / "summary_metrics.csv", summaries)
-    print(f"\nSummary table: {csv_path}")
+    significance = paired_significance(
+        prediction_paths(summaries), reference=args.reference, task="sub"
+    )
+    if significance:
+        print(f"\nMcNemar's exact test against {args.reference!r} (Holm-adjusted):")
+        for name, outcome in sorted(significance.items(), key=lambda item: item[1]["p_value"]):
+            print(
+                f"  {name:<28} delta={outcome['accuracy_delta'] * 100:+6.2f} pp  "
+                f"n01={int(outcome['n01']):<5} n10={int(outcome['n10']):<5} "
+                f"p={outcome['p_value']:.4g}  p_holm={outcome.get('p_value_holm', float('nan')):.4g}"
+            )
+    else:
+        print(
+            f"\nNo paired significance test: {args.reference!r} has no test_predictions.npz, "
+            "or no variant shares its sample count."
+        )
+
+    csv_path = write_summary_csv(
+        output_dir / "summary_metrics.csv", summaries, significance=significance
+    )
+    per_run_path = write_summary_csv(
+        output_dir / "summary_metrics_per_run.csv", summaries, aggregate=False
+    )
+    print(f"\nSummary table (mean +- SD): {csv_path}")
+    print(f"Per-run table:               {per_run_path}")
 
     if not args.no_figures:
         print("\nRegenerating figures:")

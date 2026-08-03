@@ -36,7 +36,7 @@ Only one of the five component toggles reaches this package:
 gradient is computed for it, and it **overrides** a non-zero `lambda_kl` rather
 than being silently re-enabled by one.
 
-`use_arcface=false` deliberately needs **no switch here**. It swaps the model's
+A margin-free sub-variety head deliberately needs **no switch here**. It swaps the model's
 head for `LinearSubVarietyHead`, which returns its logits unchanged as
 `sub_margin_logits`. `L_ArcFace` is a cross-entropy over `sub_margin_logits`, so
 with no margin present it *is* the categorical cross-entropy the ablation calls

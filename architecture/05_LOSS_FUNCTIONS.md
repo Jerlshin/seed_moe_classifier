@@ -10,47 +10,91 @@ combined objective plus the revision's cosine-compactness addition (Section
 ## 1. The combined objective (stage 2)
 
 ```text
-L = λ_seed     · L_seed        Eq. 7   categorical cross-entropy, 4 seed types
-  + λ_arcface  · L_ArcFace     Eq. 13  angular margin, 27 sub-varieties
-  + λ_kl       · L_KL          Eq. 10  hierarchy consistency
-  + λ_load     · L_load        §5.2    entropy load balancing
-  + λ_sparsity · L_sparsity    §5.2    L1 Top-K sparsity
-  + λ_cosine   · L_cos         §1      residual compactness
-  + λ_sub_ce   · L_sub_CE      —       auxiliary plain CE, 0.0 by default
+L = w_seed     . L_seed        Eq. 7   categorical cross-entropy, 4 seed types
+  + w_arcface  . L_ArcFace     Eq. 13  angular margin, 27 sub-varieties
+  + w_kl       . L_KL          Eq. 10  hierarchy consistency, in log space
+  + lam_load     . L_load      5.2     dispatch-aware load balancing
+  + lam_sparsity . L_sparsity  5.2     L1 Top-K sparsity      (0.0 by default)
+  + lam_z        . L_z         --      router z-loss (ST-MoE)
+  + lam_cosine   . L_cos       1       class compactness, EMA centroids
+  + lam_residual . L_res       Eq. 9   residual magnitude hinge
+  + lam_sub_ce   . L_sub_CE    --      auxiliary plain CE      (0.0 by default)
 ```
 
-Implemented in `CombinedHierarchicalLoss.forward`
-(`src/losses/hierarchical.py:253-316`), which takes the model's
+Implemented in `CombinedHierarchicalLoss.forward`, which takes the model's
 `HierarchicalOutput` directly (not positional tensors) and returns a
-`LossBreakdown` NamedTuple (`hierarchical.py:66-89`) carrying the weighted
-total plus every unweighted component:
+`LossBreakdown` NamedTuple carrying the weighted total plus every unweighted
+component:
 
 ```python
-LossBreakdown(total, seed, arcface, sub_ce, kl, moe_load, moe_sparsity, cosine)
+LossBreakdown(total, seed, arcface, sub_ce, kl, moe_load, moe_sparsity, moe_z,
+              cosine, residual, dead_experts, task_weights)
 ```
 
-`.as_dict()` flattens these into tracker-ready floats
-(`total_loss, seed_type_loss, arcface_loss, sub_variety_ce_loss, kl_loss,
-moe_load_balancing_loss, moe_sparsity_loss, cosine_loss`), logged every epoch
-automatically.
+`.as_dict()` flattens these into tracker-ready floats, logged every epoch
+automatically. `component_losses()` is exposed separately so the trainer's
+gradient telemetry can backprop one term at a time **through the same code the
+objective uses** — a second implementation would measure a different thing.
 
-**The criterion holds no learnable parameters** — ArcFace's class centres
-live in the model (`ArcFaceHead.weight`), not the loss. Consequences: the
-optimizer needs only the model plus the encoder
-(`build_optimizer([encoder, model], cfg)`), gradient clipping covers
-everything trainable, and a saved `model_state_dict` alone reproduces
-inference.
+### Weighting
+
+The submitted objective used seven fixed lambdas over terms whose magnitudes at
+initialisation differed by ~13x. With `s = 30` and `m = 0.5`, random 384-D
+embeddings give `cos(theta) ~ 0`, hence
+
+```text
+target logit = 30 . cos(theta + 0.5) ~ 30 . (-sin 0.5) = -14.38
+L_ArcFace    = log(1 + 26 . e^14.38) = 17.64
+L_seed       = ln 4                  =  1.386        ->  ratio 12.7 : 1
+```
+
+One term carried ~92 % of the initial gradient budget, and `L_KL` and `L_cos`
+were rounding error against it. **Most of that is a consequence of the ArcFace
+scale, not of the lambdas**: at the AdaCos scale (§3) the dry run measures the
+ratio at ~4:1, so `weighting_mode: fixed` remains defensible.
+
+`weighting_mode: uncertainty` learns the three **task** weights via Kendall et
+al.'s homoscedastic formulation:
+
+$$
+\mathcal{L} = \sum_{t \in \{\text{seed}, \text{arc}, \text{kl}\}}
+  \Big(\frac{\mathcal{L}_t}{2\sigma_t^2} + \tfrac{1}{2}\log \sigma_t^2\Big)
+  + \sum_r \lambda_r \mathcal{L}_r
+$$
+
+optimising `log sigma^2` directly (clamped for stability). The three regularisers
+keep fixed lambdas deliberately: they are genuinely auxiliary, small, and their
+scale is meaningful — `L_load` has a zero floor by construction. The learned
+`sigma_t` are also **diagnostic**: if `sigma_arcface` collapses while `sigma_kl`
+explodes, the dominance hypothesis is confirmed empirically rather than argued.
+
+**Whichever mode is chosen must be identical across every variant in a suite**,
+or the ablation gaps become gaps in loss-weighting policy. `loss_flags` in
+`summary.json` records it so that cannot happen silently.
+
+### Statefulness
+
+The criterion holds learnable parameters **only** under
+`weighting_mode="uncertainty"` (three scalars), and buffers only for the EMA
+class centroids and the routing statistics. ArcFace's class centres stay in the
+model, so a saved `model_state_dict` alone still reproduces inference.
+
+The trainer therefore passes the criterion to the optimizer:
+`build_optimizer([encoder, model, criterion], cfg)`. Omitting it would pin the
+task weights at their initial values while the logs reported them as learned.
 
 Weights come from `conf/model/loss/arcface_kl.yaml`:
 
-| Weight | Default | Paper term |
+| Weight | Default | Term |
 | --- | --- | --- |
 | `lambda_seed` | 1.0 | Eq. 7 |
 | `lambda_arcface` | 1.0 | Eq. 13 |
 | `lambda_kl` | 1.0 | Eq. 10 |
-| `lambda_moe_load` | 0.01 | §5.2 |
-| `lambda_moe_sparsity` | 0.01 | §5.2 |
-| `lambda_cosine` | 0.1 | §1 |
+| `lambda_moe_load` | 0.01 | 5.2, Switch form |
+| `lambda_moe_sparsity` | **0.0** | 5.2, redundant under renormalisation |
+| `lambda_moe_z` | 0.001 | router z-loss, ST-MoE standard |
+| `lambda_cosine` | 0.1 | 1, class compactness |
+| `lambda_residual` | 0.01 | Eq. 9 magnitude hinge |
 | `lambda_sub_ce` | 0.0 | auxiliary, off |
 
 ## 2. Eq. 7 — seed-type cross-entropy
@@ -91,65 +135,122 @@ For the margin/threshold mathematics themselves, see
 lives in `src/models/components/`, not `src/losses/`, since it owns
 parameters the model must checkpoint).
 
-## 4. Eq. 10 — hierarchy-consistency KL divergence
+## 4. Eq. 10 — hierarchy consistency, in log space
 
 $$
-\mathcal{L}_{\text{KL}} = D_{\text{KL}}(P_{\text{seed}} \,\|\, P_{\text{sub}})
-$$
-
-The two distributions live over different label sets (4 vs. 27), so the
-sub-variety distribution is first **aggregated** to seed-type granularity
-through a fixed `[27, 4]` one-hot mapping matrix `M`:
-
-$$
-P_{\text{sub-agg}} = \text{softmax}(\text{sub\_logits}) \cdot M, \qquad
 \mathcal{L}_{\text{KL}} = D_{\text{KL}}(P_{\text{seed}} \,\|\, P_{\text{sub-agg}})
 $$
 
+The two distributions live over different label sets (4 vs. 27), so the
+sub-variety distribution is first **marginalised** to seed-type granularity.
+
+### The bug the revision fixes
+
+The submitted implementation aggregated in probability space and then took a log:
+
 ```python
-def hierarchical_kl_loss(seed_type_logits, sub_variety_logits, mapping_matrix,
-                          detach_seed_target=False):
-    seed_probs = softmax(seed_type_logits, dim=-1)
-    if detach_seed_target:
-        seed_probs = seed_probs.detach()
-    sub_probs  = softmax(sub_variety_logits, dim=-1)
-    aggregated = sub_probs @ mapping_matrix
-    return F.kl_div(torch.log(aggregated.clamp_min(1e-8)), seed_probs, reduction="batchmean")
+aggregated = sub_probs @ mapping_matrix
+F.kl_div(torch.log(aggregated.clamp_min(1e-8)), seed_probs, reduction="batchmean")
 ```
 
-(`hierarchical.py:146-175`) **Direction matters**: `F.kl_div(input=log q,
-target=p)` computes `KL(p \| q)`. Passing the aggregated sub-variety
-log-probabilities as `input` and the seed-type probabilities as `target` is
-what gives the `D_KL(P_seed \| P_sub)` direction Eq. 10 asks for — swapping
-the arguments would silently optimize the reverse-KL objective instead.
-Verified correct by `PAPER_AUDIT.md` §3.5 and pinned by a test that
-recomputes the KL by hand.
+`clamp_min` has **zero gradient in the clamped region**. So whenever an
+aggregated seed-type probability fell below `1e-8`, the KL term contributed
+exactly nothing to that entry — silently, with no NaN and no warning.
 
-**`sub_variety_logits` here must be `sub_logits` (no margin), never
-`sub_margin_logits`** — the ArcFace margin is a training device for the
-classification term, not part of the predicted distribution the hierarchy
-term should measure consistency against.
+**That was the common case, not an edge case.** With `sub_logits = 30 cos(theta)`
+in `[-30, 30]`, a cosine gap of 1.0 between the argmax sub-variety and a
+competitor becomes a *logit* gap of 30, i.e. a probability ratio of
+`e^30 ~ 1.07e13`. Aggregating 27 such probabilities into 4 bins leaves the
+non-argmax bins at `1e-13` to `1e-10`, comfortably below the clamp. Concretely:
+**the term was live when the two heads agreed (where it has nothing to do) and
+dead when they disagreed confidently (which is the entire point of it).**
 
-`detach_kl_seed_target=false` (default): the gradient flows into both
-branches. Set `true` to freeze the seed-type distribution as a fixed target,
-so KL only reshapes the sub-variety head.
+### The fix
+
+```python
+def aggregate_sub_log_probs(sub_variety_logits, mapping_matrix, tau=1.0):
+    log_p_sub = F.log_softmax(sub_variety_logits / tau, dim=-1)          # [B, 27]
+    children  = mapping_matrix.t().bool()                                # [4, 27]
+    masked    = log_p_sub.unsqueeze(1).masked_fill(~children.unsqueeze(0), -inf)
+    return torch.logsumexp(masked, dim=-1)                               # [B, 4], exact
+```
+
+`logsumexp` over each parent's children is **exact**, not a tolerance tweak: it is
+numerically stable by construction (max-subtraction), needs no epsilon, and has a
+well-conditioned gradient across the entire probability range — including the
+confident-disagreement region where the old form was silently dead.
+
+Two tests pin this: one asserts the term now has non-zero gradient on a maximal
+disagreement, and one shows the old `clamp -> log` composition is gradient-dead on
+the identical input.
+
+### `tau_kl` — untangling two hyperparameters
+
+`P_sub = softmax(s cos theta)` is near-one-hot by construction at `s = 30`, so
+`lambda_kl` and `arcface_scale` were secretly **one** hyperparameter: changing the
+scale silently changed the effective strength of the hierarchy term. `tau_kl`
+divides before the softmax and separates them. At the AdaCos scale (§3),
+`tau_kl = 1.0` is the right value; raise it toward `s` if `arcface_scale` is
+raised.
+
+### Direction, and the detach default
+
+`F.kl_div(input=log q, target=p)` computes `KL(p || q)`. Passing the aggregated
+sub-variety log-probabilities as `input` and the seed-type log-probabilities as
+`target` (with `log_target=True`) gives the `D_KL(P_seed || P_sub)` direction
+Eq. 10 asks for — swapping the arguments would silently optimize the reverse-KL
+objective.
+
+**`detach_kl_seed_target` now defaults to `true`.** With the gradient flowing into
+both branches, the term is symmetric in *who moves*, and `P_seed` is already
+supervised by hard labels through Eq. 7. Letting `L_KL` also push the coarse head
+means it can be reduced by the coarse head becoming *less* accurate — agreeing
+with a confidently wrong fine prediction. Since Eq. 7 fits fast on 4 classes, the
+marginal gradient available on the seed side is spent disproportionately on the
+hard, ambiguous samples, which are exactly the ones where following the fine head
+is most likely to be wrong.
+
+`KL(p||q)` is also **mode-covering in `q`**: wherever `P_seed` has mass,
+`P_sub-agg` is forced to have mass, so an uncertain coarse head makes the fine
+head hedge *across seed types* — smearing the very decisions the 27-way task
+depends on.
+
+### `kl_mode: jsd`
+
+The symmetric alternative the hierarchy-consistency literature converged on
+(HAF, Garg et al. 2022):
+
+$$
+\mathcal{L}_{\text{JS}} = \tfrac{1}{2}D_{\text{KL}}(P_{\text{seed}} \| M)
+                          + \tfrac{1}{2}D_{\text{KL}}(P_{\text{sub-agg}} \| M),
+\qquad M = \tfrac{1}{2}(P_{\text{seed}} + P_{\text{sub-agg}})
+$$
+
+Bounded by `log 2`, symmetric, and without the zero-avoidance that forces the
+fine head to hedge. Computed in log space via `logsumexp`, and tested to stay
+within its bound. `kl_jsd` runs it as an ablation, so `{forward, detached, jsd}`
+is a three-way comparison rather than an assertion.
+
+### `sub_logits`, never `sub_margin_logits`
+
+The margin is a training device for the classification term, not part of the
+predicted distribution the hierarchy term measures consistency against.
 
 ### Building the mapping matrix `M`
 
 ```python
 build_subvariety_seed_mapping(num_sub_varieties, num_seed_types,
-                               subvariety_to_seed_type=None,
-                               subvarieties_per_seed_type=None) -> torch.Tensor  # [27, 4]
+                              subvariety_to_seed_type=None,
+                              subvarieties_per_seed_type=None) -> torch.Tensor  # [27, 4]
 ```
 
-(`hierarchical.py:92-134`) Preferred path: an explicit per-sub-variety parent
-list — exactly what `HierarchicalSeedDataset.get_subvariety_to_seed_type()`
-produces, derived from the directory tree at runtime (see
-[`01_DATA_PIPELINE.md`](01_DATA_PIPELINE.md)), never hardcoded. A fallback
-path accepts `subvarieties_per_seed_type` (a count list) when sub-variety
-indices are known to be contiguous within each seed type. `M` is registered
-as a non-trainable buffer (`self.register_buffer("mapping_matrix", mapping)`)
-so it moves with `.to(device)` but never receives gradient.
+Preferred path: an explicit per-sub-variety parent list — exactly what
+`HierarchicalSeedDataset.get_subvariety_to_seed_type()` produces, derived from the
+directory tree at runtime (see [`01_DATA_PIPELINE.md`](01_DATA_PIPELINE.md)),
+never hardcoded. `M` is registered as a non-trainable buffer so it moves with
+`.to(device)` but never receives gradient. The log-space path reads it as a
+boolean children mask; the stored one-hot float form is unchanged, so the buffer,
+the checkpoint layout and every existing consumer are unaffected.
 
 ## 5. Auxiliary sub-variety cross-entropy (`lambda_sub_ce`, off by default)
 
@@ -164,56 +265,96 @@ weighted at `1.0` unconditionally, which was never specified by the paper.
 Default `lambda_sub_ce: 0.0`; a small nonzero value is available as an
 opt-in aid if the ArcFace margin destabilizes very early training.
 
-## 6. Cosine compactness loss (`src/losses/cosine.py`, paper Section 1)
+## 6. Compactness and residual control (`src/losses/cosine.py`, paper Section 1)
 
 Paper: *"we introduce cosine similarity loss within SwinV2's residual
-connections, promoting feature compactness."* The residual the head owns is
-Eq. 9's `h' = h + P(p_s)`.
+connections, promoting feature compactness."*
 
-**`mode="residual"` (default)** — keep `h'` angularly aligned with the raw
-MoE feature `h`:
+### Why `mode="residual"` is no longer the default
 
-$$
-\mathcal{L}_{\cos} = 1 - \text{mean}_i \cos(h'_i, h_i) \in [0, 2]
-$$
+The submitted term was `L_cos = 1 - cos(h + P(p_s), h)`. Characterise its
+minimiser set. `L_cos = 0` iff `h'` is a positive multiple of `h`, i.e. iff
 
-```python
-def residual_cosine_loss(refined, original):
-    return 1.0 - F.cosine_similarity(refined, original, dim=-1, eps=1e-8).mean()
+```text
+P(p_s) = alpha(x) . h(x)     for some alpha >= -1,  including alpha = 0
 ```
 
-(`cosine.py:40-42`) This lets the seed-type prior *shift* the representation
-without *rotating* it away from what the MoE extracted — the mechanism that
-stops the residual from overwriting the MoE output when stage 1 is
-confidently wrong. In `CombinedHierarchicalLoss.forward`
-(`hierarchical.py:292-294`): `cosine = self.cosine_loss(output.refined_features,
-output.moe_features)`.
+So **every global minimiser either zeroes the residual outright — which *is* the
+`use_residual=False` ablation — or collapses it to a scalar rescaling of `h`.**
+In the second case Eq. 9 carries **one** degree of freedom of seed-type
+information instead of 384. In both cases the coarse-to-fine link the
+architecture exists to provide is gone.
 
-**`mode="intra_class"`** — pull every embedding toward its own class
-centroid, complementing ArcFace's inter-class separation with an explicit
-intra-class term:
+The stated intent was the opposite: *"this lets the seed-type prior shift the
+representation without rotating it away from what the MoE extracted."* But cosine
+is **invariant to magnitude**, so it constrains only the residual's *direction*,
+never how much it shifts. The cheapest way to preserve direction is to make the
+residual small. The loss achieved "not rotating" by achieving "not shifting".
+
+The weighting made it worse over time rather than better. `lambda_cosine = 0.1`
+looks small against `lambda_arcface = 1.0`, but `L_ArcFace` decays toward 0 as the
+model fits while `L_cos` has no reason to — so the cosine term's *share* of the
+gradient grew monotonically through training. It was weakest during the epochs
+when the residual was forming and strongest during the epochs when it could be
+dismantled.
+
+`mode="residual"` is retained as an ablation axis, and a test asserts it still
+collapses `wo_residual`'s compactness term to exactly zero. The confound is
+reproducible on purpose.
+
+### `mode="intra_class"` with EMA centroids (default)
+
+Compactness is an **intra-class** property, so this is the reading that matches
+the words:
 
 $$
-\mathcal{L}_{\cos} = 1 - \text{mean}_i \cos(e_i, \text{centroid}(\text{class of } i))
+\mathcal{L}_{\cos} = 1 - \text{mean}_i \cos(e_i, c_{y_i})
 $$
 
-```python
-def intra_class_cosine_loss(embeddings, labels):
-    normalized = F.normalize(embeddings, p=2, dim=-1)
-    # per-class mean of normalized embeddings, itself renormalized -> centroid
-    ...
-    similarity = (normalized * centroids[labels]).sum(dim=-1)
-    return 1.0 - similarity.mean()
+Centroids are maintained as an **EMA over training** rather than recomputed per
+batch. That is not a refinement — it is what makes the term exist. With
+`batch_size = 16` over `C = 27` roughly-balanced classes, the expected number of
+classes with two or more members is
+
+```text
+C . [1 - (1-p)^n - n.p.(1-p)^(n-1)]  =  27 . [1 - 0.5468 - 0.3365]  =  3.2,   p = 1/27
 ```
 
-(`cosine.py:45-70`) Classes with a single sample in the batch contribute
-exactly `0` (the embedding is its own centroid) rather than distorting the
-term. When this mode is active, `CombinedHierarchicalLoss` instead computes
-`cosine = self.cosine_loss(output.sub_embeddings, output.sub_embeddings,
-sub_variety_labels)`.
+so roughly **6 of 16 embeddings would contribute a non-zero term** and the other
+10 exactly zero — and the "centroid" each of those 6 was pulled toward was
+estimated from **two samples**. That is not a compactness loss; it is noise with
+a small mean.
 
-Both modes are bounded in `[0, 2]`, reaching `0` at perfect alignment.
-`cosine_mode` config default: `"residual"`.
+With EMA centroids every sample contributes and every centroid is estimated from
+the whole training history. This is centre loss (Wen et al., 2016) adapted to the
+hypersphere, and it supplies exactly the intra-class complement that ArcFace's
+inter-class margin does not. Centroids are **persistent buffers** — training
+state a resumed run must not silently reset — and a class's first appearance
+seeds its centroid outright rather than blending against a zero vector.
+
+A test constructs an all-singleton batch: the per-batch form scores exactly 0,
+the EMA form scores a real value.
+
+### Controlling the residual structurally
+
+Magnitude control moved out of the loss and into the architecture:
+
+* **`LayerScale`** on the Eq. 9 branch — a learned per-channel gain initialised
+  at `1e-4` (Touvron et al., 2021). It gives the "start negligible, grow only if
+  it helps" behaviour the cosine penalty was reaching for, with no fixed point at
+  `P = 0`. `wo_layer_scale` ablates it.
+* **`residual_magnitude_loss`**, an optional hinge on the magnitude *ratio*:
+
+$$
+\mathcal{L}_{\text{res}} = \text{mean}_i \max\!\Big(0, \frac{\lVert P(p_s)_i \rVert}{\lVert h_i \rVert} - \tau\Big)^2,
+\qquad \tau = 0.5
+$$
+
+  Exactly zero for every residual smaller than `tau`, so it is inactive in the
+  healthy regime and has **no gradient pushing `P` toward zero**. That is the
+  property the cosine form lacks, and a test asserts both halves of it.
+
+`lambda_residual: 0.01`.
 
 ## 7. Config reference
 

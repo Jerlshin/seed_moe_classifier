@@ -48,7 +48,12 @@ def output_root() -> Path:
 
 
 def default_checkpoint_path() -> Path:
-    """Absolute path of the shared DINOv2-SwinV2 checkpoint."""
+    """Absolute path of the shared self-supervised SwinV2 checkpoint.
+
+    The filename still says ``dinov2_`` for backward compatibility with existing
+    checkpoints and ``$SEED_PRETRAIN_BACKBONE`` defaults. Stage 1 is DINO-style
+    self-distillation, not DINOv2; see ``src/losses/dino.py``.
+    """
     override = os.environ.get("SEED_PRETRAIN_BACKBONE")
     if override:
         return Path(override)
@@ -71,7 +76,7 @@ def ensure_pretrained_checkpoint(path: str | Path, allow_missing: bool = False) 
         return None
     raise FileNotFoundError(
         f"Shared pretrained checkpoint not found: {checkpoint}\n\n"
-        "Every variant in this suite must start from the same DINOv2-SwinV2 encoder, "
+        "Every variant in this suite must start from the same self-supervised SwinV2 encoder, "
         "otherwise the comparison measures self-supervised initialisation noise rather "
         "than the architectural change under test.\n\n"
         "Produce it once with:\n"
@@ -80,6 +85,25 @@ def ensure_pretrained_checkpoint(path: str | Path, allow_missing: bool = False) 
         "--allow-missing-checkpoint to train from a randomly initialised encoder "
         "(smoke runs only)."
     )
+
+
+#: Training seeds every variant is repeated over.
+#
+# One run per variant cannot support the table it is being asked to support. On
+# a 1,871-image test split at ~95 % accuracy the 95 % CI half-width on a single
+# accuracy is +-0.99 pp and on a *difference* of two accuracies +-1.40 pp --
+# before any training-seed variance (dropout, shuffling, router initialisation,
+# and for a MoE specifically, which experts win the early race). Component
+# contributions of 0.5-2 pp are the normal magnitude for a 27-class fine-grained
+# task, so most of the gaps the ablation table needs to report sit inside the
+# noise floor of a single split.
+#
+# Five seeds per variant with mean +- SD, plus McNemar's exact test on the shared
+# test split, is what turns the table from anecdote into evidence. Stage 2 trains
+# a head against a frozen encoder, so these runs are cheap relative to
+# pretraining, and `run_suite`'s failure isolation already makes an unattended
+# sweep safe.
+DEFAULT_SEEDS = (42, 43, 44, 45, 46)
 
 
 @dataclass
@@ -91,13 +115,46 @@ class VariantSpec:
     overrides: list[str] = field(default_factory=list)
     group: str = "ablation"
     experiment: str = "finetune_hierarchical_moe"
+    seed: int | None = None
+    """Training seed. ``None`` uses the config's own value and writes to
+    ``{group}/{variant}/``; an integer writes to ``{group}/{variant}/seed{n}/``,
+    which is the extra directory level ``collect_run_summaries`` globs for."""
 
     def save_path(self, root: Path) -> Path:
-        return root / self.group_directory / self.name
+        base = root / self.group_directory / self.name
+        return base if self.seed is None else base / f"seed{self.seed}"
+
+    @property
+    def run_name(self) -> str:
+        """Unique label for logs and the manifest."""
+        return self.name if self.seed is None else f"{self.name}/seed{self.seed}"
 
     @property
     def group_directory(self) -> str:
         return "ablations" if self.group == "ablation" else "baselines"
+
+    def with_seed(self, seed: int) -> "VariantSpec":
+        """Copy of this spec pinned to ``seed``."""
+        return VariantSpec(
+            name=self.name,
+            description=self.description,
+            overrides=list(self.overrides),
+            group=self.group,
+            experiment=self.experiment,
+            seed=int(seed),
+        )
+
+
+def expand_seeds(specs: Sequence[VariantSpec], seeds: Sequence[int]) -> list[VariantSpec]:
+    """Cross every variant with every seed, preserving variant order.
+
+    Variant-major rather than seed-major so a suite interrupted halfway has
+    complete coverage of the variants it did reach, which is the more useful
+    partial result.
+    """
+    if not seeds:
+        return list(specs)
+    return [spec.with_seed(seed) for spec in specs for seed in seeds]
 
 
 @dataclass
@@ -137,6 +194,10 @@ def build_command(
         f"hydra.run.dir={save_path / 'hydra'}",
         *spec.overrides,
     ]
+    if spec.seed is not None:
+        # Placed before spec.overrides' consumers but after the path settings so
+        # a variant can still pin its own seed if it genuinely needs one.
+        overrides.append(f"seed={spec.seed}")
     if checkpoint is not None:
         overrides.append(f"model.backbone.checkpoint_path={checkpoint}")
     overrides.extend(extra_overrides)
@@ -154,10 +215,10 @@ def run_variant(
     save_path = spec.save_path(root)
     command = build_command(spec, save_path, checkpoint, extra_overrides)
 
-    print(f"\n=== {spec.name}: {spec.description} ===", flush=True)
+    print(f"\n=== {spec.run_name}: {spec.description} ===", flush=True)
     print(f"$ {' '.join(command)}", flush=True)
     if dry_run:
-        return VariantResult(spec.name, 0, 0.0, str(save_path), command)
+        return VariantResult(spec.run_name, 0, 0.0, str(save_path), command)
 
     save_path.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
@@ -165,8 +226,8 @@ def run_variant(
     duration = time.perf_counter() - started
 
     status = "OK" if returncode == 0 else f"FAILED (exit {returncode})"
-    print(f"--- {spec.name}: {status} in {duration:.1f}s ---", flush=True)
-    return VariantResult(spec.name, returncode, duration, str(save_path), command)
+    print(f"--- {spec.run_name}: {status} in {duration:.1f}s ---", flush=True)
+    return VariantResult(spec.run_name, returncode, duration, str(save_path), command)
 
 
 def run_suite(
@@ -188,20 +249,21 @@ def run_suite(
         result = run_variant(spec, root, checkpoint, extra_overrides, dry_run)
         results.append(result)
         if stop_on_failure and not result.succeeded:
-            print(f"Stopping: {spec.name} failed and --stop-on-failure is set.", flush=True)
+            print(f"Stopping: {spec.run_name} failed and --stop-on-failure is set.", flush=True)
             break
     return results
 
 
 def write_suite_manifest(path: str | Path, specs: Sequence[VariantSpec], results: Sequence[VariantResult]) -> str:
     """Record what was run, with what overrides and what outcome."""
-    by_name = {spec.name: spec for spec in specs}
+    by_name = {spec.run_name: spec for spec in specs}
     payload = {
         "variants": [
             {
                 "name": result.name,
                 "description": by_name[result.name].description if result.name in by_name else "",
                 "overrides": by_name[result.name].overrides if result.name in by_name else [],
+                "seed": by_name[result.name].seed if result.name in by_name else None,
                 "returncode": result.returncode,
                 "succeeded": result.succeeded,
                 "duration_seconds": result.duration_seconds,
@@ -220,11 +282,11 @@ def write_suite_manifest(path: str | Path, specs: Sequence[VariantSpec], results
 def print_summary(results: Sequence[VariantResult]) -> int:
     """Print a per-variant status table. Returns a process exit code."""
     print("\n" + "=" * 72)
-    print(f"{'variant':<28} {'status':<10} {'duration':>10}  output")
+    print(f"{'variant':<32} {'status':<10} {'duration':>10}  output")
     print("-" * 72)
     for result in results:
         status = "ok" if result.succeeded else f"exit {result.returncode}"
-        print(f"{result.name:<28} {status:<10} {result.duration_seconds:>9.1f}s  {result.save_path}")
+        print(f"{result.name:<32} {status:<10} {result.duration_seconds:>9.1f}s  {result.save_path}")
     print("=" * 72)
 
     failures = [result for result in results if not result.succeeded]

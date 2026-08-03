@@ -3,6 +3,8 @@ import csv
 import glob
 import os
 import pickle
+import re
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +12,34 @@ from PIL import Image
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
+
+#: Filenames under ``Cropped_Samples`` look like ``IMG_0502_bbox137.png``: many
+#: crops cut from one source photograph of a tray of seeds. The stem before
+#: ``_bbox<n>`` is therefore the provenance key, and crops sharing it are
+#: near-duplicates of the same physical scene -- same lighting, same background,
+#: same sensor noise, often the same individual seed photographed at overlapping
+#: bounding boxes.
+SOURCE_IMAGE_PATTERN = re.compile(r"^(?P<source>.+?)_bbox\d+$", re.IGNORECASE)
+
+
+def source_image_id(image_path: str | os.PathLike[str]) -> str:
+    """Provenance key for one crop: ``<sub_variety>/<source photograph>``.
+
+    Splitting at the image level when many crops share a source photograph puts
+    near-duplicates on both sides of the train/test boundary, so the reported
+    accuracy measures memorisation of source-specific cues rather than
+    sub-variety discrimination. The key is scoped by sub-variety directory
+    because two different sub-varieties can legitimately reuse a filename.
+
+    Falls back to the file stem when the name carries no ``_bbox`` suffix, which
+    makes every such file its own group -- i.e. the same behaviour as
+    ungrouped splitting, which is the correct default when provenance is
+    unknown.
+    """
+    path = Path(image_path)
+    match = SOURCE_IMAGE_PATTERN.match(path.stem)
+    source = match.group("source") if match else path.stem
+    return f"{path.parent.name}/{source}"
 
 
 class PretrainImageFolderDataset(ImageFolder):
@@ -221,6 +251,46 @@ class HierarchicalSeedDataset(Dataset):
             seed_counts[seed_names[seed_label]] += 1
             sub_counts[sub_names[sub_label]] += 1
         return seed_counts, sub_counts
+
+    def source_groups(self) -> np.ndarray:
+        """Integer group id per sample, keyed on the source photograph.
+
+        This is the group key ``StratifiedGroupKFold`` needs. Without it the
+        split is at the crop level, and crops of the same physical seed under the
+        same lighting land on both sides of the boundary.
+        """
+        keys = [source_image_id(path) for path, _, _ in self.samples]
+        ordering = {key: index for index, key in enumerate(sorted(set(keys)))}
+        return np.array([ordering[key] for key in keys], dtype=np.int64)
+
+    def group_report(self) -> dict[str, object]:
+        """Diagnostics describing how much provenance the tree actually has.
+
+        Reported at the top of every run because it decides what the headline
+        accuracy can mean. ``single_group_sub_varieties`` is the number that
+        bounds the whole protocol: a class whose crops all come from **one**
+        photograph cannot be group-separated at all, so for those classes no
+        honest train/test split exists and their scores measure within-photo
+        generalisation whatever the splitter does.
+        """
+        _, sub_names = self.get_ordered_class_names()
+        groups = self.source_groups()
+        per_sub: dict[str, set[int]] = {name: set() for name in sub_names}
+        for (_, _, sub_label), group in zip(self.samples, groups):
+            per_sub[sub_names[sub_label]].add(int(group))
+
+        sizes = Counter(groups.tolist())
+        singletons = sorted(name for name, ids in per_sub.items() if len(ids) < 2)
+        return {
+            "num_samples": len(self.samples),
+            "num_source_groups": len(sizes),
+            "mean_crops_per_source": len(self.samples) / max(len(sizes), 1),
+            "min_crops_per_source": min(sizes.values()) if sizes else 0,
+            "max_crops_per_source": max(sizes.values()) if sizes else 0,
+            "sources_per_sub_variety": {name: len(ids) for name, ids in per_sub.items()},
+            "single_group_sub_varieties": singletons,
+            "num_single_group_sub_varieties": len(singletons),
+        }
 
 
 def get_pretrain_dataloader(

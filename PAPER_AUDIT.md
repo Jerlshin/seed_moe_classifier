@@ -209,9 +209,123 @@ appear in the split — which a stratified validation fold does not guarantee.
 
 ---
 
-## 6. Open items requiring your decision
+## 6. Second-round findings (independent audit, `CHANGES.md`)
 
-### 6.1 The backbone is frozen in stage 2; the paper fine-tunes it
+The first five sections above record what was wrong when this repository was
+first reconciled with the manuscript. `CHANGES.md` is an independent audit
+conducted afterwards against the `architecture/` documentation, and it found a
+second class of problem: components that were implemented *correctly* against
+the paper's equations and were nevertheless mathematically inert or
+counterproductive.
+
+Full disposition of all 32 findings is in
+[`AUDIT_RESPONSE.md`](AUDIT_RESPONSE.md). The four that belong in this file,
+because they are the same *class* of finding the sections above track — an
+implementation that runs, trains, and measures the wrong thing — are:
+
+### 6.1 The load-balancing loss could not see the routing it balanced
+
+§3.2 above fixed the entropy term's normalisation. The term itself was the
+problem: it is the entropy of the batch-mean **soft** gate `u = mean(G)`, while
+the model's behaviour is decided by `topk(G, K)`, which `u` never observes.
+
+A router emitting `G = (0.30, 0.30, 0.10, 0.10, 0.10, 0.10)` for every sample
+scores `L_load = −0.9172` — 92 % of the way to "perfect balance" — while Top-2
+sends every sample to experts {0, 1} and four experts receive no gradient for the
+entire run. Worse, at the term's *global optimum* `G` is exactly uniform and
+`torch.topk` breaks ties toward the lowest indices, so **the minimum of the
+load-balancing loss produces maximally imbalanced hard routing**.
+
+Replaced by the Shazeer/GShard/Switch form `E·Σ fᵢPᵢ`, which couples the hard
+dispatch fraction to the differentiable router probability. The entropy form is
+kept as `moe_load_mode: entropy` so the two can be compared on one split, and the
+counterexample is a test.
+
+Aggravating detail worth recording: `plot_expert_utilization` charted the *hard*
+fraction `f` while the loss optimised `P`. The figure and the objective disagreed
+about what "balanced" meant, and the figure was right.
+
+### 6.2 Attention over a length-1 sequence is an affine map
+
+Both `TransformerExpert` and `CrossAttention` called `nn.MultiheadAttention` with
+`[batch, 1, dim]` tensors. With one key, `softmax(QKᵀ/√d) = 1` for any `Q` and
+`K`, so the output is `W_O(W_V x)` and `∂a/∂W_Q = ∂a/∂W_K ≡ 0` — **exactly zero
+gradient, forever**.
+
+`04_HIERARCHICAL_FUSION.md` already stated the reduction honestly. What was not
+carried through: ~2.07 M parameters (295,680 × 7 instances) were unreachable,
+`num_heads=8` was inert, `attn_weights` was identically 1.0, and all of it was
+counted in the results table's **"Total Params (M)" and "Active Params (M)"**
+columns. Of the 3.95 M "saved" by Top-4 → Top-2, roughly 1.18 M had never been
+computed.
+
+Resolved both ways: `token_mode="grid"` keeps SwinV2's token grid so the attention
+is genuine, and `token_mode="pooled"` does not allocate the Q/K projections at
+all. `tests/test_components.py` verifies the degeneracy by measurement rather
+than by argument.
+
+### 6.3 `L_cos(residual)` is minimised by deleting the residual
+
+§2.5 above added the cosine loss because it was missing. The formulation was
+wrong. `L_cos = 1 − cos(h + P(p_s), h)` reaches 0 exactly when `P(p_s) = α·h` —
+**including `α = 0`, which is literally the `use_residual=False` ablation**.
+Every other minimiser collapses the residual to a scalar rescaling carrying one
+degree of freedom instead of 384.
+
+The stated intent was that the seed-type prior should *shift* the representation
+without *rotating* it. But cosine is invariant to magnitude, so the cheapest way
+to preserve direction is to make the residual vanish: the loss achieved "not
+rotating" by achieving "not shifting". And because `L_ArcFace` decays while
+`L_cos` does not, the term's share of the gradient grew monotonically — weakest
+while the residual was forming, strongest when it could be dismantled.
+
+Replaced by structural control (`LayerScale`, init 1e-4) plus a magnitude hinge
+that is exactly zero in the healthy regime. `cosine_mode` now defaults to
+`intra_class` with EMA centroids, which is what "feature compactness" means.
+
+This also dissolved a second problem: `wo_residual` used to zero `L_cos`
+identically, so it removed Eq. 9 *and* the paper's Section-1 contribution in one
+toggle.
+
+### 6.4 `clamp_min(1e-8) → log` made the KL term gradient-dead
+
+§3.5 above verified the KL term's *direction* and its aggregation matrix, and
+both were correct. The composition was not.
+
+```python
+F.kl_div(torch.log(aggregated.clamp_min(1e-8)), seed_probs, reduction="batchmean")
+```
+
+`clamp_min` has zero gradient in the clamped region. With `sub_logits = 30·cos θ`,
+a cosine gap of 1.0 is a logit gap of 30 — a probability ratio of `e³⁰ ≈ 10¹³` —
+so aggregating 27 probabilities into 4 bins left the non-argmax bins around
+`10⁻¹³`, comfortably clamped. **The term was live when the two heads agreed and
+dead when they disagreed confidently**, which is the entire point of it. No NaN,
+no warning, just an absent gradient.
+
+Fixed exactly, not by raising the floor: `aggregate_sub_log_probs` marginalises
+with `logsumexp` over each parent's children. Two tests pin it — one asserting the
+gradient now exists on a maximal disagreement, one showing the old form was dead
+on the identical input.
+
+### 6.5 A methodological finding that outranks all of the above
+
+`CHANGES.md` F-22 asked whether the 9,357 crops derive from a smaller number of
+source photographs. They derive from **81**, a mean of 115.5 crops per source.
+Crop-level splitting therefore put near-duplicate views of the same physical
+seeds — same lighting, same background, overlapping bounding boxes — on both
+sides of every train/test boundary.
+
+Group-aware splitting is now the default. But five sub-varieties have crops from
+exactly one photograph, so for those classes **no protocol available on this
+dataset measures across-photograph generalisation**. That is a dataset
+limitation the paper has to state; see [`AUDIT_RESPONSE.md`](AUDIT_RESPONSE.md) §2.
+
+---
+
+## 7. Open items requiring your decision
+
+### 7.1 The backbone is frozen in stage 2; the paper fine-tunes it
 
 Section 4 ends: *"the DINOv2-Swin Transformer V2 encoder was integrated into the
 proposed hierarchical classification framework and **fine-tuned** on the seed
@@ -222,7 +336,7 @@ Left as-is (it is the established, much cheaper recipe) but now a one-line
 switch: `model.backbone.freeze=false`. Flipping it makes the run match the paper
 at substantially higher memory and time cost.
 
-### 6.2 Dataset folder names do not match the paper
+### 7.2 Dataset folder names do not match the paper
 
 The paper describes **amaranthus** (AMT-1, AMT-2, AMT-4) and mustard
 (Jagnath, PM30, Poosa33). The dataset on disk has **Seasame** (VRI1, VRI2, VRI4)
@@ -238,3 +352,26 @@ reports a per-seed-type alignment rate for "Amaranthus".
 The code reads class names from the directory tree, so figures and tables will
 say whatever the folders say — no code change is needed once the naming is
 settled.
+
+### 7.3 Stage 1 is not DINOv2, and the manuscript says it is
+
+`CustomDINOLoss` implements cross-view CE with an EMA-centred, temperature-
+scheduled teacher — Caron et al. (2021). DINOv2 is defined by four additions.
+The revision implements the two that do not require patch tokens (KoLeo,
+Sinkhorn–Knopp centering) and does **not** implement iBOT or untied heads.
+
+The tree now says "DINO-style self-distillation" everywhere, including the
+published checkpoint's description. The manuscript still says DINOv2. Either
+implement iBOT — which pairs naturally with the token-grid work already landed in
+stage 2 — or rename. DINOv2's own ablations credit iBOT with ~3 % on dense tasks,
+so this is a missing-method question with a known magnitude, not a naming
+preference.
+
+### 7.4 Nothing has been retrained
+
+Every stage-2 number the paper currently reports was produced under crop-level
+splitting, `s = 30`, the entropy load loss, and a gradient-dead KL term. None of
+those results carry over. The suites must be re-run — 18 ablation variants and 5
+baselines × 5 seeds — before any table in Section 6 can be updated, and
+`linear_probe` should be run first because its outcome bounds what the paper can
+claim.

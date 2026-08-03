@@ -197,3 +197,144 @@ def test_evaluate_hierarchical_assembles_the_full_paper_report(subvariety_to_see
     assert "kl_alignment/overall" in scalars
     assert "moe/expert_0_utilization" in scalars
     assert all(isinstance(value, float) for value in scalars.values())
+
+
+# ------------------------------------------------- revision: new measurements
+
+
+def test_expert_nmi_separates_specialisation_from_balance():
+    """Utilisation bars show balance; only NMI shows specialisation.
+
+    Six experts each taking a sixth of the traffic at random are perfectly
+    balanced and perfectly uninformative, which is exactly the configuration the
+    submitted diagnostics could not distinguish from expert specialisation.
+    """
+    from src.utils.metrics import expert_label_nmi
+
+    labels = np.repeat(np.arange(4), 25)
+
+    perfect = np.stack([labels, (labels + 1) % 4], axis=1)
+    assert expert_label_nmi(perfect, labels) == pytest.approx(1.0, abs=1e-6)
+
+    rng = np.random.default_rng(0)
+    random_routing = rng.integers(0, 4, size=(labels.size, 2))
+    assert expert_label_nmi(random_routing, labels) < 0.2
+
+    # Balanced but uninformative: every expert takes an equal share, cycling
+    # independently of the label.
+    balanced = np.stack([np.arange(labels.size) % 4, np.arange(labels.size) % 3], axis=1)
+    utilisation = np.bincount(balanced[:, 0], minlength=4) / balanced.shape[0]
+    assert np.allclose(utilisation, 0.25, atol=1e-6), "fixture must be balanced"
+    assert expert_label_nmi(balanced, labels) < 0.2
+
+
+def test_expert_nmi_folds_grid_routing_back_to_one_expert_per_image():
+    """Under grid routing there are ``tokens`` routing rows per label."""
+    from src.utils.metrics import expert_label_nmi
+
+    labels = np.repeat(np.arange(4), 10)
+    tokens = 8
+    per_token = np.repeat(labels, tokens).reshape(-1, 1)
+    assert expert_label_nmi(per_token, labels, tokens_per_sample=tokens) == pytest.approx(1.0, abs=1e-6)
+    # Mismatched lengths must report nan rather than silently mis-pairing.
+    assert np.isnan(expert_label_nmi(per_token, labels, tokens_per_sample=1))
+
+
+def test_expected_calibration_error_detects_overconfidence():
+    """``softmax(s cos theta)`` is overconfident by construction at s = 30.
+
+    A hierarchical classifier's practical value depends on trustworthy
+    confidence, so the sign of the miscalibration matters as much as the size.
+    """
+    from src.utils.metrics import expected_calibration_error
+
+    labels = np.array([0, 0, 1, 1])
+    overconfident = np.array([[0.99, 0.01], [0.99, 0.01], [0.99, 0.01], [0.01, 0.99]])
+    report = expected_calibration_error(overconfident, labels, num_bins=5)
+    assert report["accuracy"] == pytest.approx(0.75)
+    assert report["overconfidence"] > 0.2
+    assert report["ece"] > 0.2
+
+    calibrated = np.array([[0.75, 0.25], [0.75, 0.25], [0.75, 0.25], [0.25, 0.75]])
+    assert expected_calibration_error(calibrated, labels, num_bins=5)["ece"] < report["ece"]
+
+
+def test_temperature_scaling_softens_an_overconfident_head():
+    """Fitted on validation, applied to test; a scale of 30 needs a big T."""
+    from src.utils.metrics import expected_calibration_error, fit_temperature
+
+    rng = np.random.default_rng(0)
+    labels = rng.integers(0, 5, size=200)
+    logits = rng.normal(size=(200, 5))
+    # 30 * cos(theta), the geometry the submitted ArcFace scale produced.
+    logits[np.arange(200), labels] += 1.0
+    logits *= 30.0
+
+    temperature = fit_temperature(logits, labels)
+    assert temperature > 1.0, "an inflated logit scale must be scaled back down"
+
+    def softmax(x):
+        shifted = x - x.max(axis=1, keepdims=True)
+        exp = np.exp(shifted)
+        return exp / exp.sum(axis=1, keepdims=True)
+
+    before = expected_calibration_error(softmax(logits), labels)
+    after = expected_calibration_error(softmax(logits / temperature), labels)
+    assert after["ece"] < before["ece"]
+
+
+def test_mcnemar_uses_only_the_discordant_pairs():
+    """Paired testing is available because every variant shares the test split.
+
+    Concordant pairs carry no evidence about which classifier is better; the
+    whole of the signal is in ``n01`` and ``n10``. That is what makes McNemar
+    more powerful here than comparing two independent confidence intervals.
+    """
+    from src.utils.metrics import mcnemar_test
+
+    reference = np.array([True] * 50 + [False] * 50)
+    identical = reference.copy()
+    assert mcnemar_test(reference, identical)["p_value"] == pytest.approx(1.0)
+
+    # A one-sided landslide among the discordant pairs.
+    variant = reference.copy()
+    variant[:25] = False
+    outcome = mcnemar_test(reference, variant)
+    assert outcome["n01"] == 25 and outcome["n10"] == 0
+    assert outcome["p_value"] < 1e-6
+    assert outcome["accuracy_delta"] == pytest.approx(-0.25)
+
+    # Concordant pairs must not move the p-value.
+    padded_reference = np.concatenate([reference, np.ones(1000, dtype=bool)])
+    padded_variant = np.concatenate([variant, np.ones(1000, dtype=bool)])
+    assert mcnemar_test(padded_reference, padded_variant)["p_value"] == pytest.approx(
+        outcome["p_value"]
+    )
+
+
+def test_holm_bonferroni_is_monotone_and_never_shrinks_a_p_value():
+    """Six ablations against one reference is six chances to find a difference."""
+    from src.utils.metrics import holm_bonferroni
+
+    raw = {"a": 0.001, "b": 0.02, "c": 0.04, "d": 0.5}
+    adjusted = holm_bonferroni(raw)
+
+    assert set(adjusted) == set(raw)
+    assert all(adjusted[name] >= raw[name] for name in raw)
+    ordered = [adjusted[name] for name in sorted(raw, key=raw.get)]
+    assert all(b >= a for a, b in zip(ordered, ordered[1:]))
+    assert all(value <= 1.0 for value in adjusted.values())
+
+
+def test_per_seed_type_breakdown_stops_rice_dominating_the_impression():
+    """13 of 27 sub-varieties are rice, so an overall figure is structurally skewed."""
+    from src.utils.metrics import per_seed_type_breakdown
+
+    parents = [0] * 3 + [1] * 3
+    sub_true = np.array([0, 1, 2, 3, 4, 5])
+    sub_pred = np.array([0, 1, 2, 4, 5, 3])  # seed type 0 perfect, seed type 1 wrong
+
+    breakdown = per_seed_type_breakdown(sub_true, sub_pred, parents, ["millet", "rice"])
+    assert breakdown["millet"]["accuracy"] == pytest.approx(1.0)
+    assert breakdown["rice"]["accuracy"] == pytest.approx(0.0)
+    assert breakdown["millet"]["support"] == 3

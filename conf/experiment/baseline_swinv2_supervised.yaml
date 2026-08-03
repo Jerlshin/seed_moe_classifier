@@ -1,0 +1,34 @@
+# @package _global_
+#
+# Baseline: ImageNet-initialised SwinV2-Base + the FULL hierarchical head.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_swinv2_supervised
+#   python scripts/run_baselines.py --models swinv2_supervised
+#
+# The only variant that separates "in-domain self-supervised pretraining" from
+# "the architecture". Everything is the proposed model except the encoder's
+# initialisation: no stage-1 checkpoint, ImageNet weights instead, and the trunk
+# unfrozen so those weights can adapt.
+#
+# The suite's shared-checkpoint rule is deliberately bypassed here
+# (checkpoint_path: null) because the whole point of this row is to NOT read the
+# self-supervised encoder. run_baselines.py knows not to inject one.
+
+defaults:
+  - finetune_hierarchical_moe
+
+experiment:
+  name: "baseline_swinv2_supervised"
+  group: "baseline"
+  variant: "swinv2_supervised"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/swinv2_supervised"
+    # The trunk trains here, so the rate that suits a head on a frozen encoder
+    # would be far too high.
+    learning_rate: 0.00003
+
+model:
+  backbone:
+    checkpoint_path: null   # ImageNet init, not the stage-1 encoder
+    pretrained: true
+    freeze: false

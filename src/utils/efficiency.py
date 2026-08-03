@@ -87,12 +87,23 @@ class ParameterReport:
 
 @dataclass
 class LatencyReport:
-    """Timing for a single batch size."""
+    """Timing for a single batch size.
+
+    Reports the **median** and the interquartile range rather than a bare mean.
+    A mean over ten iterations on a contended device has no dispersion estimate
+    at all, and the first few iterations after warm-up are still the most likely
+    to be outliers; the median is robust to both and the IQR says how much to
+    trust it.
+    """
 
     batch_size: int
     latency_ms_per_batch: float
     latency_ms_per_sample: float
     throughput_fps: float
+    latency_ms_iqr: float = 0.0
+    latency_ms_min: float = 0.0
+    latency_ms_max: float = 0.0
+    iterations: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -359,15 +370,25 @@ def benchmark_latency(
     example_input: torch.Tensor,
     device: torch.device,
     batch_sizes: Sequence[int] = (1, 8, 32),
-    warmup: int = 3,
-    iterations: int = 10,
+    warmup: int = 5,
+    iterations: int = 50,
     forward_fn=None,
+    sample_pool: torch.Tensor | None = None,
 ) -> list[LatencyReport]:
     """Time inference at each batch size and return per-sample latency and FPS.
 
     ``example_input`` supplies the sample shape; each batch size is materialised
-    by tiling or slicing its first element, so the caller only has to provide one
-    representative tensor.
+    by tiling or slicing, so the caller only has to provide one representative
+    tensor.
+
+    **Tile from distinct samples where possible.** Repeating one row to reach
+    batch 32 gives 32 identical gate logits, hence 32 identical Top-K selections,
+    hence exactly ``K`` expert kernels launched for the whole batch instead of
+    the up-to-``E`` that diverse data produces. That systematically *understates*
+    the dispatch overhead of sparse routing at larger batches, which is the one
+    thing the batch-32 row exists to measure. ``sample_pool`` supplies real,
+    distinct samples; when it is absent the tiled batch is still used but the
+    report is annotated so nobody reads the number as realistic.
 
     Args:
         model: Module to benchmark, moved to ``device`` by the caller.
@@ -377,38 +398,51 @@ def benchmark_latency(
         warmup: Untimed iterations, which absorb lazy kernel compilation and
             allocator warm-up. Skipping these inflates the first measurement
             enough to dominate a short benchmark.
-        iterations: Timed iterations per batch size.
+        iterations: Timed iterations per batch size. Each is timed individually
+            so a median and an IQR are available.
         forward_fn: Callable taking the batch tensor, for models whose forward
             takes extra arguments.
+        sample_pool: Distinct real samples to tile from; see above.
     """
     was_training = model.training
     model.eval()
     reports: list[LatencyReport] = []
+    source = sample_pool if sample_pool is not None and sample_pool.shape[0] > 0 else example_input
 
     try:
         for batch_size in batch_sizes:
-            batch = _resize_batch(example_input, batch_size).to(device)
+            batch = _resize_batch(source, batch_size).to(device)
             run = (lambda: forward_fn(batch)) if forward_fn is not None else (lambda: model(batch))
 
+            timings: list[float] = []
             with torch.no_grad():
                 for _ in range(max(warmup, 0)):
                     run()
                 synchronize(device)
 
-                started = time.perf_counter()
                 for _ in range(max(iterations, 1)):
+                    started = time.perf_counter()
                     run()
-                synchronize(device)
-                elapsed = time.perf_counter() - started
+                    synchronize(device)
+                    timings.append((time.perf_counter() - started) * 1000.0)
 
-            per_batch_ms = elapsed / max(iterations, 1) * 1000.0
-            per_sample_ms = per_batch_ms / batch_size
+            ordered = sorted(timings)
+            count = len(ordered)
+            median_ms = ordered[count // 2] if count % 2 else 0.5 * (ordered[count // 2 - 1] + ordered[count // 2])
+            q1 = ordered[max(int(0.25 * count) - 1, 0)]
+            q3 = ordered[min(int(0.75 * count), count - 1)]
+
+            per_sample_ms = median_ms / batch_size
             reports.append(
                 LatencyReport(
                     batch_size=batch_size,
-                    latency_ms_per_batch=per_batch_ms,
+                    latency_ms_per_batch=median_ms,
                     latency_ms_per_sample=per_sample_ms,
                     throughput_fps=1000.0 / per_sample_ms if per_sample_ms > 0 else float("inf"),
+                    latency_ms_iqr=float(q3 - q1),
+                    latency_ms_min=float(ordered[0]),
+                    latency_ms_max=float(ordered[-1]),
+                    iterations=count,
                 )
             )
     finally:
@@ -437,13 +471,24 @@ def profile_model(
     name: str = "model",
     extra_modules: Sequence[nn.Module] = (),
     batch_sizes: Sequence[int] = (1, 8, 32),
-    warmup: int = 3,
-    iterations: int = 10,
+    warmup: int = 5,
+    iterations: int = 50,
     forward_fn=None,
     measure_flops: bool = True,
     measure_latency: bool = True,
+    sample_pool: torch.Tensor | None = None,
 ) -> EfficiencyReport:
     """Run every measurement and return one :class:`EfficiencyReport`.
+
+    A framing note that belongs with the numbers rather than only in the paper:
+    the Top-4 -> Top-2 change saves ``2 x parameters_per_expert``, which against
+    a ~96 M model dominated by a frozen 87 M SwinV2-Base trunk is roughly **2 %
+    of total parameters**. That saving is real but it is in *parameters and
+    FLOPs*, not in wall-clock: sparse dispatch replaces one batched matmul with
+    several small gather/matmul/scatter sequences, so at these batch sizes it can
+    be *slower* than dense evaluation. The "Inference Latency (ms)" column sits
+    next to "Active Params (M)" in the results table and must not be read as
+    caused by it. :meth:`EfficiencyReport.summary_line` says so explicitly.
 
     Args:
         model: The module to profile.
@@ -457,6 +502,8 @@ def profile_model(
         forward_fn: Callable taking a batch, for non-standard forward signatures.
         measure_flops: Run the FLOP counter.
         measure_latency: Run the latency sweep.
+        sample_pool: Distinct real samples for the latency sweep to tile from;
+            see :func:`benchmark_latency`.
     """
     modules = [model, *extra_modules]
     report = EfficiencyReport(
@@ -484,7 +531,14 @@ def profile_model(
             warmup=warmup,
             iterations=iterations,
             forward_fn=forward_fn,
+            sample_pool=sample_pool,
         )
+        if sample_pool is None or sample_pool.shape[0] < max(batch_sizes, default=1):
+            report.notes.append(
+                "Latency batches were tiled from too few distinct samples: identical rows "
+                "produce identical routing, so sparse-dispatch overhead is understated at "
+                "the larger batch sizes."
+            )
 
     report.peak_memory_mb = peak_memory_mb(device)
     if report.peak_memory_mb is None:
@@ -494,9 +548,14 @@ def profile_model(
 
     saving = top_k_saving(*modules)
     if saving:
+        total = report.parameters.total or 1
         report.notes.append(
             f"Top-{report.parameters.top_k} activates "
-            f"{saving['parameters_saved_fraction'] * 100:.1f}% fewer parameters than Top-4."
+            f"{saving['parameters_saved_fraction'] * 100:.1f}% fewer parameters than Top-4 "
+            f"({saving['parameters_saved'] / 1e6:.2f} M, "
+            f"{saving['parameters_saved'] / total * 100:.1f}% of the total model). "
+            "This is a parameter and FLOP saving, not a wall-clock one: the frozen backbone "
+            "dominates latency and sparse dispatch trades one batched matmul for several small ones."
         )
 
     return report

@@ -2,32 +2,42 @@
 #
 #   L = CE(seed_type_logits, y_seed) + CE(sub_logits, y_sub)
 #
-# Used by the supervised baselines and by the two-stage hierarchical CCE
-# baseline. Reuses CombinedHierarchicalLoss with the hierarchy-specific terms
-# weighted to zero rather than defining a second criterion: sharing one
-# implementation guarantees the baseline and the full model compute their
-# cross-entropy identically, so any measured gap is architectural.
+# Used by the supervised baselines, the linear probe, and the two-stage
+# hierarchical CCE baseline. Reuses CombinedHierarchicalLoss with the
+# hierarchy-specific terms weighted to zero rather than defining a second
+# criterion: sharing one implementation guarantees the baseline and the full
+# model compute their cross-entropy identically, so any measured gap is
+# architectural.
 #
 # `lambda_arcface` weights a cross-entropy over `sub_margin_logits`. Models with
-# no ArcFace head return those unchanged from `sub_logits`, so with no margin
-# present the term *is* the plain sub-variety cross-entropy.
+# no angular-margin head return those unchanged from `sub_logits`, so with no
+# margin present the term *is* the plain sub-variety cross-entropy.
 
 name: "flat_cce"
 
 use_kl_loss: false
+weighting_mode: "fixed"
 
 lambda_seed: 1.0
 lambda_arcface: 1.0     # plain CE over the sub-variety logits, see above
 lambda_kl: 0.0
 lambda_moe_load: 0.0    # no router to balance
 lambda_moe_sparsity: 0.0
-lambda_cosine: 0.0      # no Eq. 9 residual to regularise
+lambda_moe_z: 0.0
+lambda_cosine: 0.0      # no compactness term in a plain-CE baseline
+lambda_residual: 0.0    # no Eq. 9 residual to bound
 lambda_sub_ce: 0.0      # would double-count the sub-variety term
 
 seed_label_smoothing: 0.0
 arcface_label_smoothing: 0.0
 
-detach_kl_seed_target: false
+detach_kl_seed_target: true
+kl_mode: "forward"
+tau_kl: 1.0
 moe_sparsity_mode: "off_topk"
+moe_load_mode: "switch"
+moe_utilization_momentum: 0.9
 normalize_moe_entropy: true
-cosine_mode: "residual"
+cosine_mode: "intra_class"
+centroid_momentum: 0.9
+residual_tau: 0.5

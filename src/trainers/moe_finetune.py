@@ -44,8 +44,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
-from sklearn.model_selection import StratifiedKFold, train_test_split
-from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import (
+    GroupShuffleSplit,
+    StratifiedGroupKFold,
+    StratifiedKFold,
+    train_test_split,
+)
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if PROJECT_ROOT not in sys.path:
@@ -54,7 +59,7 @@ if PROJECT_ROOT not in sys.path:
 from src.datasets.dataset import HierarchicalSeedDataset, get_finetune_dataset
 from src.datasets.transforms import get_supervised_transforms
 from src.losses.hierarchical import CombinedHierarchicalLoss, build_combined_loss
-from src.models.baselines import IdentityEncoder, build_baseline
+from src.models.baselines import IdentityEncoder, build_baseline, build_linear_probe
 from src.models.builder import build_encoder, build_hierarchical_moe
 from src.utils.efficiency import EfficiencyReport, profile_model
 from src.utils.evaluation import RunSummary, save_test_predictions
@@ -84,23 +89,53 @@ def seed_everything(seed: int) -> None:
     Reproducibility across the ablation and baseline suites depends on this: the
     variants are compared against each other, so an unseeded split or
     initialisation would show up as a spurious difference between variants.
+
+    Note that this seeds the *process*. DataLoader worker processes need their
+    own seeding, which :func:`make_worker_init_fn` supplies -- without it the
+    augmentation stream is not reproducible even though the split is.
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
+
+def make_worker_init_fn(seed: int):
+    """Per-worker seeding so the augmentation stream is reproducible."""
+
+    def worker_init_fn(worker_id: int) -> None:
+        worker_seed = seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed % (2**32))
+        torch.manual_seed(worker_seed)
+
+    return worker_init_fn
 
 
 # --------------------------------------------------------------------- splits
 
+#: How the held-out partition is drawn.
+SPLIT_PROTOCOLS = ("grouped", "stratified")
+
 
 def stratification_labels(dataset: HierarchicalSeedDataset) -> np.ndarray:
-    """Composite ``seed * 1000 + sub`` key so splits stay stratified on both levels."""
-    return np.array([seed * 1000 + sub for _, seed, sub in dataset.samples])
+    """Sub-variety label, which is the whole stratification key.
+
+    A note on a claim this repository used to make. The composite key
+    ``seed * 1000 + sub`` was justified as necessary because "stratifying on
+    sub-variety alone would not guarantee seed-type balance". That is false: the
+    sub-variety labels are **global** (0..26) and each has exactly one parent, so
+    ``seed = parent(sub)`` is a deterministic function of ``sub`` and the map
+    ``sub -> seed*1000 + sub`` is a bijection. The composite key therefore induced
+    *exactly* the same strata as ``sub`` alone. The code was correct and the
+    reason was wrong; this returns the simpler key that produces the same
+    partition.
+    """
+    return np.array([sub for _, _, sub in dataset.samples], dtype=np.int64)
 
 
 def split_dataset(
@@ -108,30 +143,75 @@ def split_dataset(
     test_size: float,
     num_folds: int,
     seed: int,
-) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
+    protocol: str = "grouped",
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray, dict[str, Any]]:
     """Carve out a held-out test set, then build ``num_folds`` train/val splits.
 
-    Driven entirely by ``seed``, so every variant in the ablation suite sees the
+    Driven entirely by ``seed``, so every variant in the suite sees the
     byte-identical partition. Comparing variants trained on different splits
     would confound the architecture change with the split.
+
+    ``protocol="grouped"`` (default) keeps every crop of one source photograph on
+    one side of the boundary. This matters here more than in most datasets: the
+    9,357 crops under ``Cropped_Samples`` come from **81 source photographs**,
+    a mean of 115 crops per source. Under crop-level splitting, near-duplicate
+    views of the same physical seeds -- same lighting, same background, same
+    sensor noise, overlapping bounding boxes -- appear in both train and test,
+    and the measured accuracy is substantially a memorisation score.
+
+    ``protocol="stratified"`` reproduces the submitted crop-level splitting. It
+    is retained deliberately: running the full model under both and reporting the
+    delta turns a fatal methodological objection into a measured result. See
+    ``scripts/run_ablations.py``'s ``leakage_ungrouped`` variant.
+
+    **A limit the protocol cannot fix.** Five of the 27 sub-varieties have crops
+    from exactly one source photograph, so no grouped split can put any of their
+    crops in both train and test. Grouped stratification therefore degrades to
+    "that class is entirely in one partition" for those five. The returned
+    report names them; the honest reading is that their scores measure
+    within-photograph generalisation whatever the splitter does, and the paper
+    must say so.
+
+    Returns ``(splits, test_indices, report)``.
     """
+    if protocol not in SPLIT_PROTOCOLS:
+        raise ValueError(f"protocol must be one of {SPLIT_PROTOCOLS}, got {protocol!r}")
+
     labels = stratification_labels(dataset)
     indices = np.arange(len(dataset))
+    groups = dataset.source_groups() if protocol == "grouped" else None
+    report: dict[str, Any] = {"protocol": protocol, "seed": int(seed), "num_folds": int(num_folds)}
 
     if test_size > 0:
-        train_val_indices, test_indices = train_test_split(
-            indices, test_size=test_size, stratify=labels, random_state=seed
-        )
+        if protocol == "grouped":
+            splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+            train_val_indices, test_indices = next(splitter.split(indices, labels, groups))
+        else:
+            train_val_indices, test_indices = train_test_split(
+                indices, test_size=test_size, stratify=labels, random_state=seed
+            )
     else:
         train_val_indices, test_indices = indices, np.array([], dtype=np.int64)
 
     train_val_labels = labels[train_val_indices]
     if num_folds > 1:
-        splitter = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+        if protocol == "grouped":
+            fold_splitter = StratifiedGroupKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+            fold_iter = fold_splitter.split(
+                np.zeros(len(train_val_labels)), train_val_labels, groups[train_val_indices]
+            )
+        else:
+            fold_splitter = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+            fold_iter = fold_splitter.split(np.zeros(len(train_val_labels)), train_val_labels)
         splits = [
-            (train_val_indices[train_idx], train_val_indices[val_idx])
-            for train_idx, val_idx in splitter.split(np.zeros(len(train_val_labels)), train_val_labels)
+            (train_val_indices[train_idx], train_val_indices[val_idx]) for train_idx, val_idx in fold_iter
         ]
+    elif protocol == "grouped":
+        inner = GroupShuffleSplit(n_splits=1, test_size=max(test_size, 0.2), random_state=seed)
+        train_idx, val_idx = next(
+            inner.split(train_val_indices, train_val_labels, groups[train_val_indices])
+        )
+        splits = [(train_val_indices[train_idx], train_val_indices[val_idx])]
     else:
         train_idx, val_idx = train_test_split(
             train_val_indices,
@@ -141,7 +221,49 @@ def split_dataset(
         )
         splits = [(train_idx, val_idx)]
 
-    return splits, test_indices
+    report.update(leakage_report(dataset, splits, test_indices, protocol))
+    return splits, test_indices, report
+
+
+def leakage_report(
+    dataset: HierarchicalSeedDataset,
+    splits: list[tuple[np.ndarray, np.ndarray]],
+    test_indices: np.ndarray,
+    protocol: str,
+) -> dict[str, Any]:
+    """Count source photographs that straddle a partition boundary.
+
+    Reported for *both* protocols, so the stratified run carries an explicit
+    record of how much leakage it has rather than leaving it to be inferred.
+    """
+    groups = dataset.source_groups()
+    test_groups = set(groups[test_indices].tolist()) if test_indices.size else set()
+    train_groups: set[int] = set()
+    for train_indices, _ in splits:
+        train_groups.update(groups[train_indices].tolist())
+
+    shared = sorted(train_groups & test_groups)
+    _, sub_names = dataset.get_ordered_class_names()
+    test_classes = {int(dataset.samples[i][2]) for i in test_indices.tolist()}
+    train_classes: set[int] = set()
+    for train_indices, _ in splits:
+        train_classes.update(int(dataset.samples[i][2]) for i in train_indices.tolist())
+
+    return {
+        "num_source_groups": int(len(set(groups.tolist()))),
+        "test_size": int(test_indices.size),
+        "shared_source_groups": len(shared),
+        "leaked_test_fraction": (
+            float(np.isin(groups[test_indices], list(shared)).mean()) if test_indices.size else 0.0
+        ),
+        "sub_varieties_missing_from_train": sorted(
+            sub_names[index] for index in test_classes - train_classes
+        ),
+        "sub_varieties_missing_from_test": sorted(
+            sub_names[index] for index in train_classes - test_classes
+        ),
+        "protocol": protocol,
+    }
 
 
 def save_split_manifest(
@@ -149,8 +271,9 @@ def save_split_manifest(
     splits: list[tuple[np.ndarray, np.ndarray]],
     test_indices: np.ndarray,
     dataset: HierarchicalSeedDataset,
+    protocol: str = "grouped",
 ) -> str:
-    """Persist split indices and class mappings so evaluation stays reproducible."""
+    """Persist split indices, group keys and class mappings for reproducibility."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     path = output_path / "split_manifest.npz"
@@ -159,6 +282,10 @@ def save_split_manifest(
         "seed_type_to_idx": np.array(list(dataset.seed_type_to_idx.items()), dtype=object),
         "subvariety_to_idx": np.array(list(dataset.subvariety_to_idx.items()), dtype=object),
         "subvariety_to_seed_type": np.array(dataset.get_subvariety_to_seed_type()),
+        # Persisted so a later reviewer can verify the grouping rather than
+        # trusting the protocol name.
+        "source_groups": dataset.source_groups(),
+        "split_protocol": np.array(protocol),
     }
     for fold, (train_indices, val_indices) in enumerate(splits, start=1):
         payload[f"fold_{fold}_train_indices"] = train_indices
@@ -167,11 +294,33 @@ def save_split_manifest(
     return str(path)
 
 
+def build_balanced_sampler(
+    dataset: HierarchicalSeedDataset,
+    indices: np.ndarray,
+    generator: torch.Generator | None = None,
+) -> WeightedRandomSampler:
+    """Inverse-frequency sampler over sub-varieties.
+
+    The hierarchy is 13 rice + 8 millet + 3 + 3, so seed-type accuracy is
+    structurally dominated by rice. Macro-F1 is reported but nothing was training
+    for it; this is the option that does.
+    """
+    sub_labels = np.array([dataset.samples[i][2] for i in indices], dtype=np.int64)
+    counts = np.bincount(sub_labels, minlength=int(sub_labels.max()) + 1).astype(np.float64)
+    weights = 1.0 / np.clip(counts[sub_labels], 1.0, None)
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(indices),
+        replacement=True,
+        generator=generator,
+    )
+
+
 # ------------------------------------------------------------------ model wiring
 
 
 def build_model_and_encoder(cfg: DictConfig, device: torch.device) -> tuple[nn.Module, nn.Module]:
-    """Return ``(encoder, model)`` for either the proposed framework or a baseline.
+    """Return ``(encoder, model)`` for the proposed framework or a baseline.
 
     Dispatches on ``model.head.name``:
 
@@ -180,8 +329,14 @@ def build_model_and_encoder(cfg: DictConfig, device: torch.device) -> tuple[nn.M
         slot is filled by :class:`~src.models.baselines.IdentityEncoder` and the
         images reach the model untouched.
 
+    ``linear_probe``
+        The *real* self-supervised encoder plus two linear layers. Shares the
+        encoder path with the proposed model on purpose: the probe must see
+        byte-identical features, or the gap to the full head would measure a
+        different representation rather than a different head.
+
     anything else
-        The proposed framework: a DINOv2-pretrained SwinV2 encoder emitting
+        The proposed framework: a self-supervised SwinV2 encoder emitting
         ``z in R^384``, plus the hierarchical head.
     """
     head_name = str(OmegaConf.select(cfg, "model.head.name", default="hierarchical_moe"))
@@ -189,9 +344,49 @@ def build_model_and_encoder(cfg: DictConfig, device: torch.device) -> tuple[nn.M
     if head_name == "flat_supervised":
         return IdentityEncoder().to(device), build_baseline(cfg.model.head).to(device)
 
-    encoder = build_encoder(cfg.model.backbone, embed_dim=int(cfg.model.head.embed_dim)).to(device)
-    model = build_hierarchical_moe(cfg.model.head).to(device)
-    return encoder, model
+    # The encoder's routing granularity has to match the head's, or the head
+    # silently receives one token where it expected 64 (or vice versa) and every
+    # attention module quietly becomes affine again.
+    token_mode = str(OmegaConf.select(cfg, "model.head.token_mode", default="grid"))
+    encoder = build_encoder(
+        cfg.model.backbone,
+        embed_dim=int(cfg.model.head.embed_dim),
+        token_mode="pooled" if head_name == "linear_probe" else token_mode,
+    ).to(device)
+
+    if head_name == "linear_probe":
+        return encoder, build_linear_probe(cfg.model.head).to(device)
+    return encoder, build_hierarchical_moe(cfg.model.head).to(device)
+
+
+# ------------------------------------------------------------------- schedules
+
+
+def margin_schedule(epoch: int, total_epochs: int, warmup_fraction: float) -> float:
+    """Linear ArcFace margin ramp in ``[0, 1]`` over the first ``warmup_fraction``.
+
+    Applying the full margin from step 0 is a documented convergence hazard on
+    small backbones and small datasets; CurricularFace reports outright
+    divergence at ``m = 0.5`` where ``m = 0.45`` converges.
+    """
+    if warmup_fraction <= 0.0:
+        return 1.0
+    warmup_epochs = max(int(round(total_epochs * float(warmup_fraction))), 1)
+    return min(max(epoch - 1, 0) / warmup_epochs, 1.0)
+
+
+def router_noise_schedule(epoch: int, total_epochs: int, initial: float, fraction: float) -> float:
+    """Linear anneal of the gating noise to exactly zero.
+
+    ``topk`` is flat almost everywhere, so nothing in the objective can say "this
+    token should have gone to expert 4". Gaussian gating noise is the only
+    exploration deterministic Top-K has; it has to reach zero before the end so
+    the deployed routing is the routing that was measured.
+    """
+    if initial <= 0.0 or fraction <= 0.0:
+        return 0.0
+    anneal_epochs = max(int(round(total_epochs * float(fraction))), 1)
+    return float(initial) * max(0.0, 1.0 - max(epoch - 1, 0) / anneal_epochs)
 
 
 # ----------------------------------------------------------------- optimisation
@@ -205,6 +400,12 @@ def build_optimizer(modules: list[nn.Module], cfg: DictConfig) -> optim.Optimize
     it would silently freeze the one layer that adapts the backbone's 1024
     channels to the head's 384 -- the head would train against a random
     projection.
+
+    The **criterion** must be included too under
+    ``weighting_mode="uncertainty"``, where it owns three ``log sigma^2``
+    scalars. They are the only learnable parameters the loss has ever held, and
+    omitting them would leave the task weights pinned at their initial values
+    while the logs reported them as "learned".
 
     Parameters are de-duplicated by identity, so a module appearing twice does
     not get two optimizer entries and therefore two updates per step.
@@ -271,13 +472,21 @@ class EpochAccumulator:
     total_loss: float = 0.0
     batches: int = 0
 
+    logits: list[np.ndarray] = field(default_factory=list)
+    tokens_per_sample: int = 1
+
     def update(self, output, loss_parts: dict[str, float], seed_labels, sub_labels, keep_embeddings: int) -> None:
         self.seed_pred.extend(output.seed_type_logits.argmax(dim=1).detach().cpu().tolist())
         self.seed_true.extend(seed_labels.detach().cpu().tolist())
         self.sub_pred.extend(output.sub_logits.argmax(dim=1).detach().cpu().tolist())
         self.sub_true.extend(sub_labels.detach().cpu().tolist())
         self.sub_scores.append(F.softmax(output.sub_logits.detach(), dim=-1).cpu().numpy())
+        # Raw logits are kept alongside the probabilities so temperature scaling
+        # can be fitted afterwards; refitting from softmax output would need the
+        # inverse of a transform that is not invertible in float32.
+        self.logits.append(output.sub_logits.detach().float().cpu().numpy())
         self.expert_indices.append(output.top_k_indices.detach().cpu().numpy())
+        self.tokens_per_sample = int(getattr(output, "tokens_per_sample", 1))
 
         collected = sum(chunk.shape[0] for chunk in self.embeddings)
         if collected < keep_embeddings:
@@ -295,6 +504,9 @@ class EpochAccumulator:
 
     def stacked_scores(self) -> np.ndarray | None:
         return np.concatenate(self.sub_scores, axis=0) if self.sub_scores else None
+
+    def stacked_logits(self) -> np.ndarray | None:
+        return np.concatenate(self.logits, axis=0) if self.logits else None
 
     def stacked_embeddings(self) -> np.ndarray | None:
         return np.concatenate(self.embeddings, axis=0) if self.embeddings else None
@@ -357,6 +569,54 @@ def forward_batch(
     return output, breakdown, seed_labels, sub_labels
 
 
+def per_term_gradient_norms(
+    model: nn.Module,
+    criterion: CombinedHierarchicalLoss,
+    output,
+    seed_labels: torch.Tensor,
+    sub_labels: torch.Tensor,
+) -> dict[str, float]:
+    """Gradient norm and pairwise cosine of each loss term at the shared trunk.
+
+    For a multi-term objective this is the single highest-value diagnostic
+    available, and it is the direct empirical test for the hypotheses the audit
+    could only argue analytically: whether ``L_ArcFace`` dominates the budget,
+    whether ``L_cos`` opposes it, and whether ``L_KL`` opposes ``L_seed``. A
+    persistently negative cosine between two terms is the signal to reweight or
+    apply gradient surgery.
+
+    Costs one extra backward per term, so the trainer calls it rarely
+    (``tracking.intervals.gradient_probe_every_steps``, default 50).
+    """
+    shared = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and ("sub_variety_embedding" in name or "moe" in name)
+    ]
+    if not shared:
+        return {}
+
+    parts = criterion.component_losses(output, seed_labels, sub_labels)
+    flattened: dict[str, torch.Tensor] = {}
+    for name, term in parts.items():
+        if not term.requires_grad or float(term.detach()) == 0.0:
+            continue
+        grads = torch.autograd.grad(term, shared, retain_graph=True, allow_unused=True)
+        vector = torch.cat(
+            [g.reshape(-1) if g is not None else torch.zeros_like(p).reshape(-1) for g, p in zip(grads, shared)]
+        )
+        flattened[name] = vector
+
+    metrics = {f"grad_norm/{name}": float(vector.norm()) for name, vector in flattened.items()}
+    pairs = [("arcface", "kl"), ("arcface", "seed"), ("cosine", "arcface"), ("kl", "seed")]
+    for left, right in pairs:
+        if left in flattened and right in flattened:
+            metrics[f"grad_cosine/{left}_vs_{right}"] = float(
+                F.cosine_similarity(flattened[left], flattened[right], dim=0)
+            )
+    return metrics
+
+
 def run_epoch(
     encoder: nn.Module,
     model: nn.Module,
@@ -384,9 +644,17 @@ def run_epoch(
 
     accumulator = EpochAccumulator()
     log_every = int(OmegaConf.select(tracker.cfg, "tracking.intervals.log_every_steps", default=10))
+    probe_every = int(
+        OmegaConf.select(tracker.cfg, "tracking.intervals.gradient_probe_every_steps", default=50)
+    )
     log_grad_norms = bool(
         OmegaConf.select(tracker.cfg, "tracking.artifacts.log_gradient_norms", default=True)
     )
+    log_term_grads = bool(
+        OmegaConf.select(tracker.cfg, "tracking.artifacts.log_per_term_gradients", default=True)
+    )
+    materialize_grads = getattr(model, "materialize_expert_grads", None)
+    dead_expert_total = 0
 
     for batch_idx, batch in enumerate(loader):
         if max_batches is not None and batch_idx >= max_batches:
@@ -407,8 +675,28 @@ def run_epoch(
                 training=is_train,
             )
 
+        term_gradients: dict[str, float] = {}
         if is_train:
+            probe = (
+                log_term_grads
+                and probe_every > 0
+                and (global_step + 1) % probe_every == 0
+            )
+            if probe:
+                term_gradients = per_term_gradient_norms(
+                    model, criterion, output, seed_labels, sub_labels
+                )
             breakdown.total.backward()
+
+            # Optimizer parity. Under sparse dispatch an expert no token reached
+            # has `grad is None`, and AdamW skips such parameters entirely --
+            # including decoupled weight decay and moment decay. The dense path
+            # gives them a zero gradient, so without this the two dispatch modes
+            # train measurably different models and the "debug-only" dense path
+            # could not be used to validate a sparse run.
+            if materialize_grads is not None:
+                materialize_grads()
+
             if clip_grad is not None and clip_grad > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [group_param for group in optimizer.param_groups for group_param in group["params"]],
@@ -416,6 +704,7 @@ def run_epoch(
                 )
             optimizer.step()
 
+        dead_expert_total += int(breakdown.dead_experts)
         accumulator.update(
             output,
             breakdown.as_dict(),
@@ -426,6 +715,8 @@ def run_epoch(
 
         if is_train:
             global_step += 1
+            if term_gradients:
+                tracker.log_metrics(term_gradients, global_step, prefix="train/step")
             if global_step % log_every == 0:
                 tracker.log_metrics(
                     {"loss": float(breakdown.total.detach())}, global_step, prefix="train/step"
@@ -450,24 +741,31 @@ def run_epoch(
         sub_scores=accumulator.stacked_scores(),
         top_k_indices=accumulator.stacked_experts(),
         num_experts=num_experts,
+        tokens_per_sample=accumulator.tokens_per_sample,
     )
 
     metrics: dict[str, Any] = {
         "loss": accumulator.total_loss / accumulator.batches,
         "batches": accumulator.batches,
+        # Averaged over batches, so a value above 0 means experts were sitting
+        # out *within* steps even if the epoch total looks balanced.
+        "mean_dead_experts_per_step": dead_expert_total / accumulator.batches,
         **accumulator.mean_losses(),
         **evaluation.scalar_metrics(),
     }
     tracker.log_metrics(metrics, epoch, prefix=phase)
 
     logger.info(
-        "%s epoch %s | loss=%.5f seed_acc=%.4f sub_acc=%.4f kl_align=%.4f batches=%s",
+        "%s epoch %s | loss=%.5f seed_acc=%.4f sub_acc=%.4f kl_align=%.4f "
+        "dead_experts=%s nmi_sub=%.3f batches=%s",
         phase,
         epoch,
         metrics["loss"],
         evaluation.seed_type.get("accuracy", float("nan")),
         evaluation.sub_variety.get("accuracy", float("nan")),
         evaluation.alignment.overall,
+        evaluation.dead_experts,
+        evaluation.expert_nmi.get("sub_variety", float("nan")),
         accumulator.batches,
     )
     return metrics, evaluation, accumulator, global_step
@@ -615,12 +913,19 @@ def profile_run(
     cfg: DictConfig,
     device: torch.device,
     logger,
+    sample_indices: np.ndarray | None = None,
 ) -> EfficiencyReport | None:
     """Measure parameters, FLOPs, latency, throughput and peak memory.
 
     Profiles the *deployed* path -- encoder and head together -- because that is
     what an inference latency figure has to mean. Profiling the head alone would
     report a number no user could ever observe.
+
+    ``sample_indices`` supplies **real, distinct** images for the latency sweep.
+    Tiling one image to reach batch 32 gives 32 identical gate logits and
+    therefore exactly ``K`` expert kernels for the whole batch, which understates
+    sparse-dispatch overhead precisely where the benchmark is trying to measure
+    it.
     """
     if not bool(OmegaConf.select(cfg, "experiment.efficiency.enabled", default=True)):
         return None
@@ -630,6 +935,16 @@ def profile_run(
         OmegaConf.select(cfg, "experiment.efficiency.batch_sizes", default=[1, 8, 32]) or [1, 8, 32]
     )
     example = torch.randn(max(batch_sizes[0], 1), 3, image_size, image_size, device=device)
+
+    sample_pool: torch.Tensor | None = None
+    if sample_indices is not None and len(sample_indices) > 0:
+        try:
+            wanted = min(max(batch_sizes), len(sample_indices))
+            sample_pool = torch.stack(
+                [dataset[int(index)][0] for index in sample_indices[:wanted]]
+            ).to(device)
+        except Exception as exc:  # pragma: no cover - profiling must never abort a run
+            logger.debug("Could not build a distinct-sample pool for benchmarking: %s", exc)
 
     def forward(batch: torch.Tensor):
         return model(encoder(batch))
@@ -642,13 +957,14 @@ def profile_run(
             name=str(cfg.experiment.name),
             extra_modules=[encoder],
             batch_sizes=batch_sizes,
-            warmup=int(OmegaConf.select(cfg, "experiment.efficiency.warmup", default=3)),
-            iterations=int(OmegaConf.select(cfg, "experiment.efficiency.iterations", default=10)),
+            warmup=int(OmegaConf.select(cfg, "experiment.efficiency.warmup", default=5)),
+            iterations=int(OmegaConf.select(cfg, "experiment.efficiency.iterations", default=50)),
             forward_fn=forward,
             measure_flops=bool(OmegaConf.select(cfg, "experiment.efficiency.measure_flops", default=True)),
             measure_latency=bool(
                 OmegaConf.select(cfg, "experiment.efficiency.measure_latency", default=True)
             ),
+            sample_pool=sample_pool,
         )
     except Exception as exc:
         logger.warning("Efficiency profiling failed: %s", exc)
@@ -728,14 +1044,32 @@ def main(cfg: DictConfig) -> None:
         tracker.log_metrics(collect_device_stats(device), step=0)
 
         # ---------------------------------------------------------- dataset
+        crop_scale = OmegaConf.select(
+            cfg, "experiment.training.random_resized_crop_scale", default=[0.8, 1.0]
+        )
         transform = get_supervised_transforms(
             image_size=int(cfg.data.image_size),
             train=True,
             normalize_mean=cfg.data.augmentation.normalize_mean,
             normalize_std=cfg.data.augmentation.normalize_std,
             horizontal_flip_prob=float(
-                OmegaConf.select(cfg, "experiment.training.horizontal_flip_prob", default=0.0)
+                OmegaConf.select(cfg, "experiment.training.horizontal_flip_prob", default=0.5)
             ),
+            random_resized_crop_scale=list(crop_scale) if crop_scale else None,
+            vertical_flip_prob=float(
+                OmegaConf.select(cfg, "experiment.training.vertical_flip_prob", default=0.0)
+            ),
+            rotation_degrees=float(
+                OmegaConf.select(cfg, "experiment.training.rotation_degrees", default=0.0)
+            ),
+        )
+        # Evaluation must never see a stochastic crop, or the val/test numbers
+        # would be augmentation noise rather than a measurement.
+        eval_transform = get_supervised_transforms(
+            image_size=int(cfg.data.image_size),
+            train=False,
+            normalize_mean=cfg.data.augmentation.normalize_mean,
+            normalize_std=cfg.data.augmentation.normalize_std,
         )
         dataset = get_finetune_dataset(
             data_dir=cfg.data.root_path,
@@ -758,16 +1092,50 @@ def main(cfg: DictConfig) -> None:
             )
 
         # ------------------------------------------------------------ splits
-        splits, test_indices = split_dataset(
+        group_report = dataset.group_report()
+        logger.info(
+            "Provenance: %s crops from %s source photographs (mean %.1f crops/source). "
+            "%s sub-varieties come from a single photograph: %s",
+            group_report["num_samples"],
+            group_report["num_source_groups"],
+            group_report["mean_crops_per_source"],
+            group_report["num_single_group_sub_varieties"],
+            group_report["single_group_sub_varieties"] or "none",
+        )
+
+        split_protocol = str(
+            OmegaConf.select(cfg, "experiment.training.split_protocol", default="grouped")
+        )
+        splits, test_indices, split_report = split_dataset(
             dataset=dataset,
             test_size=float(cfg.experiment.training.test_size),
             num_folds=int(cfg.experiment.training.num_folds),
             seed=int(cfg.seed),
+            protocol=split_protocol,
         )
+        split_report.update(group_report)
+        if split_report["shared_source_groups"]:
+            logger.warning(
+                "Split protocol %r leaves %s source photographs on both sides of the test "
+                "boundary, covering %.1f%% of the test set. The reported accuracy is "
+                "partly a memorisation score.",
+                split_protocol,
+                split_report["shared_source_groups"],
+                split_report["leaked_test_fraction"] * 100.0,
+            )
+        if split_report["sub_varieties_missing_from_train"]:
+            logger.warning(
+                "Grouped splitting left these sub-varieties out of training entirely: %s. "
+                "They have too few source photographs to appear on both sides.",
+                split_report["sub_varieties_missing_from_train"],
+            )
+
         output_dir = Path(cfg.experiment.training.save_path)
         output_dir.mkdir(parents=True, exist_ok=True)
-        split_manifest = save_split_manifest(output_dir, splits, test_indices, dataset)
-        tracker.log_event("split_manifest", {"path": split_manifest})
+        split_manifest = save_split_manifest(
+            output_dir, splits, test_indices, dataset, protocol=split_protocol
+        )
+        tracker.log_event("split_manifest", {"path": split_manifest, **split_report})
 
         pin_memory = bool(cfg.data.pin_memory) and device.type == "cuda"
         num_workers = int(cfg.data.num_workers)
@@ -782,21 +1150,65 @@ def main(cfg: DictConfig) -> None:
         )
         include_optimizer = bool(cfg.experiment.training.save_optimizer_state)
 
-        def make_loader(indices: np.ndarray, shuffle: bool, drop_last: bool = False) -> DataLoader:
+        use_balanced_sampler = bool(
+            OmegaConf.select(cfg, "experiment.training.balanced_sampler", default=False)
+        )
+        # Seeded generator + per-worker seeding: without both, the split is
+        # reproducible but the shuffling and augmentation stream are not, which
+        # is enough to move an ablation gap of the size this table reports.
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(int(cfg.seed))
+        worker_init_fn = make_worker_init_fn(int(cfg.seed))
+        logger.info(
+            "Determinism | cudnn.deterministic=%s cudnn.benchmark=%s seed=%s balanced_sampler=%s",
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            int(cfg.seed),
+            use_balanced_sampler,
+        )
+
+        # Two views of the same underlying tree: augmented for training,
+        # deterministic for evaluation.
+        eval_dataset = get_finetune_dataset(data_dir=cfg.data.root_path, transform=eval_transform)
+
+        def make_loader(
+            indices: np.ndarray,
+            shuffle: bool,
+            drop_last: bool = False,
+            train: bool = False,
+        ) -> DataLoader:
+            source = dataset if train else eval_dataset
+            sampler = (
+                build_balanced_sampler(dataset, indices, loader_generator)
+                if train and use_balanced_sampler
+                else None
+            )
             return DataLoader(
-                Subset(dataset, indices),
+                Subset(source, indices),
                 batch_size=batch_size,
-                shuffle=shuffle,
+                shuffle=shuffle and sampler is None,
+                sampler=sampler,
                 num_workers=num_workers,
                 pin_memory=pin_memory,
                 drop_last=drop_last,
+                generator=loader_generator,
+                worker_init_fn=worker_init_fn,
             )
+
+        margin_warmup = float(
+            OmegaConf.select(cfg, "experiment.training.margin_warmup_fraction", default=0.15)
+        )
+        router_noise_std = float(OmegaConf.select(cfg, "model.head.router_noise_std", default=0.0))
+        router_noise_fraction = float(
+            OmegaConf.select(cfg, "experiment.training.router_noise_fraction", default=0.3)
+        )
 
         global_step = 0
         best_val_loss = float("inf")
         best_state: dict[str, Any] | None = None
         history = LossHistory()
         num_experts = 1
+        fold_test_metrics: list[dict[str, float]] = []
 
         # ------------------------------------------------------------- folds
         for fold, (train_indices, val_indices) in enumerate(splits, start=1):
@@ -823,21 +1235,47 @@ def main(cfg: DictConfig) -> None:
                 num_seed_types=len(seed_names),
                 num_sub_varieties=len(sub_names),
                 subvariety_to_seed_type=dataset.get_subvariety_to_seed_type(),
+                embed_dim=int(OmegaConf.select(cfg, "model.head.embed_dim", default=384)),
+                num_experts=num_experts,
             ).to(device)
-            optimizer = build_optimizer([encoder, model], cfg)
+            # The criterion joins the optimizer because uncertainty weighting
+            # owns three learnable scalars; omitting it would pin the task
+            # weights while reporting them as learned.
+            optimizer = build_optimizer([encoder, model, criterion], cfg)
             scheduler = build_scheduler(optimizer, cfg)
 
             if fold == 1:
                 flags = getattr(model, "component_flags", lambda: {})()
                 logger.info("Component flags: %s", flags or "n/a")
-                tracker.log_metrics({f"model/{key}": value for key, value in flags.items()}, step=0)
+                logger.info("Loss flags: %s", criterion.loss_flags())
+                tracker.log_metrics(
+                    {
+                        f"model/{key}": value
+                        for key, value in flags.items()
+                        if isinstance(value, (int, float, bool))
+                    },
+                    step=0,
+                )
                 tracker.log_model_watch(model)
 
-            train_loader = make_loader(train_indices, shuffle=True, drop_last=bool(cfg.data.drop_last))
+            train_loader = make_loader(
+                train_indices, shuffle=True, drop_last=bool(cfg.data.drop_last), train=True
+            )
             val_loader = make_loader(val_indices, shuffle=False)
 
             for epoch in range(1, epochs + 1):
                 epoch_started = time.perf_counter()
+                # Schedules that must move once per epoch, before the loop that
+                # reads them.
+                margin_scale = margin_schedule(epoch, epochs, margin_warmup)
+                noise_scale = router_noise_schedule(
+                    epoch, epochs, router_noise_std, router_noise_fraction
+                )
+                if hasattr(model, "set_margin_scale"):
+                    model.set_margin_scale(margin_scale)
+                if hasattr(model, "set_router_noise"):
+                    model.set_router_noise(noise_scale)
+
                 train_metrics, _, _, global_step = run_epoch(
                     encoder, model, criterion, train_loader, device, tracker, logger,
                     epoch, global_step, phase=f"fold_{fold}/train", dataset=dataset,
@@ -870,6 +1308,8 @@ def main(cfg: DictConfig) -> None:
                         "lr": optimizer.param_groups[0]["lr"],
                         "train_loss": train_metrics["loss"],
                         "validation_loss": val_metrics["loss"],
+                        "margin_scale": margin_scale,
+                        "router_noise": noise_scale,
                         # Positive and growing means the model is memorising the
                         # training split rather than generalising.
                         "overfitting_gap": history.latest_gap,
@@ -899,6 +1339,23 @@ def main(cfg: DictConfig) -> None:
                         rolling_prefix=f"model_fold{fold}_epoch",
                     )
                     tracker.log_event("checkpoint", {"type": "interval", "path": checkpoint_path})
+
+            # Score *this* fold's final model on the held-out test split before
+            # moving on. Reporting only the best fold's test metrics is a
+            # selection over K folds, and the expected value of a maximum
+            # exceeds the expected value of a single draw -- so the headline
+            # number would be optimistically biased the moment num_folds > 1,
+            # and incomparable with the num_folds=1 numbers already collected.
+            # The mean across folds is what the table uses; best-fold selection
+            # survives only for the artifact that gets profiled and shipped.
+            if len(test_indices) > 0 and len(splits) > 1:
+                _, fold_test_evaluation, _, _ = run_epoch(
+                    encoder, model, criterion, make_loader(test_indices, shuffle=False),
+                    device, tracker, logger, epoch=fold, global_step=global_step,
+                    phase=f"fold_{fold}/test", dataset=dataset, max_batches=max_batches,
+                    use_amp=False, num_experts=num_experts, max_tsne_samples=max_tsne,
+                )
+                fold_test_metrics.append(dict(fold_test_evaluation.scalar_metrics()))
 
             logger.info("Fold %s complete.", fold)
 
@@ -937,7 +1394,8 @@ def main(cfg: DictConfig) -> None:
 
         # -------------------------------------------------------- efficiency
         efficiency = profile_run(
-            best_state["encoder"], best_state["model"], dataset, cfg, device, logger
+            best_state["encoder"], best_state["model"], eval_dataset, cfg, device, logger,
+            sample_indices=test_indices if len(test_indices) else None,
         )
         if efficiency is not None:
             tracker.log_metrics(efficiency.as_metrics(), step=0)
@@ -947,12 +1405,15 @@ def main(cfg: DictConfig) -> None:
             cfg=cfg,
             output_dir=output_dir,
             model=best_state["model"],
+            criterion=best_state["criterion"],
             evaluation=test_evaluation,
             accumulator=test_accumulator,
             dataset=dataset,
             efficiency=efficiency,
             history=history,
             checkpoint_path=final_path,
+            split_report=split_report,
+            fold_metrics=aggregate_fold_metrics(fold_test_metrics),
             logger=logger,
         )
         tracker.log_event("run_summary", {"path": summary_path})
@@ -970,6 +1431,31 @@ def main(cfg: DictConfig) -> None:
         tracker.close()
 
 
+def aggregate_fold_metrics(fold_metrics: list[dict[str, float]]) -> dict[str, dict[str, float]]:
+    """``{metric: {mean, std, min, max, folds}}`` across cross-validation folds."""
+    if len(fold_metrics) < 2:
+        return {}
+    keys = set(fold_metrics[0])
+    for entry in fold_metrics[1:]:
+        keys &= set(entry)
+
+    aggregated: dict[str, dict[str, float]] = {}
+    for key in sorted(keys):
+        values = [float(entry[key]) for entry in fold_metrics if entry[key] == entry[key]]
+        if not values:
+            continue
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1) if len(values) > 1 else 0.0
+        aggregated[key] = {
+            "mean": mean,
+            "std": variance**0.5,
+            "min": min(values),
+            "max": max(values),
+            "folds": float(len(values)),
+        }
+    return aggregated
+
+
 def write_run_summary(
     cfg: DictConfig,
     output_dir: Path,
@@ -981,11 +1467,19 @@ def write_run_summary(
     history: LossHistory,
     checkpoint_path: str,
     logger,
+    criterion: CombinedHierarchicalLoss | None = None,
+    split_report: dict[str, Any] | None = None,
+    fold_metrics: dict[str, dict[str, float]] | None = None,
 ) -> str:
     """Persist ``summary.json`` and ``test_predictions.npz`` for cross-run reporting.
 
     Written even when there is no held-out split, so a run always leaves a
     machine-readable trace; the metrics block is simply empty in that case.
+
+    ``loss_flags`` and ``split`` are recorded alongside the architectural flags
+    because without them two runs that differ only in the objective or only in
+    the split protocol are byte-identical in ``summary.json``, and only the
+    variant *name* separates them.
     """
     artifacts = {"checkpoint": checkpoint_path}
 
@@ -1004,6 +1498,8 @@ def write_run_summary(
                 sub_scores=accumulator.stacked_scores(),
                 embeddings=accumulator.stacked_embeddings(),
                 expert_indices=accumulator.stacked_experts(),
+                sub_logits=accumulator.stacked_logits(),
+                tokens_per_sample=accumulator.tokens_per_sample,
             )
         except Exception as exc:
             logger.warning("Failed to save test predictions: %s", exc)
@@ -1016,13 +1512,18 @@ def write_run_summary(
         efficiency=efficiency.as_dict() if efficiency is not None else {},
         history=history.as_series(),
         component_flags=getattr(model, "component_flags", lambda: {})(),
+        loss_flags=criterion.loss_flags() if criterion is not None else {},
+        split=dict(split_report or {}),
+        fold_metrics=dict(fold_metrics or {}),
         config={
             "backbone": str(OmegaConf.select(cfg, "model.backbone.name", default="")),
             "head": str(OmegaConf.select(cfg, "model.head.name", default="")),
             "embed_dim": OmegaConf.select(cfg, "model.head.embed_dim", default=None),
             "num_experts": OmegaConf.select(cfg, "model.head.num_experts", default=None),
             "top_k": OmegaConf.select(cfg, "model.head.top_k", default=None),
+            "token_mode": OmegaConf.select(cfg, "model.head.token_mode", default=None),
             "epochs": OmegaConf.select(cfg, "experiment.training.epochs", default=None),
+            "num_folds": OmegaConf.select(cfg, "experiment.training.num_folds", default=None),
             "learning_rate": OmegaConf.select(cfg, "experiment.training.learning_rate", default=None),
             "batch_size": OmegaConf.select(cfg, "data.batch_size", default=None),
             "seed": OmegaConf.select(cfg, "seed", default=None),

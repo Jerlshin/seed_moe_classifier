@@ -31,17 +31,33 @@ confounded by a different self-supervised initialization.
 
 ### Revision status
 
-This tree implements the **peer-review revision**, which departs from the
-submitted manuscript in two deliberate, reversible ways:
+This tree implements the **peer-review revision**. It departs from the submitted
+manuscript in several deliberate, reversible ways, and each departure exists
+because the submitted form was measurably doing something other than what it
+claimed. [`AUDIT_RESPONSE.md`](../AUDIT_RESPONSE.md) records the full disposition
+of the independent audit in `CHANGES.md`; [`REVISION_NOTES.md`](../REVISION_NOTES.md)
+records the rationale.
 
 | Departure | Submitted | This tree | Reproduce submitted |
 | --- | --- | --- | --- |
-| MoE routing width | Top-4 of 6 experts | **Top-2** of 6 experts | `model.head.top_k=4` |
-| DINOv2 backbone | SwinV2 + comparative ViT-S/14 | **SwinV2 only** | not reversible — ViT-S/14 path removed |
+| MoE routing width | Top-4 of 6 | **Top-2** of 6 | `model.head.top_k=4` |
+| Routing granularity | pooled vector | **token grid** (`8x8`) | `model.head.token_mode=pooled` |
+| Load-balancing loss | soft-gate entropy | **Switch `E.sum f.P`** | `model.loss.moe_load_mode=entropy` |
+| Hierarchy KL | probability space + `clamp` | **log space (`logsumexp`)** | not reversible — the old form was gradient-dead |
+| KL gradient | flows into both heads | **coarse head detached** | `model.loss.detach_kl_seed_target=false` |
+| ArcFace scale | `s = 30` | **AdaCos `s = 4.61`** | `model.head.arcface_scale=30.0` |
+| Compactness term | residual cosine | **intra-class, EMA centroids** | `model.loss.cosine_mode=residual` |
+| Split protocol | crop level | **source-photograph groups** | `experiment.training.split_protocol=stratified` |
+| Reporting | 1 seed, best fold | **5 seeds, mean ± SD, McNemar** | `--seeds 42` |
+| Stage-1 method name | "DINOv2" | **"DINO-style self-distillation"** | not reversible — it was never DINOv2 |
+| Backbone | SwinV2 + comparative ViT-S/14 | **SwinV2 only** | not reversible — ViT-S/14 path removed |
 
-See [`REVISION_NOTES.md`](../REVISION_NOTES.md) for the full rationale.
-`src/models/components/moe_layer.py:32-33` defines `DEFAULT_NUM_EXPERTS = 6`
-and `DEFAULT_TOP_K = 2` as the single source of truth for those values.
+`src/models/components/moe_layer.py` defines `DEFAULT_NUM_EXPERTS = 6` and
+`DEFAULT_TOP_K = 2` as the single source of truth for the routing values.
+
+Most of these are exposed as ablation variants precisely so the comparison can be
+made rather than asserted — see [`06_ABLATION_ENGINE.md`](06_ABLATION_ENGINE.md)
+§3.
 
 ## 2. End-to-end data flow
 
@@ -69,26 +85,37 @@ image ──DataAugmentationDINO──▶ 2 global + 4 local crops
                                     STAGE 2 — hierarchical finetuning
                                     (src/trainers/moe_finetune.py)
 
-image ──SwinV2 (frozen)──▶ pooled ──EmbeddingProjection──▶ z ∈ ℝ³⁸⁴   (Eq. 4)
+image ──SwinV2 (frozen)──▶ 8×8 token grid ──EmbeddingProjection──▶ z ∈ ℝ^(64×384)   (Eq. 4)
                                                               │
                               ┌───────────────────────────────┴───────────────┐
                               ▼                                              ▼
-                   SeedTypeClassifier (Eq. 5)                    MixtureOfExperts (Eq. 8)
-                        s ∈ ℝ⁴                                  h = Σ_{i∈Top-2} Gᵢ Eᵢ(z)
+               SeedTypeClassifier (Eq. 5)                        MixtureOfExperts (Eq. 8)
+                    s ∈ ℝ⁴, hidden ∈ ℝ¹⁹²                       h = Σ_{i∈Top-2} Gᵢ Eᵢ(z)
+                              │                                  routed PER TOKEN
+                    p_s = softmax(s)  (Eq. 6)                     gate sees [z, p_s.detach()]
                               │                                              │
-                    p_s = softmax(s)  (Eq. 6)                                │
-                              │                                              │
-                    SeedTypeProjection P(p_s) ─────────────(+)───────────────┘
-                                                              │
-                                                    h' = h + P(p_s)   (Eq. 9)
+             SeedTypeProjection P(p_s) · γ  ────────────────(+)──────────────┘
+             or FiLM(h ; hidden)                              │
+                                                    h' = h + γ⊙P(p_s)   (Eq. 9)
                                                               │
                                      CrossAttention(Q=h', K=V=h)     (Eq. 11)
-                                          h'' = LayerNorm(a + Q)     (Eq. 12)
+                                        over 64 keys — a real map    (Eq. 12)
+                                                              │
+                                          TokenPooling  ──▶ ℝ³⁸⁴
                                                               │
                                             SubVarietyEmbedding
                                                               │
                                     ArcFaceHead(e, labels) ──▶ (sub_logits, sub_margin_logits)  (Eq. 13)
 ```
+
+**Pooling moved to after the head**, and that is the revision's largest
+architectural change. Over a length-1 sequence `softmax(QKᵀ/√d)` is identically
+1, so the submitted pooled path made Eqs. 11-12 an affine map with ~2.07 M
+parameters that no configuration could reach — while counting them as active.
+Keeping the token grid makes the attention real, raises routing slots per step
+from `batch × K` to `batch × 64 × K`, and preserves the localised texture a
+27-way fine-grained task depends on. See
+[`03_MOE_MODULE.md`](03_MOE_MODULE.md) §1.
 
 Both stages share the SwinV2 trunk architecture but train independently:
 stage 1 discovers the representation, stage 2 (with the backbone frozen by
@@ -184,34 +211,47 @@ python scripts/generate_plots.py  # figures + outputs/reports/summary_metrics.cs
 
 ## 7. Cross-cutting invariants worth internalizing before editing code
 
-These are the facts that, if violated, produce a model that *runs* and
-*trains* but silently measures the wrong thing. Each is pinned by at least one
-test in `tests/`.
+These are the facts that, if violated, produce a model that *runs* and *trains*
+but silently measures the wrong thing. Each is pinned by at least one test.
 
 1. **`encoder(images).shape[-1] == 384` always holds.** `DinoV2SwinV2Encoder`
-   (`src/models/builder.py:529-621`) owns the projection from the backbone's
-   native width (768 for Tiny/Small, 1024 for Base) to the paper's
-   `embed_dim = 384`. This projection is trainable even when the SwinV2 trunk
-   is frozen, so it **must** be included in the optimizer
-   (`build_optimizer([encoder, model], cfg)` in `moe_finetune.py:200-235`).
-2. **The MoE routes on `z`, not on the seed-type projection** — Eq. 8 is
-   defined over the DINO embedding (`src/models/builder.py:353`).
-3. **The residual adds `P(p_s)`, softmax probabilities, not `P(s)`, logits**
-   (Eq. 9, `src/models/builder.py:355-362`).
-4. **`sub_logits` (no margin) drive prediction and the KL term;
-   `sub_margin_logits` drive only the ArcFace cross-entropy.** Evaluation
-   passes no labels, so the two coincide and metrics are never inflated by the
-   training-time margin (`src/models/components/arcface_head.py:70-99`).
-5. **A disabled component toggle is never allocated** — the attribute is set
-   to `None`, not `nn.Identity`, so an ablation's parameter count describes
-   the model actually trained (`src/models/builder.py:267-289`).
-6. **`use_moe=False` substitutes one dense transformer block**, not nothing —
-   `DenseExpertBlock` (`src/models/components/moe_layer.py:213-268`) — so the
-   `wo_moe` gap measures routing, not a missing layer's capacity.
-7. **Every DINOv2-path run reads one shared encoder checkpoint.**
-   `ensure_pretrained_checkpoint()` (`src/trainers/runner.py:58-82`) refuses
-   to start a suite otherwise.
-8. **One trainer serves the full model, all six ablations, and the
-   `hierarchical_cce` baseline** (`src/trainers/moe_finetune.py`,
-   dispatch on `model.head.name` in `build_model_and_encoder`,
-   `moe_finetune.py:173-194`).
+   owns the projection from the backbone's native width (768 for Tiny/Small,
+   1024 for Base) to `embed_dim = 384`. Under `token_mode="grid"` the output is
+   `[B, 64, 384]`, so the invariant is on the **last axis**. This projection is
+   trainable even when the trunk is frozen, so it **must** be in the optimizer.
+2. **The encoder's `token_mode` must match the head's.** A grid encoder feeding a
+   pooled head (or the reverse) is a silent misconfiguration that would quietly
+   re-degenerate every attention module. `build_model_and_encoder` passes one
+   value to both.
+3. **The experts consume `z`, not the seed-type projection** (Eq. 8). The *gate*
+   may additionally see the **detached** `p_s` — that is what makes the MoE
+   hierarchical — but the experts always see the image.
+4. **The residual adds `P(p_s)`, softmax probabilities, not `P(s)`, logits**
+   (Eq. 9), scaled by a LayerScale gain.
+5. **`sub_logits` (no margin) drive prediction and the KL term;
+   `sub_margin_logits` drive only the ArcFace cross-entropy.** Evaluation passes
+   no labels, so the two coincide and metrics are never inflated by the margin.
+   The same holds during the margin warm-up.
+6. **A disabled component toggle is never allocated** — the attribute is `None`,
+   not `nn.Identity` — and neither is a block no configuration can reach. The
+   affine token mixer and the unallocated noise gate are the two cases of the
+   latter, and both exist because unreachable parameters were being reported as
+   *active*.
+7. **`use_moe=False` substitutes one dense block**, not nothing, so the `wo_moe`
+   gap measures routing rather than a missing layer's capacity — and
+   `dense_capacity_multiplier` matches it to Top-K's *active* capacity, because
+   the naive substitution still confounded routing with a 2× FLOP cut.
+8. **`materialize_expert_grads()` runs between `backward()` and `step()`.**
+   Without it, unrouted experts have `grad is None`, AdamW skips them entirely
+   (including weight decay), and sparse and dense dispatch train measurably
+   different models despite identical forward passes.
+9. **Every self-supervised-path run reads one shared encoder checkpoint.**
+   `ensure_pretrained_checkpoint()` refuses to start a suite otherwise.
+10. **One trainer serves the full model, every ablation, the linear probe and the
+    baselines**, dispatching on `model.head.name`.
+11. **Splits are group-aware by default and byte-identical across variants.**
+    The first is what makes the accuracy mean something; the second is what makes
+    McNemar's paired test valid.
+12. **Every run leaves a complete machine-readable trace** — `component_flags`,
+    `loss_flags`, `split`, `fold_metrics`. Two runs that differ in any axis must
+    differ in `summary.json`, not only in their variant name.

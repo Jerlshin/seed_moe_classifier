@@ -1,21 +1,34 @@
-# DINO projection head (paper Section 4).
+# Self-distillation projection head (paper Section 4).
 #
-# "The DINO projection head consists of a multi-layer perceptron (MLP) with batch
+# "The projection head consists of a multi-layer perceptron (MLP) with batch
 # normalization and GELU activation functions. The final embeddings are
 # normalized to facilitate stable self-distillation."
-#
-# `out_dim` is Table 1's "DINO Output Dimension".
 
 name: "dino_projection"
 
 in_dim: ${model.backbone.feature_dim}
 hidden_dim: 2048
 bottleneck_dim: 256
-out_dim: 65536
+
+# out_dim, RECALIBRATED. Table 1's 65,536 is DINO's value, set for ImageNet-1k's
+# 1.28 M images -- 0.051 prototypes per image. Against 9,357 images that is 7.00
+# prototypes per image, a 137x higher density, and the prototype layer alone is
+# 16.8 M parameters (71 % of the head, ~19 % of the student). Total exposure here
+# is 300 x 9,357 = 2.81 M presentations, about 2 % of DINO's 100-epoch budget.
+# 8,192 gives 0.88 prototypes per image and removes ~14.7 M parameters.
+# Set 65536 to reproduce the submitted configuration.
+out_dim: 8192
 num_layers: 3
 
-# Paper explicitly specifies batch normalization inside the head.
-use_batch_norm: true
+# Head normalisation: "layer" | "batch" | "none".
+#
+# The paper says batch normalization, and that is what was submitted. But
+# `update_momentum` EMAs *parameters*, not *buffers*, so teacher and student
+# BatchNorm running statistics diverge -- and the teacher sees 2 views per step
+# while the student sees 6, so their batch statistics differ even in principle.
+# DINO's official head defaults to use_bn=False for transformer backbones for
+# exactly this reason.
+use_batch_norm: "layer"
 
 # Weight-normalised final layer with a frozen gain, as in the DINO reference
 # implementation; combined with `freeze_last_layer_epochs` this is what keeps

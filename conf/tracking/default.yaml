@@ -49,11 +49,19 @@ intervals:
   attention_every_epochs: 5
   figure_every_epochs: 5   # confusion matrices, expert utilisation, t-SNE
 
+  # Per-term gradient probe. Costs one extra backward per loss term, so it runs
+  # rarely. It is the direct empirical test for the conflicts a seven-term
+  # objective invites: does L_cos oppose L_ArcFace, does L_KL oppose L_seed.
+  # Set to 0 to disable.
+  gradient_probe_every_steps: 50
+
 artifacts:
   # Parameter/gradient histograms are large; keep them off for long runs.
   log_parameter_histograms: false
   log_gradient_histograms: false
   log_gradient_norms: true
+  # Per-term gradient norms and pairwise cosines at the last shared layer.
+  log_per_term_gradients: true
 
   # Paper Section 6 qualitative results.
   log_confusion_matrices: true

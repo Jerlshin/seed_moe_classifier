@@ -1,4 +1,4 @@
-# Hierarchical head: seed type -> MoE -> residual -> cross-attention -> ArcFace.
+# Hierarchical head: seed type -> MoE -> fusion -> cross-attention -> ArcFace.
 # Paper Section 5, Eqs. 4-13. This node is passed whole to `build_hierarchical_moe`.
 
 name: "hierarchical_moe"
@@ -13,44 +13,134 @@ embed_dim: 384
 num_seed_types: ${data.num_seed_types}       # Eq. 5, |s| = 4
 num_sub_varieties: ${data.num_sub_varieties} # Eq. 13, 27 classes
 
+# ---------------------------------------------------------------------------
+# Routing granularity. THE most consequential setting in this file.
+#
+#   grid   (revision default) keep SwinV2's final-stage 8x8 token grid through
+#          the MoE and the cross-attention, pool afterwards.
+#   pooled (submitted)        mean-pool to one vector before the head.
+#
+# Over a length-1 sequence softmax(QK^T/sqrt(d)) is identically 1, so Eqs. 11-12
+# collapse to an affine map and the Q/K projections receive exactly zero
+# gradient forever -- ~2.07 M parameters that no configuration can reach. Under
+# `pooled` the head therefore does not allocate them at all (it substitutes the
+# single Linear that spans the same function class), and under `grid` the
+# attention is real: 64 keys, meaningful heads, and an attention map worth
+# plotting. Grid routing also raises routing slots per step from batch*K to
+# batch*64*K, which is what makes the load-balancing statistic estimable.
+# ---------------------------------------------------------------------------
+token_mode: "grid"
+token_pooling: "attention"    # "attention" | "gem" | "mean", applied after the head
+
 # Eq. 8: six transformer experts.
 #
 # top_k = 2 (REVISED). The submitted manuscript routed the top 4 of 6. The
-# revision routes 2, which halves the experts evaluated per sample and so the
+# revision routes 2, which halves the experts evaluated per token and so the
 # active parameter count, at unchanged total capacity. Set `top_k: 4` to
 # reproduce the submitted configuration; src/utils/efficiency.py reports both
-# active-parameter figures side by side for the cost table.
+# active-parameter figures side by side for the cost table -- and states that
+# the saving is ~2 % of total parameters and does not appear in wall-clock.
 num_experts: 6
 top_k: 2
 moe_hidden_dim: 512
 moe_sparse_dispatch: true
 
+# Routing controls, for attributing what the MoE actually contributes.
+#   learned  the gate is trained (the method)
+#   hash     fixed assignment by token index: sparse capacity, no learning
+#   uniform  all experts at weight 1/E: ensembling, no sparsity
+router_mode: "learned"
+
+# Feed the *detached* coarse posterior p_s to the gate. Without this the router
+# and the seed head both read z and never interact, so the "hierarchical MoE"
+# is a flat router sitting beside a coarse classifier and expert specialisation
+# has no structural reason to align with seed type. The experts still consume z
+# either way -- only the gate sees p_s, and the detach stops the router's
+# gradient reshaping the coarse head.
+gate_conditioning: true
+
+# Shazeer-style gating noise, annealed to zero over
+# `experiment.training.router_noise_fraction` of training. topk is flat almost
+# everywhere, so this is the only exploration deterministic Top-K has.
+router_noise_std: 0.3
+
+# Feed-forward widening of the use_moe=false block. At `top_k` it matches Top-K's
+# active capacity, so the wo_moe gap measures routing rather than a 2x cut in
+# active FLOPs. Left at 1 for the naive control; run_ablations.py runs both.
+dense_capacity_multiplier: 1
+
 num_heads: 8
 dropout_rate: 0.1
+
+# ---------------------------------------------------------------------------
+# Eq. 9 fusion.
+#
+#   additive  h' = h + gamma * P(p_s)     (the paper, plus LayerScale)
+#   film      h' = gamma(g_hidden) * h + beta(g_hidden)
+#
+# The additive form conditions on p_s, a point on the 3-simplex. Once the
+# 4-class seed head fits -- early -- p_s saturates to one-hot, so P(p_s) takes
+# one of four fixed vectors: at convergence the fusion is a 4-entry codebook,
+# and the softmax Jacobian diag(p) - pp^T takes the fine branch's gradient into
+# the coarse head to zero with it. FiLM conditions on the seed classifier's
+# pre-softmax hidden state instead, which neither saturates nor quantises, and
+# recovers the additive form exactly at gamma = 1.
+fusion_mode: "additive"
+
+# LayerScale gain on the additive residual (Touvron et al., 2021). This replaces
+# the loss-side attempt to control the residual: a cosine penalty on
+# (h + P(p_s), h) is minimised by P(p_s) = 0, so it rewards deleting the very
+# connection it regularises. A learned gain has no such fixed point. Set to null
+# for the submitted free residual.
+residual_layer_scale: 0.0001
 
 # Eq. 9: depth of the MLP projecting p_s back into the feature space.
 seed_projection_depth: 2
 
-# Eq. 13: angular margin m and feature scale s.
-arcface_scale: 30.0
+# ---------------------------------------------------------------------------
+# Eq. 13: the sub-variety head.
+#
+#   arcface   normalised embedding + normalised centres + angular margin
+#   normface  normalised embedding + normalised centres, m = 0
+#   linear    plain nn.Linear
+#
+# `normface` is the single-factor control for the *margin*; swapping straight to
+# `linear` changes the margin, the embedding normalisation, the centre
+# normalisation and the logit scale at once, so that gap is not a margin
+# measurement. See scripts/run_ablations.py: wo_margin_only vs wo_angular_head.
+sub_head_variant: "arcface"
+
+# Feature scale s. "auto" uses the AdaCos value sqrt(2)*log(C-1) = 4.61 for
+# C = 27. The submitted 30.0 is ArcFace's face-recognition value for 10^5-10^6
+# identities: 6.5x too large here, which put L_ArcFace at ~17.6 against
+# L_seed = 1.386 at initialisation (a 12.7:1 ratio) and saturated softmax(s cos)
+# into a near-one-hot distribution that broke both the KL term and calibration.
+arcface_scale: "auto"
 arcface_margin: 0.5
 arcface_easy_margin: false
+# Prototypes per class. 3 tolerates a sub-variety spanning several growing
+# conditions or imaging sessions; 1 is standard ArcFace.
+arcface_sub_centers: 1
+# Re-derive s each step from the running median target angle (AdaCos proper),
+# removing the hyperparameter instead of retuning it.
+arcface_dynamic: false
 
 # ---------------------------------------------------------------------------
 # Component toggles, driving the component-wise ablation suite.
 #
-# Setting one to false replaces or bypasses exactly one block, and the disabled
-# block is never allocated, so an ablation's parameter count reflects the model
-# actually trained. See scripts/run_ablations.py.
+# Setting one to false replaces or bypasses one block, and the disabled block is
+# never allocated, so an ablation's parameter count reflects the model actually
+# trained.
 #
-#   use_moe             false -> one dense transformer block, no routing
-#   use_arcface         false -> linear head; the objective becomes plain CE
-#   use_residual        false -> h' = h; Eq. 9 seed-type fusion removed
-#   use_cross_attention false -> h'' = h'; Eqs. 11-12 skipped
-#   use_kl_loss         false -> Eq. 10 not computed (read by model/loss too)
+# NOTE what each one really changes -- several move more than one factor, and
+# architecture/06_ABLATION_ENGINE.md tabulates it:
 #
-# `use_kl_loss` lives here rather than under model/loss so all five switches
-# have one home; conf/model/loss/arcface_kl.yaml interpolates it.
+#   use_moe             false -> routing AND active capacity AND 2 regularisers
+#   use_arcface         false -> margin AND normalisation AND logit scale
+#                                (prefer sub_head_variant: normface for margin)
+#   use_residual        false -> Eq. 9 fusion AND the residual magnitude term
+#   use_cross_attention false -> Eqs. 11-12
+#   use_kl_loss         false -> Eq. 10 (read by model/loss too)
 # ---------------------------------------------------------------------------
 use_moe: true
 use_arcface: true

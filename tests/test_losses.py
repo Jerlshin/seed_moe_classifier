@@ -11,60 +11,149 @@ import torch.nn.functional as F
 from src.losses.cosine import intra_class_cosine_loss, residual_cosine_loss
 from src.losses.dino import CustomDINOLoss
 from src.losses.hierarchical import (
+    aggregate_sub_log_probs,
     build_subvariety_seed_mapping,
     hierarchical_kl_loss,
     seed_type_loss,
 )
-from src.losses.moe import expert_utilization, l1_sparsity_loss, load_balancing_loss
+from src.losses.moe import (
+    dispatch_fraction,
+    expert_utilization,
+    l1_sparsity_loss,
+    load_balancing_loss,
+    router_z_loss,
+    switch_load_balancing_loss,
+)
 from tests.conftest import (
-    PAPER_CENTER_MOMENTUM,
+    SUBMITTED_CENTER_MOMENTUM,
     PAPER_EMBED_DIM,
     PAPER_NUM_EXPERTS,
     PAPER_NUM_SEED_TYPES,
     PAPER_NUM_SUB_VARIETIES,
-    PAPER_TEACHER_TEMP,
+    SUBMITTED_TEACHER_TEMP,
     REVISED_TOP_K,
-    PAPER_WARMUP_EPOCHS,
-    PAPER_WARMUP_TEACHER_TEMP,
+    SUBMITTED_WARMUP_EPOCHS,
+    SUBMITTED_WARMUP_TEACHER_TEMP,
 )
 
 
 # ------------------------------------------------------- MoE regularisation
 
 
-def test_load_balancing_is_minimised_by_uniform_utilization():
+def _entropy_load(gate):
+    """The submitted soft-gate form, retained as an ablation axis."""
+    return load_balancing_loss(gate, mode="entropy")
+
+
+def test_entropy_load_balancing_is_minimised_by_uniform_utilization():
     """Uniform routing must reach the lower bound of -1 under normalisation."""
     uniform = torch.full((16, PAPER_NUM_EXPERTS), 1.0 / PAPER_NUM_EXPERTS)
-    assert load_balancing_loss(uniform).item() == pytest.approx(-1.0, abs=1e-5)
+    assert _entropy_load(uniform).item() == pytest.approx(-1.0, abs=1e-5)
 
 
-def test_load_balancing_is_maximised_by_total_collapse():
+def test_entropy_load_balancing_is_maximised_by_total_collapse():
     """All mass on one expert gives zero entropy, the loss's upper bound."""
     collapsed = torch.zeros(16, PAPER_NUM_EXPERTS)
     collapsed[:, 0] = 1.0
-    assert load_balancing_loss(collapsed).item() == pytest.approx(0.0, abs=1e-4)
+    assert _entropy_load(collapsed).item() == pytest.approx(0.0, abs=1e-4)
 
 
-def test_load_balancing_is_bounded_in_minus_one_to_zero():
+def test_entropy_load_balancing_is_bounded_in_minus_one_to_zero():
     for _ in range(20):
         gate = F.softmax(torch.randn(32, PAPER_NUM_EXPERTS) * 3, dim=-1)
-        value = load_balancing_loss(gate).item()
+        value = _entropy_load(gate).item()
         assert -1.0 - 1e-5 <= value <= 1e-5
 
 
-def test_load_balancing_prefers_balance_over_collapse():
+def test_entropy_load_balancing_prefers_balance_over_collapse():
     balanced = torch.full((8, PAPER_NUM_EXPERTS), 1.0 / PAPER_NUM_EXPERTS)
     skewed = torch.zeros(8, PAPER_NUM_EXPERTS)
     skewed[:, 0] = 0.9
     skewed[:, 1:] = 0.1 / (PAPER_NUM_EXPERTS - 1)
-    assert load_balancing_loss(balanced) < load_balancing_loss(skewed)
+    assert _entropy_load(balanced) < _entropy_load(skewed)
 
 
-def test_unnormalized_load_balancing_matches_negative_entropy():
+def test_unnormalized_entropy_load_balancing_matches_negative_entropy():
     gate = F.softmax(torch.randn(16, PAPER_NUM_EXPERTS), dim=-1)
     utilization = expert_utilization(gate)
     expected = torch.sum(utilization * torch.log(utilization))
-    assert load_balancing_loss(gate, normalize=False).item() == pytest.approx(expected.item(), abs=1e-6)
+    assert load_balancing_loss(gate, mode="entropy", normalize=False).item() == pytest.approx(
+        expected.item(), abs=1e-6
+    )
+
+
+# --- The counterexample that motivated replacing the entropy form -------------
+
+#: The router distribution from the audit: identical for every sample, and
+#: catastrophic under Top-2 despite scoring 92 % of "perfect balance".
+COLLAPSING_GATE = (0.30, 0.30, 0.10, 0.10, 0.10, 0.10)
+
+
+def test_entropy_load_balancing_scores_a_collapsed_router_as_nearly_perfect():
+    """The failure the revision exists to fix, reproduced to four decimal places.
+
+    ``-sum u ln u = 1.64342`` and ``ln 6 = 1.79176``, so the entropy form scores
+    ``-0.9172`` -- 91.7 % of the way to its own optimum. Meanwhile ``topk(G, 2)``
+    picks experts {0, 1} for *every* sample, so four of six experts receive no
+    gradient at all. The regulariser cannot see the dispatch it is supposed to
+    balance.
+    """
+    gate = torch.tensor([list(COLLAPSING_GATE)]).repeat(32, 1)
+    _, indices = torch.topk(gate, REVISED_TOP_K, dim=-1)
+
+    assert load_balancing_loss(gate, indices, mode="entropy").item() == pytest.approx(
+        -0.9172, abs=1e-3
+    )
+    # ... and the hard dispatch is maximally imbalanced.
+    fractions = dispatch_fraction(indices, PAPER_NUM_EXPERTS)
+    assert torch.allclose(fractions, torch.tensor([0.5, 0.5, 0.0, 0.0, 0.0, 0.0]), atol=1e-6)
+
+
+def test_switch_load_balancing_sees_the_collapse_the_entropy_form_misses():
+    """On the same gate, the dispatch-aware form is far from its optimum.
+
+    ``E * sum f_i P_i`` with ``f = (.5, .5, 0, 0, 0, 0)`` and ``P = G`` gives
+    ``6 * (0.5*0.3 + 0.5*0.3) = 1.8``, i.e. 0.8 above the uniform-routing floor
+    of 1. The gradient flows through ``P``, pushing down the router probability
+    of exactly the over-dispatched experts.
+    """
+    gate = torch.tensor([list(COLLAPSING_GATE)]).repeat(32, 1)
+    _, indices = torch.topk(gate, REVISED_TOP_K, dim=-1)
+
+    collapsed = load_balancing_loss(gate, indices, mode="switch").item()
+    assert collapsed == pytest.approx(0.8, abs=1e-4)
+
+    uniform = torch.full((32, PAPER_NUM_EXPERTS), 1.0 / PAPER_NUM_EXPERTS)
+    _, uniform_indices = torch.topk(uniform, REVISED_TOP_K, dim=-1)
+    balanced = load_balancing_loss(uniform, uniform_indices, mode="switch").item()
+    assert balanced < collapsed
+
+
+def test_switch_load_balancing_gradient_pushes_down_over_dispatched_experts():
+    """``f`` is a coefficient; ``P`` carries the gradient. That asymmetry is the mechanism."""
+    logits = torch.zeros(16, PAPER_NUM_EXPERTS, requires_grad=True)
+    with torch.no_grad():
+        logits[:, 0] = 3.0
+        logits[:, 1] = 2.0
+    gate = F.softmax(logits, dim=-1)
+    _, indices = torch.topk(gate, REVISED_TOP_K, dim=-1)
+    load_balancing_loss(gate, indices, mode="switch").backward()
+
+    grad = logits.grad.sum(dim=0)
+    # Reducing the loss means reducing the router probability of the two experts
+    # taking all the traffic, so their logits must have positive gradient.
+    assert grad[0] > 0 and grad[1] > 0
+    assert grad[2:].max() < 0
+
+
+def test_router_z_loss_grows_with_router_logit_magnitude():
+    """The term ST-MoE adds to stop router logits running away."""
+    small = router_z_loss(torch.randn(16, PAPER_NUM_EXPERTS) * 0.1)
+    large = router_z_loss(torch.randn(16, PAPER_NUM_EXPERTS) * 0.1 + 10.0)
+    assert large > small
+    assert router_z_loss(torch.zeros(16, PAPER_NUM_EXPERTS)).item() == pytest.approx(
+        math.log(PAPER_NUM_EXPERTS) ** 2, abs=1e-5
+    )
 
 
 def test_l1_sparsity_is_zero_when_all_mass_is_inside_top_k():
@@ -248,17 +337,17 @@ def test_dino_temperature_schedule_follows_equation_2():
     loss = CustomDINOLoss(
         out_dim=16,
         num_crops=6,
-        warmup_teacher_temp=PAPER_WARMUP_TEACHER_TEMP,
-        teacher_temp=PAPER_TEACHER_TEMP,
-        warmup_teacher_temp_epochs=PAPER_WARMUP_EPOCHS,
+        warmup_teacher_temp=SUBMITTED_WARMUP_TEACHER_TEMP,
+        teacher_temp=SUBMITTED_TEACHER_TEMP,
+        warmup_teacher_temp_epochs=SUBMITTED_WARMUP_EPOCHS,
         num_epochs=20,
     )
-    assert loss.teacher_temperature(0) == pytest.approx(PAPER_WARMUP_TEACHER_TEMP)
-    assert loss.teacher_temperature(4) == pytest.approx(PAPER_TEACHER_TEMP)
-    assert loss.teacher_temperature(5) == pytest.approx(PAPER_TEACHER_TEMP)
-    assert loss.teacher_temperature(19) == pytest.approx(PAPER_TEACHER_TEMP)
+    assert loss.teacher_temperature(0) == pytest.approx(SUBMITTED_WARMUP_TEACHER_TEMP)
+    assert loss.teacher_temperature(4) == pytest.approx(SUBMITTED_TEACHER_TEMP)
+    assert loss.teacher_temperature(5) == pytest.approx(SUBMITTED_TEACHER_TEMP)
+    assert loss.teacher_temperature(19) == pytest.approx(SUBMITTED_TEACHER_TEMP)
     # Strictly increasing through the warmup window.
-    warmup = [loss.teacher_temperature(e) for e in range(PAPER_WARMUP_EPOCHS)]
+    warmup = [loss.teacher_temperature(e) for e in range(SUBMITTED_WARMUP_EPOCHS)]
     assert all(b > a for a, b in zip(warmup, warmup[1:]))
 
 
@@ -279,6 +368,9 @@ def test_dino_loss_counts_only_cross_view_pairs():
     loss_fn = CustomDINOLoss(
         out_dim=8, num_crops=6, warmup_teacher_temp=0.04,
         teacher_temp=0.04, warmup_teacher_temp_epochs=0, num_epochs=1,
+        # This test recomputes the softmax path by hand, so it pins the EMA
+        # variant; the Sinkhorn default has its own tests below.
+        centering="ema", lambda_koleo=0.0,
     )
     student = torch.cat([torch.randn(2, 8) for _ in range(6)], dim=0)
     teacher = torch.cat([torch.randn(2, 8) for _ in range(2)], dim=0)
@@ -303,13 +395,14 @@ def test_dino_center_update_follows_equation_3():
     """C_t = m * C_{t-1} + (1 - m) * qbar with m = 0.9."""
     loss_fn = CustomDINOLoss(
         out_dim=4, num_crops=6, warmup_teacher_temp=0.04, teacher_temp=0.04,
-        warmup_teacher_temp_epochs=0, num_epochs=1, center_momentum=PAPER_CENTER_MOMENTUM,
+        warmup_teacher_temp_epochs=0, num_epochs=1,
+        center_momentum=SUBMITTED_CENTER_MOMENTUM, centering="ema",
     )
     assert torch.allclose(loss_fn.center, torch.zeros(1, 4))
 
     teacher = torch.ones(8, 4) * 2.0
     loss_fn.update_center(teacher)
-    expected = PAPER_CENTER_MOMENTUM * 0.0 + (1 - PAPER_CENTER_MOMENTUM) * 2.0
+    expected = SUBMITTED_CENTER_MOMENTUM * 0.0 + (1 - SUBMITTED_CENTER_MOMENTUM) * 2.0
     assert torch.allclose(loss_fn.center, torch.full((1, 4), expected), atol=1e-6)
 
 
@@ -326,6 +419,7 @@ def test_dino_loss_lower_bound_is_the_teacher_entropy():
     loss_fn = CustomDINOLoss(
         out_dim=8, num_crops=2, warmup_teacher_temp=1.0, teacher_temp=1.0,
         warmup_teacher_temp_epochs=0, num_epochs=1, student_temp=1.0,
+        centering="ema", lambda_koleo=0.0,
     )
     logits = torch.randn(4, 8)
     both_views = torch.cat([logits, logits], dim=0)
@@ -420,7 +514,7 @@ def test_sparsity_and_load_balancing_pull_in_opposite_directions():
     # Peaked gates concentrate mass inside the selection: lower sparsity penalty.
     assert l1_sparsity_loss(peaked, peaked_indices) < l1_sparsity_loss(flat, flat_indices)
     # Flat gates spread utilisation evenly: lower (more negative) balancing loss.
-    assert load_balancing_loss(flat) < load_balancing_loss(peaked)
+    assert load_balancing_loss(flat, mode="entropy") < load_balancing_loss(peaked, mode="entropy")
 
 
 # ------------------------------------------------- combined-objective toggles
@@ -509,3 +603,215 @@ def test_every_loss_component_is_finite_for_all_ablations(subvariety_to_seed_typ
         )(output, seed_labels, sub_labels)
         for name, value in breakdown.as_dict().items():
             assert math.isfinite(value), f"{flag}=False produced non-finite {name}"
+
+
+# ------------------------------------- hierarchy consistency, in log space
+
+
+def test_kl_gradient_survives_confident_disagreement():
+    """The bug ``clamp_min(1e-8) -> log`` hid, made into a regression test.
+
+    ``clamp_min`` has zero gradient in the clamped region. Aggregating in
+    probability space and then taking a log therefore silently dropped the KL
+    term whenever an aggregated seed-type probability fell below 1e-8 -- and with
+    ``s = 30`` that was the *common* case, not an edge case: a cosine gap of 1.0
+    becomes a logit gap of 30, i.e. a probability ratio of e^30 ~ 1e13, so
+    aggregating 27 probabilities into 4 bins leaves the non-argmax bins around
+    1e-13. The term was live when the two heads agreed and dead when they
+    disagreed confidently, which is precisely when it was supposed to act.
+
+    ``logsumexp`` over each parent's children is exact and its gradient is
+    well-conditioned across the whole range.
+    """
+    from src.losses.hierarchical import build_subvariety_seed_mapping, hierarchical_kl_loss
+
+    mapping = build_subvariety_seed_mapping(
+        num_sub_varieties=PAPER_NUM_SUB_VARIETIES,
+        num_seed_types=PAPER_NUM_SEED_TYPES,
+        subvarieties_per_seed_type=[8, 3, 13, 3],
+    )
+
+    # Maximal disagreement: the coarse head is certain of seed type 0, the fine
+    # head is certain of a sub-variety belonging to seed type 2, and both at the
+    # magnitude s = 30 produces.
+    seed_logits = torch.zeros(2, PAPER_NUM_SEED_TYPES)
+    seed_logits[:, 0] = 30.0
+    sub_logits = torch.full((2, PAPER_NUM_SUB_VARIETIES), -30.0, requires_grad=True)
+    with torch.no_grad():
+        sub_logits[:, 20] = 30.0  # index 20 lives under seed type 2
+
+    loss = hierarchical_kl_loss(seed_logits, sub_logits, mapping, detach_seed_target=True)
+    loss.backward()
+
+    assert torch.isfinite(loss), "log-space aggregation must not produce inf or nan"
+    assert loss.item() > 1.0, "a confident disagreement must be expensive"
+    assert sub_logits.grad is not None
+    assert sub_logits.grad.abs().sum() > 0, (
+        "the KL term must have gradient exactly where the heads disagree confidently"
+    )
+
+
+def test_probability_space_aggregation_is_what_lost_the_gradient():
+    """The counterfactual, so the fix is attributable rather than asserted."""
+    seed_probs = torch.zeros(1, PAPER_NUM_SEED_TYPES)
+    seed_probs[:, 0] = 1.0
+    sub_logits = torch.full((1, PAPER_NUM_SUB_VARIETIES), -30.0, requires_grad=True)
+    with torch.no_grad():
+        sub_logits[:, 20] = 30.0
+
+    mapping = torch.zeros(PAPER_NUM_SUB_VARIETIES, PAPER_NUM_SEED_TYPES)
+    for index in range(PAPER_NUM_SUB_VARIETIES):
+        mapping[index, 0 if index < 8 else 2] = 1.0
+
+    aggregated = torch.matmul(F.softmax(sub_logits, dim=-1), mapping)
+    # Seed type 0's aggregated probability is far below the old 1e-8 floor.
+    assert aggregated[0, 0].item() < 1e-8
+    F.kl_div(
+        torch.log(aggregated.clamp_min(1e-8)), seed_probs, reduction="batchmean"
+    ).backward()
+    clamped_grad = sub_logits.grad.abs().sum().item()
+
+    sub_logits.grad = None
+    log_aggregated = aggregate_sub_log_probs(sub_logits, mapping)
+    F.kl_div(log_aggregated, seed_probs, reduction="batchmean").backward()
+    exact_grad = sub_logits.grad.abs().sum().item()
+
+    assert clamped_grad == pytest.approx(0.0, abs=1e-12), "the clamped form was gradient-dead"
+    assert exact_grad > 0.0
+
+
+def test_aggregated_log_probabilities_are_exact():
+    """``logsumexp`` over children must reproduce the probability-space sum."""
+    mapping = torch.zeros(6, 2)
+    mapping[:3, 0] = 1.0
+    mapping[3:, 1] = 1.0
+
+    logits = torch.randn(4, 6)
+    expected = torch.matmul(F.softmax(logits, dim=-1), mapping)
+    assert torch.allclose(aggregate_sub_log_probs(logits, mapping).exp(), expected, atol=1e-6)
+
+
+def test_jsd_is_symmetric_and_bounded_by_log_two():
+    """The alternative the hierarchy-consistency literature converged on."""
+    from src.losses.hierarchical import hierarchical_kl_loss
+
+    mapping = torch.zeros(6, 2)
+    mapping[:3, 0] = 1.0
+    mapping[3:, 1] = 1.0
+
+    for _ in range(10):
+        seed_logits = torch.randn(8, 2) * 5
+        sub_logits = torch.randn(8, 6) * 5
+        value = hierarchical_kl_loss(
+            seed_logits, sub_logits, mapping, detach_seed_target=False, mode="jsd"
+        )
+        assert 0.0 <= value.item() <= math.log(2.0) + 1e-5
+
+
+def test_detached_kl_target_blocks_gradient_into_the_coarse_head():
+    """The coarse head is supervised by hard labels; KL must not renegotiate that.
+
+    Without the detach, ``L_KL`` can be reduced by making ``P_seed`` agree with a
+    confidently *wrong* fine prediction -- and since Eq. 7 fits fast on 4 classes,
+    the marginal gradient it spends goes disproportionately to the hard,
+    ambiguous samples where following the fine head is most likely wrong.
+    """
+    from src.losses.hierarchical import hierarchical_kl_loss
+
+    mapping = torch.zeros(6, 2)
+    mapping[:3, 0] = 1.0
+    mapping[3:, 1] = 1.0
+    # requires_grad so the loss has a graph even when the seed branch is cut off.
+    sub_logits = torch.randn(8, 6, requires_grad=True)
+
+    detached = torch.randn(8, 2, requires_grad=True)
+    hierarchical_kl_loss(detached, sub_logits, mapping, detach_seed_target=True).backward()
+    assert detached.grad is None or detached.grad.abs().sum() == 0
+    # The fine branch must still be reshaped -- that is the term's actual job.
+    assert sub_logits.grad is not None and sub_logits.grad.abs().sum() > 0
+
+    attached = torch.randn(8, 2, requires_grad=True)
+    hierarchical_kl_loss(attached, sub_logits, mapping, detach_seed_target=False).backward()
+    assert attached.grad is not None and attached.grad.abs().sum() > 0
+
+
+def test_tau_kl_decouples_the_hierarchy_term_from_the_arcface_scale():
+    """``lambda_kl`` and ``arcface_scale`` were one hyperparameter in disguise.
+
+    ``P_sub = softmax(s cos theta)`` is near-one-hot by construction at ``s = 30``,
+    so raising the ArcFace scale silently sharpened the distribution the KL term
+    measures. Dividing by ``tau_kl`` before the softmax separates them.
+    """
+    mapping = torch.zeros(6, 2)
+    mapping[:3, 0] = 1.0
+    mapping[3:, 1] = 1.0
+    logits = torch.randn(8, 6) * 10
+
+    def entropy(tau):
+        probs = aggregate_sub_log_probs(logits, mapping, tau=tau).exp()
+        return -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(-1).mean()
+
+    assert entropy(10.0) > entropy(1.0), "a higher temperature must soften P_sub"
+
+
+# --------------------------------------------------- EMA-centroid compactness
+
+
+def test_ema_centroids_make_every_sample_contribute():
+    """Per-batch centroids leave most of a batch of 16 contributing exactly zero.
+
+    With 27 roughly-balanced classes, the expected number with two or more
+    members in a batch of 16 is 27*[1 - (1-p)^16 - 16p(1-p)^15] = 3.2, so ~10 of
+    16 embeddings are their own centroid and score exactly 0, and the rest are
+    pulled toward a centroid estimated from two samples.
+    """
+    from src.losses.cosine import CosineSimilarityLoss, intra_class_cosine_loss
+
+    torch.manual_seed(0)
+    num_classes = 14
+
+    # A batch where every class appears exactly once -- the regime a batch of 16
+    # over 27 classes is close to.
+    singletons = torch.randn(num_classes, 8)
+    labels = torch.arange(num_classes)
+    assert (labels.bincount() == 1).all(), "fixture must be all singletons"
+
+    # Per-batch centroids: every sample is its own centroid, so the term is
+    # identically zero and carries no signal at all.
+    assert intra_class_cosine_loss(singletons, labels).item() == pytest.approx(0.0, abs=1e-6)
+
+    ema = CosineSimilarityLoss(
+        mode="intra_class", num_classes=num_classes, embed_dim=8, centroid_momentum=0.9
+    )
+    ema.train()
+    ema(torch.randn(num_classes, 8), None, labels)   # seed the centroids
+    scored = ema(singletons, None, labels)           # scored against history
+
+    assert torch.isfinite(scored)
+    assert ema.centroid_initialized.all()
+    assert scored.item() > 1e-3, (
+        "EMA centroids must give singletons a real target instead of scoring them 0"
+    )
+
+
+def test_residual_magnitude_hinge_is_inactive_in_the_healthy_regime():
+    """It must bound the residual without rewarding its disappearance.
+
+    That is exactly the property ``1 - cos(h + P(p_s), h)`` lacks: cosine is
+    magnitude-invariant, so the cheapest way to preserve direction is to make the
+    residual vanish -- and ``P(p_s) = 0`` is a global minimum of it.
+    """
+    from src.losses.cosine import residual_cosine_loss, residual_magnitude_loss
+
+    base = torch.randn(8, 16)
+    small = base * 0.1
+    large = base * 2.0
+
+    assert residual_magnitude_loss(small, base, tau=0.5).item() == pytest.approx(0.0, abs=1e-8)
+    assert residual_magnitude_loss(large, base, tau=0.5).item() > 0.0
+    # Zeroing the residual is free under the hinge -- and it is also free under
+    # the cosine form, which is the defect: there the *only* way to score 0 is to
+    # be parallel, and P = 0 is the cheapest way to be parallel.
+    zero = torch.zeros_like(base)
+    assert residual_magnitude_loss(zero, base, tau=0.5).item() == pytest.approx(0.0, abs=1e-8)
+    assert residual_cosine_loss(base + zero, base).item() == pytest.approx(0.0, abs=1e-6)

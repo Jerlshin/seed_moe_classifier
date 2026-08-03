@@ -14,18 +14,27 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
 from tests.conftest import (
-    PAPER_CENTER_MOMENTUM,
+    ADACOS_SCALE_27,
+    DATASET_NUM_CROPS,
+    REVISED_CENTER_MOMENTUM,
+    REVISED_DINO_OUT_DIM,
+    REVISED_TEACHER_MOMENTUM_FINAL,
+    REVISED_TEACHER_TEMP,
+    REVISED_WARMUP_EPOCHS,
+    REVISED_WARMUP_TEACHER_TEMP,
+    SUBMITTED_ARCFACE_SCALE,
+    SUBMITTED_CENTER_MOMENTUM,
     PAPER_CLIP_GRAD,
-    PAPER_DINO_OUT_DIM,
+    SUBMITTED_DINO_OUT_DIM,
     PAPER_EMBED_DIM,
     PAPER_LOCAL_CROPS,
     PAPER_NUM_EXPERTS,
     PAPER_NUM_SEED_TYPES,
     PAPER_NUM_SUB_VARIETIES,
-    PAPER_TEACHER_MOMENTUM,
-    PAPER_TEACHER_TEMP,
-    PAPER_WARMUP_EPOCHS,
-    PAPER_WARMUP_TEACHER_TEMP,
+    SUBMITTED_TEACHER_MOMENTUM,
+    SUBMITTED_TEACHER_TEMP,
+    SUBMITTED_WARMUP_EPOCHS,
+    SUBMITTED_WARMUP_TEACHER_TEMP,
     REVISED_TOP_K,
     SUBMITTED_TOP_K,
 )
@@ -64,6 +73,9 @@ def finetune_cfg(conf_dir):
 # ------------------------------------------------------------- composition
 
 
+#: Every experiment file. A new one that is not listed here is a config that
+#: nothing composes until someone launches a suite against it, which is the
+#: worst moment to discover a dangling interpolation.
 ALL_EXPERIMENTS = [
     "pretrain_swinv2_dino",
     "finetune_hierarchical_moe",
@@ -71,7 +83,15 @@ ALL_EXPERIMENTS = [
     "baseline_resnet50",
     "baseline_swin_tiny",
     "baseline_hierarchical_cce",
+    "baseline_linear_probe",
+    "baseline_swinv2_supervised",
 ]
+
+
+def test_all_experiment_files_are_covered(conf_dir):
+    """The list above must not drift behind `conf/experiment/`."""
+    on_disk = sorted(path.stem for path in (Path(conf_dir) / "experiment").glob("*.yaml"))
+    assert on_disk == sorted(ALL_EXPERIMENTS)
 
 
 @pytest.mark.parametrize("experiment", ALL_EXPERIMENTS)
@@ -84,7 +104,9 @@ def test_every_experiment_composes_and_resolves(conf_dir, experiment):
 def test_experiments_select_the_right_head_and_loss(pretrain_cfg, finetune_cfg):
     """conf/model/* is genuinely composed, not shadowed by inline duplicates."""
     assert pretrain_cfg.model.head.name == "dino_projection"
-    assert pretrain_cfg.model.loss.name == "dino"
+    # Renamed: stage 1 is DINO self-distillation with two DINOv2 components, not
+    # DINOv2. Calling it "dino" invited the reading the paper could not support.
+    assert pretrain_cfg.model.loss.name == "dino_self_distillation"
     assert finetune_cfg.model.head.name == "hierarchical_moe"
     assert finetune_cfg.model.loss.name == "combined_arcface_kl_moe"
 
@@ -113,19 +135,60 @@ def test_command_line_overrides_reach_the_loss(conf_dir):
 # ----------------------------------------------------------- paper: Table 1
 
 
-def test_dino_pretraining_matches_table_1(pretrain_cfg):
+def test_dino_pretraining_keeps_the_table_1_values_it_should(pretrain_cfg):
+    """The Table 1 entries the revision did not change."""
     training = pretrain_cfg.experiment.training
-    loss = pretrain_cfg.model.loss
 
     assert pretrain_cfg.model.backbone.name.startswith("swinv2")   # "Swin Transformer v2"
     assert pretrain_cfg.data.batch_size == 16                       # "Batch Size 16"
     assert training.epochs == 300                                   # "Number of Epochs 300"
     assert training.clip_grad == pytest.approx(PAPER_CLIP_GRAD)     # "Clip Gradient 3"
-    assert training.momentum_teacher == pytest.approx(PAPER_TEACHER_MOMENTUM)
-    assert loss.warmup_teacher_temp == pytest.approx(PAPER_WARMUP_TEACHER_TEMP)
-    assert loss.teacher_temp == pytest.approx(PAPER_TEACHER_TEMP)
-    assert loss.warmup_teacher_temp_epochs == PAPER_WARMUP_EPOCHS
-    assert pretrain_cfg.model.head.out_dim == PAPER_DINO_OUT_DIM    # "65,536"
+    # Table 1's 0.996 is now the *start* of a cosine schedule, not a constant.
+    assert training.momentum_teacher == pytest.approx(SUBMITTED_TEACHER_MOMENTUM)
+
+
+def test_stage_one_collapse_guards_are_recalibrated(pretrain_cfg):
+    """Sharpening and centering were both set toward collapse; neither is now.
+
+    The submitted configuration ran a teacher at tau = 0.04 -- roughly twice as
+    sharp as DINO's converged 0.07 -- while its counterweight, a 65,536-wide
+    centering vector, was an EMA at m = 0.9 over 32 teacher vectors per step:
+    ~320 effective samples for 65,536 dimensions, 1/64th the sample density DINO
+    has. Sharpening was strengthened and centering weakened simultaneously.
+    """
+    loss = pretrain_cfg.model.loss
+
+    assert loss.warmup_teacher_temp == pytest.approx(REVISED_WARMUP_TEACHER_TEMP)
+    assert loss.teacher_temp == pytest.approx(REVISED_TEACHER_TEMP)
+    assert loss.teacher_temp > SUBMITTED_TEACHER_TEMP, "the teacher must be softer, not sharper"
+    assert loss.warmup_teacher_temp_epochs == REVISED_WARMUP_EPOCHS
+
+    # Sinkhorn removes the dependence on a running mean entirely: the assignment
+    # is normalised within the batch, so nothing is estimated across steps.
+    assert loss.centering == "sinkhorn"
+    assert loss.center_momentum == pytest.approx(REVISED_CENTER_MOMENTUM)
+    assert loss.lambda_koleo > 0
+
+
+def test_prototype_count_is_sized_for_this_dataset(pretrain_cfg):
+    """65,536 prototypes for 9,357 images is 7.00 per image; DINO's ratio is 0.051.
+
+    That is 137x the prototype density DINO was tuned at, and the layer alone is
+    16.8 M parameters against a total training exposure of ~2 % of DINO's budget.
+    """
+    out_dim = pretrain_cfg.model.head.out_dim
+    assert out_dim == REVISED_DINO_OUT_DIM
+    assert out_dim < SUBMITTED_DINO_OUT_DIM
+    assert out_dim / DATASET_NUM_CROPS < 1.0, "fewer prototypes than training images"
+
+
+def test_stage_one_schedules_the_momentum_and_weight_decay(pretrain_cfg):
+    """DINO anneals both; the submitted configuration held both constant."""
+    training = pretrain_cfg.experiment.training
+    assert training.momentum_teacher_final == pytest.approx(REVISED_TEACHER_MOMENTUM_FINAL)
+    assert training.weight_decay_final > training.weight_decay
+    # Every collapse guard is a batch statistic, so the effective batch matters.
+    assert training.gradient_accumulation_steps * pretrain_cfg.data.batch_size >= 64
 
 
 def test_dino_optimizer_matches_section_6_1(pretrain_cfg):
@@ -136,14 +199,16 @@ def test_dino_optimizer_matches_section_6_1(pretrain_cfg):
     assert pretrain_cfg.experiment.training.freeze_last_layer_epochs == 1
 
 
-def test_dino_head_uses_batch_norm(pretrain_cfg):
-    """Section 4: "an MLP with batch normalization and GELU activation functions"."""
-    assert pretrain_cfg.model.head.use_batch_norm is True
+def test_dino_head_normalisation_decouples_teacher_from_student(pretrain_cfg):
+    """Section 4 says batch norm; the EMA cannot carry it.
 
-
-def test_dino_centering_momentum(pretrain_cfg):
-    """Eq. 3 with m = 0.9."""
-    assert pretrain_cfg.model.loss.center_momentum == pytest.approx(PAPER_CENTER_MOMENTUM)
+    ``update_momentum`` EMAs *parameters*, not *buffers*, so a BatchNorm head
+    leaves teacher and student running statistics to diverge -- and the teacher
+    sees 2 views per step against the student's 6, so their batch statistics
+    differ even in principle. DINO's reference head uses no batch norm for
+    transformer trunks for the same reason.
+    """
+    assert pretrain_cfg.model.head.use_batch_norm in {"layer", "none"}
 
 
 def test_multi_crop_configuration_matches_table_1(pretrain_cfg):
@@ -262,15 +327,62 @@ def test_every_paper_loss_component_is_weighted(finetune_cfg):
     assert loss.lambda_seed > 0        # Eq. 7
     assert loss.lambda_arcface > 0     # Eq. 13
     assert loss.lambda_kl > 0          # Eq. 10
-    assert loss.lambda_moe_load > 0    # entropy load balancing
-    assert loss.lambda_moe_sparsity > 0  # L1 sparsity
-    assert loss.lambda_cosine > 0      # residual compactness
+    assert loss.lambda_moe_load > 0    # dispatch-aware load balancing
+    assert loss.lambda_cosine > 0      # class compactness
+    assert loss.lambda_moe_z > 0       # router z-loss
+    assert loss.lambda_residual > 0    # Eq. 9 residual magnitude hinge
+
+    # L1 sparsity is deliberately OFF. Under renormalize_top_k it has a null
+    # space with respect to the module's output -- mass can move onto the
+    # selected set without changing h -- so its only reliable effect is to cut
+    # router entropy, which fights the load term. Kept as an ablation axis.
+    assert loss.lambda_moe_sparsity == 0.0
+    assert loss.moe_load_mode == "switch"
 
 
-def test_arcface_hyperparameters_are_present(finetune_cfg):
-    """Eq. 13 needs both an angular margin m and a feature scale s."""
-    assert finetune_cfg.model.head.arcface_margin > 0
-    assert finetune_cfg.model.head.arcface_scale > 1
+def test_arcface_scale_is_analytic_not_inherited_from_face_recognition(finetune_cfg):
+    """Eq. 13 needs a margin and a scale, and the scale must suit C = 27.
+
+    ``s = 30`` is ArcFace's value for 10^5-10^6 identities. AdaCos derives the
+    fixed optimal scale as ``sqrt(2) log(C-1)``, which is 4.61 here -- so 30 was
+    6.5x too large, put ``L_ArcFace`` at ~17.6 against ``L_seed = 1.386`` at
+    initialisation, and saturated ``softmax(s cos)`` into a near-one-hot
+    distribution that broke the KL term and any calibration analysis.
+    """
+    from src.models.components.arcface_head import adacos_scale, resolve_scale
+
+    head = finetune_cfg.model.head
+    assert head.arcface_margin > 0
+    assert head.arcface_scale == "auto"
+
+    resolved = resolve_scale(head.arcface_scale, PAPER_NUM_SUB_VARIETIES)
+    assert resolved == pytest.approx(ADACOS_SCALE_27, abs=1e-3)
+    assert resolved == pytest.approx(adacos_scale(PAPER_NUM_SUB_VARIETIES))
+    assert resolved < SUBMITTED_ARCFACE_SCALE
+
+
+def test_hierarchy_kl_is_decoupled_from_the_arcface_scale(finetune_cfg):
+    """``lambda_kl`` and ``arcface_scale`` must not be one hyperparameter in disguise."""
+    loss = finetune_cfg.model.loss
+    assert loss.tau_kl > 0
+    assert loss.kl_mode in {"forward", "jsd"}
+    # The coarse head is already supervised by hard labels; letting L_KL push it
+    # too lets the term be reduced by agreeing with a confidently wrong fine
+    # prediction.
+    assert loss.detach_kl_seed_target is True
+
+
+def test_split_protocol_defaults_to_group_aware(finetune_cfg):
+    """9,357 crops from 81 photographs: crop-level splitting is not a neutral choice."""
+    assert finetune_cfg.experiment.training.split_protocol == "grouped"
+
+
+def test_stage_two_augmentation_is_not_empty(finetune_cfg):
+    """The submitted default saw each image once per epoch, deterministically."""
+    training = finetune_cfg.experiment.training
+    assert training.horizontal_flip_prob > 0
+    assert training.random_resized_crop_scale is not None
+    assert training.margin_warmup_fraction > 0
 
 
 def test_ablation_disables_the_hierarchy(conf_dir):

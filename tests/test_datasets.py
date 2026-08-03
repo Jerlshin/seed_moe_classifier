@@ -159,3 +159,98 @@ def test_supervised_transform_is_deterministic_without_flip():
 def test_negative_local_crop_count_is_rejected():
     with pytest.raises(ValueError, match="local_crops_number"):
         DataAugmentationDINO(image_size=32, local_crop_size=16, local_crops_number=-1)
+
+
+# ---------------------------------------------------------------- provenance
+
+
+def test_source_image_id_groups_crops_by_their_source_photograph():
+    """``IMG_0502_bbox137.png`` and ``IMG_0502_bbox4.png`` are the same scene."""
+    from src.datasets.dataset import source_image_id
+
+    assert source_image_id("Millet/Baryard/IMG_0502_bbox137.png") == source_image_id(
+        "Millet/Baryard/IMG_0502_bbox4.png"
+    )
+    assert source_image_id("Millet/Baryard/IMG_0502_bbox0.png") != source_image_id(
+        "Millet/Baryard/IMG_0503_bbox0.png"
+    )
+    # Two sub-varieties may legitimately reuse a filename, so the key is scoped.
+    assert source_image_id("Millet/Baryard/IMG_0502_bbox0.png") != source_image_id(
+        "Millet/Browntop/IMG_0502_bbox0.png"
+    )
+    # No ``_bbox`` suffix means no known provenance: every file its own group,
+    # which is exactly ungrouped splitting -- the right default when unknown.
+    assert source_image_id("a/b/plain.png") != source_image_id("a/b/other.png")
+
+
+def test_source_groups_are_dense_contiguous_indices(synthetic_dataset_root):
+    from src.datasets.dataset import HierarchicalSeedDataset
+
+    dataset = HierarchicalSeedDataset(root_dir=synthetic_dataset_root)
+    groups = dataset.source_groups()
+
+    assert groups.shape == (len(dataset),)
+    assert groups.min() == 0
+    assert set(groups.tolist()) == set(range(int(groups.max()) + 1))
+
+
+def test_group_report_names_the_classes_no_split_can_separate(synthetic_dataset_root):
+    """The number that bounds the whole protocol, surfaced rather than inferred.
+
+    A sub-variety whose crops all come from one photograph cannot be
+    group-separated at all: for those classes no honest train/test split exists,
+    and their scores measure within-photograph generalisation whatever the
+    splitter does. The paper has to say so, so the trainer reports it.
+    """
+    from src.datasets.dataset import HierarchicalSeedDataset
+
+    dataset = HierarchicalSeedDataset(root_dir=synthetic_dataset_root)
+    report = dataset.group_report()
+
+    assert report["num_samples"] == len(dataset)
+    assert report["num_source_groups"] >= 1
+    assert report["mean_crops_per_source"] >= 1.0
+    assert set(report["sources_per_sub_variety"]) == set(dataset.subvariety_to_idx)
+    assert report["num_single_group_sub_varieties"] == len(report["single_group_sub_varieties"])
+
+
+def test_supervised_transforms_resize_to_an_explicit_square():
+    """``T.Resize(int)`` preserves aspect ratio; only 3.4 % of the crops are square.
+
+    Passing an integer would resize the shorter side only, emit variable-width
+    tensors, and make ``default_collate`` raise on the first mixed batch. The
+    tuple form squashes to a square instead -- a real distortion, chosen
+    deliberately over a latent crash.
+    """
+    from PIL import Image
+
+    from src.datasets.transforms import get_supervised_transforms
+
+    transform = get_supervised_transforms(image_size=64, train=False)
+    for size in ((21, 60), (60, 21), (48, 48)):
+        tensor = transform(Image.new("RGB", size))
+        assert tensor.shape == (3, 64, 64)
+
+
+def test_stage_two_training_transform_is_stochastic_and_evaluation_is_not():
+    """The submitted default saw each image once per epoch, deterministically."""
+    from PIL import Image
+
+    from src.datasets.transforms import get_supervised_transforms
+
+    # A textured image: a uniform one is invariant to crop and flip, so it would
+    # make this test pass for the wrong reason.
+    import numpy as np
+
+    pixels = np.tile(np.arange(40, dtype=np.uint8)[None, :, None], (55, 1, 3))
+    image = Image.fromarray(pixels, mode="RGB")
+    train = get_supervised_transforms(image_size=32, train=True)
+    evaluate = get_supervised_transforms(image_size=32, train=False)
+
+    torch.manual_seed(0)
+    samples = [train(image) for _ in range(8)]
+    assert any(not torch.equal(samples[0], other) for other in samples[1:])
+
+    # Evaluation must never be stochastic, or val/test numbers become
+    # augmentation noise rather than a measurement.
+    assert torch.equal(evaluate(image), evaluate(image))

@@ -5,7 +5,7 @@ conf/
   config.yaml                        # root: composes every group below
   data/hierarchical_seeds.yaml       # dataset paths, sizes, augmentation
   model/
-    backbone/  swinv2.yaml           # the ONLY DINOv2 backbone (see below)
+    backbone/  swinv2.yaml           # the ONLY self-supervised backbone (see below)
     head/      hierarchical_moe.yaml # MoE + cross-attention + ArcFace (stage 2)
                dino.yaml             # DINO projection head (stage 1)
                flat_supervised.yaml  # supervised baseline: backbone + 2 linear heads
@@ -55,7 +55,7 @@ differ only in the thing being ablated.
 
 ## `model/backbone` has exactly one option
 
-SwinV2 is the only encoder on the DINOv2 path. The comparative ViT-S/14 entry
+SwinV2 is the only encoder on the self-supervised path. The comparative ViT-S/14 entry
 from the submitted manuscript has been removed, and `validate_swinv2_name()` in
 `src/models/builder.py` rejects any name that is not a SwinV2 variant — so a run
 cannot silently fall back to a different encoder.
@@ -64,7 +64,7 @@ asserts the directory contains one file.
 
 Supervised comparison backbones (ResNet-50, Swin-T) are selected through
 `model/head: flat_supervised` and the `baseline_*` experiments. They are not
-DINOv2-pretrained, so putting them in this group would invite exactly the mix-up
+self-supervised-pretrained, so putting them in this group would invite exactly the mix-up
 the validator prevents.
 
 ## Component toggles
@@ -73,7 +73,7 @@ Five booleans under `model.head` drive the ablation suite:
 
 ```yaml
 use_moe: true              # false -> one dense transformer block, no routing
-use_arcface: true          # false -> linear head; objective becomes plain CE
+use_arcface: true          # false -> linear head; prefer sub_head_variant for margin ablations
 use_residual: true         # false -> h' = h; Eq. 9 fusion removed
 use_cross_attention: true  # false -> h'' = h'; Eqs. 11-12 skipped
 use_kl_loss: true          # false -> Eq. 10 not computed
@@ -144,7 +144,8 @@ its source. A failure there means the configs have drifted from the paper.
 | `model.head.top_k` | **2** | revision (paper: 4) |
 | `data.num_seed_types` / `num_sub_varieties` | 4 / 27 | Section 3 |
 
-`top_k` is the one deliberate departure. `model.head.top_k=4` reproduces the
+`top_k` is one of several deliberate departures; `REVISION_NOTES.md` 0 tabulates
+them all with their reversing override. `model.head.top_k=4` reproduces the
 submitted configuration; see [`../REVISION_NOTES.md`](../REVISION_NOTES.md).
 
 ## Run-directory layout

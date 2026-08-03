@@ -9,7 +9,7 @@ Exercises every stage on random data, with no dataset, no checkpoint and no
 network access::
 
     synthetic images
-      -> DINOv2 SwinV2 encoder                z in R^384        (Eq. 4)
+      -> self-supervised SwinV2 encoder       z in R^384        (Eq. 4)
       -> seed-type classifier                 s, p_s            (Eqs. 5-6)
       -> Top-2 MoE over 6 experts             h                 (Eq. 8)
       -> residual seed-type fusion            h' = h + P(p_s)   (Eq. 9)
@@ -84,8 +84,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=10, help="Synthetic images to generate.")
     parser.add_argument("--batch-size", type=int, default=5)
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--top-k", type=int, default=2, help="Experts routed per sample.")
+    parser.add_argument("--top-k", type=int, default=2, help="Experts routed per token.")
     parser.add_argument("--num-experts", type=int, default=6)
+    parser.add_argument(
+        "--token-mode",
+        choices=("grid", "pooled"),
+        default="grid",
+        help="grid keeps SwinV2's token grid through the head (attention is real); "
+        "pooled reproduces the submitted architecture (attention is affine).",
+    )
+    parser.add_argument(
+        "--weighting-mode",
+        choices=("fixed", "uncertainty"),
+        default="fixed",
+        help="Task-term weighting. 'uncertainty' exercises the criterion's learnable scalars.",
+    )
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     parser.add_argument(
         "--output-dir",
@@ -138,6 +151,7 @@ def main() -> int:
         checkpoint_path=None,   # random weights: this verifies wiring, not accuracy
         pretrained=False,
         freeze_backbone=True,
+        token_mode=args.token_mode,
     ).to(device)
     print(
         f"[2/7] Encoder built in {time.perf_counter() - started:.1f}s: "
@@ -146,9 +160,19 @@ def main() -> int:
 
     with torch.no_grad():
         probe = encoder(images[:2].to(device))
-    if probe.shape != (2, PAPER_EMBED_DIM):
-        raise AssertionError(f"Encoder must emit [B, {PAPER_EMBED_DIM}], got {tuple(probe.shape)}")
-    print(f"      z shape verified: {tuple(probe.shape)}")
+    # The invariant is on the *last* axis: grid mode adds a token axis in front
+    # of it, pooled mode does not, and both must land on the paper's 384.
+    expected_ndim = 3 if args.token_mode == "grid" else 2
+    if probe.ndim != expected_ndim or probe.shape[0] != 2 or probe.shape[-1] != PAPER_EMBED_DIM:
+        raise AssertionError(
+            f"Encoder in token_mode={args.token_mode!r} must emit "
+            f"{'[B, tokens, ' if expected_ndim == 3 else '[B, '}{PAPER_EMBED_DIM}], "
+            f"got {tuple(probe.shape)}"
+        )
+    print(
+        f"      z shape verified: {tuple(probe.shape)}"
+        + (f" ({probe.shape[1]} routing tokens per image)" if expected_ndim == 3 else "")
+    )
 
     # ---------------------------------------------------------------- head
     model = HierarchicalSeedClassifier(
@@ -158,14 +182,26 @@ def main() -> int:
         num_sub_varieties=NUM_SUB_VARIETIES,
         num_experts=args.num_experts,
         top_k=args.top_k,
+        token_mode=args.token_mode,
+        router_noise_std=0.3,
     ).to(device)
     criterion = CombinedHierarchicalLoss(
         num_seed_types=NUM_SEED_TYPES,
         num_sub_varieties=NUM_SUB_VARIETIES,
         subvariety_to_seed_type=hierarchy,
+        embed_dim=PAPER_EMBED_DIM,
+        num_experts=args.num_experts,
+        weighting_mode=args.weighting_mode,
     ).to(device)
+    # The criterion joins the optimizer because uncertainty weighting owns three
+    # learnable scalars; under fixed weighting it contributes nothing.
     optimizer = torch.optim.AdamW(
-        [p for module in (encoder, model) for p in module.parameters() if p.requires_grad],
+        [
+            p
+            for module in (encoder, model, criterion)
+            for p in module.parameters()
+            if p.requires_grad
+        ],
         lr=1e-4,
     )
     print(f"[3/7] Head built: {args.num_experts} experts, top-{args.top_k}, "
@@ -198,6 +234,11 @@ def main() -> int:
             output = model(features, sub_variety_labels=batch_sub)
             breakdown = criterion(output, batch_seed, batch_sub)
             breakdown.total.backward()
+            # Sparse dispatch leaves unrouted experts with `grad is None`, which
+            # AdamW skips entirely -- including weight decay. Materialising zeros
+            # is what keeps sparse and dense dispatch equivalent under the
+            # optimizer, not just in the forward pass.
+            model.materialize_expert_grads()
             optimizer.step()
 
             epoch_loss += float(breakdown.total.detach())
@@ -221,7 +262,9 @@ def main() -> int:
             f"[4/7] Epoch {epoch}/{args.epochs} | total={mean_loss:.4f} "
             f"seed={parts['seed_type_loss']:.4f} arcface={parts['arcface_loss']:.4f} "
             f"kl={parts['kl_loss']:.4f} load={parts['moe_load_balancing_loss']:.4f} "
-            f"sparsity={parts['moe_sparsity_loss']:.4f} cosine={parts['cosine_loss']:.4f}"
+            f"z={parts['moe_router_z_loss']:.4f} cosine={parts['cosine_loss']:.4f} "
+            f"residual={parts['residual_magnitude_loss']:.4f} "
+            f"dead_experts={int(parts['moe_dead_experts'])}"
         )
 
     # ------------------------------------------------------------- metrics
@@ -237,12 +280,16 @@ def main() -> int:
         sub_variety_names=[f"sub_{i:02d}" for i in range(NUM_SUB_VARIETIES)],
         top_k_indices=torch.cat(expert_indices).numpy(),
         num_experts=args.num_experts,
+        tokens_per_sample=int(probe.shape[1]) if probe.ndim == 3 else 1,
     )
     print(
         f"[5/7] Metrics | seed_acc={evaluation.seed_type['accuracy']:.4f} "
         f"sub_acc={evaluation.sub_variety['accuracy']:.4f} "
         f"kl_alignment={evaluation.alignment.overall:.4f} "
-        f"expert_utilization={[round(float(v), 3) for v in evaluation.expert_utilization]}"
+        f"dead_experts={evaluation.dead_experts} "
+        f"nmi_sub={evaluation.expert_nmi.get('sub_variety', float('nan')):.3f}\n"
+        f"              expert_utilization="
+        f"{[round(float(v), 3) for v in evaluation.expert_utilization]}"
     )
 
     # ---------------------------------------------------------- efficiency
@@ -272,6 +319,7 @@ def main() -> int:
         efficiency=efficiency.as_dict() if efficiency is not None else {},
         history=history,
         component_flags=model.component_flags(),
+        loss_flags=criterion.loss_flags(),
         config={
             "backbone": args.backbone,
             "head": "hierarchical_moe",

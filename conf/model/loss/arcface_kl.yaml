@@ -1,26 +1,57 @@
 # Combined hierarchical objective (paper Section 5).
 #
-#   L = lambda_seed     * L_seed      (Eq. 7)
-#     + lambda_arcface  * L_ArcFace   (Eq. 13)
-#     + lambda_kl       * L_KL        (Eq. 10)
-#     + lambda_moe_load * L_load      (Sec 5.2, entropy load balancing)
-#     + lambda_moe_sparsity * L_L1    (Sec 5.2, Top-K sparsity)
-#     + lambda_cosine   * L_cos       (Sec 1, residual compactness)
-#     + lambda_sub_ce   * L_sub_CE    (auxiliary, off by default)
+#   L = w_seed        * L_seed      (Eq. 7)
+#     + w_arcface     * L_ArcFace   (Eq. 13)
+#     + w_kl          * L_KL        (Eq. 10)
+#     + lambda_moe_load     * L_load      (Sec 5.2, dispatch-aware balancing)
+#     + lambda_moe_sparsity * L_L1        (Sec 5.2, Top-K sparsity; off)
+#     + lambda_moe_z        * L_z         (router z-loss, ST-MoE)
+#     + lambda_cosine       * L_cos       (Sec 1, class compactness)
+#     + lambda_residual     * L_res       (Eq. 9 residual magnitude hinge)
+#     + lambda_sub_ce       * L_sub_CE    (auxiliary, off by default)
 
 name: "combined_arcface_kl_moe"
 
-# The `wo_kl` ablation switch. Interpolated from the head so all five component
-# toggles have a single home; setting model.head.use_kl_loss=false here means
-# Eq. 10 is not computed at all, rather than computed and multiplied by zero.
+# The `wo_kl` ablation switch. Interpolated from the head so all component
+# toggles have a single home; setting model.head.use_kl_loss=false means Eq. 10
+# is not computed at all, rather than computed and multiplied by zero.
 use_kl_loss: ${model.head.use_kl_loss}
+
+# ---------------------------------------------------------------------------
+# Task-term weighting.
+#
+#   fixed        the submitted scheme: hand-set lambdas
+#   uncertainty  learn 1/(2 sigma^2) per task (Kendall et al., 2018)
+#
+# The submitted objective had seven fixed lambdas over terms whose magnitudes at
+# initialisation differed by ~13x (L_ArcFace = 17.64 vs L_seed = 1.386 at
+# s = 30), so one term carried ~92 % of the initial gradient. Setting the ArcFace
+# scale analytically removes most of that spread, which is why `fixed` is still
+# a defensible default; `uncertainty` removes the rest and makes the learned
+# sigmas readable as a diagnostic. Whichever is chosen must be IDENTICAL across
+# every variant in a suite, or the ablation gaps become gaps in weighting policy.
+# ---------------------------------------------------------------------------
+weighting_mode: "fixed"
 
 lambda_seed: 1.0
 lambda_arcface: 1.0
 lambda_kl: 1.0
 lambda_moe_load: 0.01
-lambda_moe_sparsity: 0.01
+# Zero on purpose. Under renormalize_top_k=True the off-Top-K L1 penalty has a
+# null space with respect to the module's output -- mass can move onto the
+# selected set without changing h at all -- so its only reliable effect is to
+# cut router entropy, which directly fights the load-balancing term.
+# renormalize_top_k and lambda_moe_sparsity > 0 are mutually redundant; this
+# picks the first. Retained as an ablation axis.
+lambda_moe_sparsity: 0.0
+# Router z-loss at the ST-MoE standard weight. Prevents router logit growth,
+# which is what makes Top-K selection brittle.
+lambda_moe_z: 0.001
 lambda_cosine: 0.1
+# Hinge on ||P(p_s)|| / ||h||: exactly zero below `residual_tau`, so it bounds
+# the residual's influence without rewarding its disappearance.
+lambda_residual: 0.01
+residual_tau: 0.5
 
 # The paper classifies sub-varieties with ArcFace alone, so the auxiliary plain
 # cross-entropy is disabled. A small value (e.g. 0.1) can help ArcFace converge
@@ -30,19 +61,67 @@ lambda_sub_ce: 0.0
 seed_label_smoothing: 0.0
 arcface_label_smoothing: 0.0
 
-# Eq. 10 direction is D_KL(P_seed || P_sub). Setting this true stops the
-# gradient into the seed branch, so KL only reshapes the sub-variety head.
-detach_kl_seed_target: false
+# ---------------------------------------------------------------------------
+# Hierarchy consistency (Eq. 10).
+#
+# Aggregation is done in LOG space with logsumexp over each parent's children.
+# The submitted implementation aggregated probabilities and then took
+# log(clamp_min(1e-8)), and clamp_min has zero gradient in the clamped region:
+# with s = 30 a cosine gap of 1.0 becomes a probability ratio of e^30 ~ 1e13, so
+# the non-argmax seed bins sat at ~1e-13 and the term contributed exactly nothing
+# -- silently, with no NaN. It was live when the heads agreed and dead when they
+# disagreed confidently, which is the entire point of it.
+#
+# detach_kl_seed_target defaults TRUE now. The coarse head is already supervised
+# by hard labels, so letting L_KL also push P_seed lets it reduce the term by
+# agreeing with a confidently wrong fine prediction.
+detach_kl_seed_target: true
 
-# "off_topk" penalises routing mass outside the Top-K selection, which is what
-# "restricts the selection to only the top-K most relevant experts" describes.
-# "topk" reproduces the earlier behaviour of penalising the selected weights.
+# "forward" is D_KL(P_seed || P_sub-agg) as Eq. 10 writes it. "jsd" is the
+# symmetric Jensen-Shannon divergence the hierarchy-consistency literature has
+# converged on (HAF, Garg et al. 2022): bounded by log 2, and without the
+# zero-avoidance that forces the fine head to hedge across seed types.
+kl_mode: "forward"
+
+# Temperature on the sub-variety branch, decoupling this term from the ArcFace
+# scale. At s = 30 the two were secretly one hyperparameter: softmax(30 cos) is
+# near-one-hot by construction, so changing arcface_scale silently changed the
+# effective strength of the hierarchy term. At the AdaCos scale tau_kl = 1.0 is
+# the right value; raise it toward s if arcface_scale is raised.
+tau_kl: 1.0
+
+# ---------------------------------------------------------------------------
+# MoE regularisers.
+#
+# "switch" is the Shazeer/GShard/Switch form E * sum_i f_i * P_i, which couples
+# the HARD dispatch fraction f to the differentiable router probability P. The
+# submitted "entropy" form saw only P: for G = (.3,.3,.1,.1,.1,.1) it scores
+# -0.917, i.e. 92 % of "perfectly balanced", while Top-2 sends every sample to
+# experts {0,1} and four experts receive no gradient for the entire run. At its
+# global optimum G is exactly uniform and torch.topk breaks ties toward the
+# lowest indices, so the minimum of the loss produces maximally imbalanced hard
+# routing. "entropy" is retained so the two can be compared on one split.
+moe_load_mode: "switch"
 moe_sparsity_mode: "off_topk"
-
-# Divide the entropy term by log(num_experts) so it is bounded in [-1, 0] and
-# lambda_moe_load keeps its meaning if the expert count changes.
 normalize_moe_entropy: true
 
-# "residual" keeps h' aligned with h across the Eq. 9 residual connection.
-# "intra_class" instead pulls embeddings toward their class centroid.
-cosine_mode: "residual"
+# EMA over the routing statistics fed to the load term. At batch 16 and K = 2,
+# one step fills 32 routing slots across 6 experts -- far too noisy to steer a
+# self-reinforcing process. (token_mode=grid fixes this at the source, giving
+# 2,048 slots; this helps the pooled path.)
+moe_utilization_momentum: 0.9
+
+# ---------------------------------------------------------------------------
+# Compactness (Section 1).
+#
+# "intra_class" pulls each embedding toward its class centroid, maintained as an
+# EMA over training. This is what "feature compactness" means, and the EMA is
+# what makes it exist: with batch 16 over 27 classes only ~3.2 classes have two
+# or more members, so per-batch centroids leave ~10 of 16 samples contributing
+# exactly zero and estimate the rest from two samples.
+#
+# "residual" is the submitted 1 - cos(h + P(p_s), h). Its global minima are
+# exactly P(p_s) = alpha*h -- including alpha = 0, which IS the use_residual=false
+# ablation. Retained for ablation only.
+cosine_mode: "intra_class"
+centroid_momentum: 0.9

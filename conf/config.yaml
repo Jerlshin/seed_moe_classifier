@@ -9,7 +9,7 @@
 #   python main.py finetune model.head.top_k=4          # submitted Top-4 routing
 #   python main.py finetune model.head.use_moe=false    # component ablation
 #
-# `model/backbone` has a single option: SwinV2 is the only encoder on the DINOv2
+# `model/backbone` has a single option: SwinV2 is the only encoder on the self-supervised
 # path. Supervised comparison backbones are selected through the baseline
 # experiments (conf/experiment/baseline_*.yaml), not through this group.
 

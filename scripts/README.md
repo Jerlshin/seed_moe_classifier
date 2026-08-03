@@ -4,7 +4,7 @@
 | --- | --- |
 | `dry_run.py` | End-to-end pipeline smoke test on synthetic tensors |
 | `run_ablations.py` | The six component-wise ablation variants |
-| `run_baselines.py` | ResNet-50, Swin-T and hierarchical-CCE baselines |
+| `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |
 | `extract_features.py` | Dump frozen-backbone embeddings to an `.npz` |
 | `train_distributed.sh` | Launch any stage or suite with vast.ai environment defaults |
@@ -14,8 +14,8 @@ The intended order for a full experimental campaign:
 ```bash
 python scripts/dry_run.py          # verify the pipeline runs at all
 python main.py pretrain            # produce the shared encoder, once
-python scripts/run_ablations.py    # six variants
-python scripts/run_baselines.py    # three baselines
+python scripts/run_ablations.py    # 18 variants x 5 seeds
+python scripts/run_baselines.py    # five baselines
 python scripts/generate_plots.py   # collect everything into outputs/reports/
 ```
 
@@ -53,7 +53,8 @@ Six variants, each removing exactly one architectural ingredient:
 | --- | --- |
 | `full_model` | *(none)* |
 | `wo_moe` | `model.head.use_moe=false` |
-| `wo_arcface` | `model.head.use_arcface=false` |
+| `wo_margin_only` | `model.head.sub_head_variant=normface` |
+| `wo_angular_head` | `model.head.sub_head_variant=linear` |
 | `wo_residual` | `model.head.use_residual=false` |
 | `wo_kl` | `model.head.use_kl_loss=false` |
 | `wo_cross_attn` | `model.head.use_cross_attention=false` |
@@ -69,7 +70,7 @@ Results land in `outputs/ablations/{variant}/` — one self-contained directory 
 variant with its Hydra config snapshot, logs, checkpoints, figures,
 `summary.json` and `test_predictions.npz`.
 
-**Pretraining is never repeated.** All six variants read the single published
+**Pretraining is never repeated.** Every variant reads the single published
 encoder at `outputs/checkpoints/dinov2_swinv2_pretrained.pth`. If each variant
 had its own self-supervised initialisation, the table would partly measure that
 instead of the architectural change under test — and the resulting numbers would
@@ -83,11 +84,13 @@ python scripts/run_baselines.py
 python scripts/run_baselines.py --models resnet50 swin_tiny
 ```
 
-`resnet50` and `swin_tiny` own ImageNet backbones and are trained end to end, so
-they are deliberately **not** given the DINOv2 checkpoint — a SwinV2 state dict
-would at best be ignored and at worst partially loaded. `hierarchical_cce` does
-read it, because it is the proposed model with toggles flipped and must start
-from the same encoder to stay comparable.
+`resnet50`, `swin_tiny` and `swinv2_supervised` own ImageNet backbones and are
+trained end to end, so they are deliberately **not** given the self-supervised
+checkpoint — a SwinV2 state dict would at best be ignored and at worst partially
+loaded. `linear_probe` and `hierarchical_cce` do read it: `linear_probe` is
+stage 1's frozen encoder plus two linear heads, and `hierarchical_cce` is the
+proposed model with toggles flipped, so both must start from the same encoder
+to stay comparable.
 
 ## Why each variant runs as a subprocess
 

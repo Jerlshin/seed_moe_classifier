@@ -102,58 +102,130 @@ see [`02_BACKBONE_AND_SSL.md`](02_BACKBONE_AND_SSL.md)).
 
 ## 2. Train / validation / test splitting (stage 2)
 
-Implemented in `src/trainers/moe_finetune.py:98-167`.
+Implemented in `src/trainers/moe_finetune.py`.
+
+### What the dataset actually is, before any splitter runs
+
+Measured from the real tree under `Cropped_Samples`:
+
+```text
+total crops                    9,357
+distinct source photographs       81
+mean crops per source          115.5      (range 37 - 297)
+sources per sub-variety          1 : 5 classes
+                                 2 : 4 classes
+                                 3 : 8 classes
+                                 4 : 6 classes
+                                 5 : 4 classes
+```
+
+Filenames carry the provenance directly — `IMG_0502_bbox137.png` is bounding box
+137 cut from photograph `IMG_0502`. **115 crops per source photograph** is what
+decides how the split has to work: crops sharing a source are near-duplicates of
+the same physical scene, with the same lighting, background, sensor noise, and
+frequently the same individual seed at overlapping bounding boxes.
+
+The crops are also **small**: median 52 x 51 px, and 100 % of them have both
+sides under 256, so every image is upsampled roughly 5x before the backbone sees
+it. Only 3.4 % are square (aspect ratios span 0.17 - 3.48).
 
 ### Stratification key
 
 ```python
 def stratification_labels(dataset) -> np.ndarray:
-    return np.array([seed * 1000 + sub for _, seed, sub in dataset.samples])
+    return np.array([sub for _, _, sub in dataset.samples])
 ```
 
-A composite `seed_label * 1000 + sub_label` key, so `StratifiedKFold` /
-`train_test_split` keep **both** hierarchy levels balanced simultaneously —
-stratifying on sub-variety alone would not guarantee seed-type balance and
-vice versa.
+**Correction to a claim this document used to make.** It previously stated that
+a composite `seed * 1000 + sub` key was needed because "stratifying on
+sub-variety alone would not guarantee seed-type balance". That is false.
+Sub-variety labels are **global** (0..26) and each has exactly one parent, so
+`seed = parent(sub)` is a deterministic function of `sub`, and the map
+`sub -> seed*1000 + sub` is a **bijection** — it induces exactly the same strata.
+The code was correct; the reason was not. It now uses the simpler key that
+produces the identical partition.
 
-### `split_dataset(dataset, test_size, num_folds, seed)`
+### Group-aware splitting (`split_protocol`, default `grouped`)
 
-1. Carve out a held-out **test set** first via `train_test_split(...,
-   stratify=labels, random_state=seed)`, using `experiment.training.test_size`
-   (default `0.2`).
-2. Over the remainder, build `num_folds` train/validation splits:
-   * `num_folds > 1` → `StratifiedKFold(n_splits=num_folds, shuffle=True,
-     random_state=seed)`.
-   * `num_folds == 1` (the default) → a single stratified
-     `train_test_split(test_size=max(test_size, 0.2), ...)`.
+`HierarchicalSeedDataset.source_groups()` returns an integer group id per sample,
+keyed on `<sub_variety>/<source photograph>` (scoped by directory because two
+sub-varieties may reuse a filename). `split_dataset` then:
 
-**Everything is driven entirely by `cfg.seed`** (default `42`, set in
-`conf/config.yaml:25`), so every variant in an ablation or baseline suite sees
-the **byte-identical partition**. This is what makes cross-variant comparison
-valid — a different split per variant would confound the architecture change
-under test with a difference in what data it happened to see.
+* `grouped` — `GroupShuffleSplit` for the test carve-out and
+  `StratifiedGroupKFold` for the folds, so no source photograph appears on both
+  sides of any boundary.
+* `stratified` — the submitted crop-level splitting, retained deliberately.
+
+Under crop-level splitting the reported accuracy is substantially a memorisation
+score: near-duplicate views of the same seeds sit in both train and test. The
+literature has measured this exact error repeatedly — 0.07-0.43 MCC in OCT
+classification, 1.6-2.0 dB PSNR in intrinsic decomposition, and a 93.7 %
+lithology result its own authors excluded as an artifact.
+
+### The limit no protocol can remove
+
+**Five of the 27 sub-varieties** — `Baryard`, `Browntop`, `FingerMillet`,
+`PearlMillet`, `ProsaMillet` — have crops from exactly one photograph. No grouped
+split can place any of their crops on both sides, so grouped stratification
+degrades to "this class is entirely in one partition" for those five. On the real
+tree a 30 % grouped test split leaves three sub-varieties out of training
+altogether.
+
+The trainer logs this at startup and records it in `summary.json`. For those
+classes, **no protocol available on this dataset measures across-photograph
+generalisation**, and the paper has to say so — it is a dataset limitation, not
+a modelling one.
+
+### The leak as a measurement
+
+`scripts/run_ablations.py` runs `leakage_ungrouped`: the full model under
+`split_protocol=stratified` and nothing else changed. The delta against
+`full_model` quantifies what the leak was worth. That is a methods result worth
+reporting, and it is the form careful applied-DL papers report it in.
+
+Both protocols emit a leakage report — shared source groups, the fraction of the
+test set they cover, and any sub-variety missing from either side — so a
+stratified run carries its own indictment rather than leaving it to be inferred.
+
+### Determinism
+
+Everything is driven by `cfg.seed`, so every variant in a suite sees the
+**byte-identical partition** — which is also what makes McNemar's paired test
+available in `generate_plots.py`. Beyond the split, the trainer seeds the
+`DataLoader` generator and every worker (`make_worker_init_fn`) and logs the cuDNN
+flags, because a reproducible split with an unreproducible augmentation stream is
+enough to move an ablation gap of the size this table reports.
 
 ### Persisted manifest
 
-`save_split_manifest()` (`moe_finetune.py:147-167`) writes
-`split_manifest.npz` into the run's `save_path` containing:
+`save_split_manifest()` writes `split_manifest.npz` into the run's `save_path`:
 
 ```text
 test_indices
-seed_type_to_idx, subvariety_to_idx      # name -> index mappings
-subvariety_to_seed_type                   # the KL mapping's source list
+seed_type_to_idx, subvariety_to_idx            # name -> index mappings
+subvariety_to_seed_type                        # the KL mapping's source list
+source_groups                                  # the provenance key, per sample
+split_protocol                                 # "grouped" | "stratified"
 fold_{n}_train_indices, fold_{n}_val_indices   # per fold
 ```
 
-so an evaluation can be reproduced later without re-deriving the split.
+`source_groups` is persisted so a reviewer can verify the grouping rather than
+trust the protocol name.
 
 ### Loaders
 
-`make_loader(indices, shuffle, drop_last=False)` (`moe_finetune.py:785-793`)
-wraps `Subset(dataset, indices)` in a `DataLoader` with
-`batch_size=data.batch_size` (16, Table 1), `num_workers=data.num_workers`,
-and `pin_memory` gated on CUDA. Training loaders shuffle and honor
-`data.drop_last`; validation/test loaders never shuffle or drop.
+`make_loader(indices, shuffle, drop_last=False, train=False)` wraps
+`Subset(dataset, indices)` in a `DataLoader` with `batch_size=data.batch_size`,
+`num_workers=data.num_workers`, `pin_memory` gated on CUDA, and the seeded
+generator plus `worker_init_fn`. Training loaders shuffle and honor
+`data.drop_last`; validation and test loaders never shuffle or drop, and read a
+**separate dataset instance carrying the deterministic transform** — otherwise
+validation numbers would be augmentation noise rather than measurements.
+
+`experiment.training.balanced_sampler` swaps shuffling for an inverse-frequency
+`WeightedRandomSampler` over sub-varieties. The hierarchy is 13 rice + 8 millet +
+3 + 3, so seed-type accuracy is structurally rice-dominated; macro-F1 is reported
+either way, but this is the option that trains for it.
 
 ## 3. Augmentation
 
@@ -199,21 +271,38 @@ carried by the *crop scale*, not the final tensor size — both views end up
 node, popping `local_crop_size` since that key lives one level up on the
 `data` node, not inside `augmentation`.
 
-### Stage 2 — supervised transforms (`transforms.py:203-227`)
+### Stage 2 — supervised transforms (`transforms.py`)
 
 ```python
 get_supervised_transforms(image_size, train=True, normalize_mean=..., normalize_std=...,
-                           horizontal_flip_prob=0.0)
+                          horizontal_flip_prob=0.5,
+                          random_resized_crop_scale=(0.8, 1.0),
+                          vertical_flip_prob=0.0, rotation_degrees=0.0)
 ```
 
-A deterministic `Resize(image_size, BICUBIC)` → optional
-`RandomHorizontalFlip` (default probability **0.0** —
-`experiment.training.horizontal_flip_prob`) → `ToTensor` → `Normalize`.
+Training: `RandomResizedCrop((H, W), scale=(0.8, 1.0))` -> `RandomHorizontalFlip(0.5)`
+-> `ToTensor` -> `Normalize`. Evaluation: `Resize((H, W))` -> `ToTensor` ->
+`Normalize`, always deterministic.
 
-This is intentionally minimal: by stage 2 the representation is already
-invariant from DINO pretraining, and the fine-grained visual cues that
-separate 27 sub-varieties are exactly the ones heavy augmentation would
-destroy.
+**The resize takes an explicit `(H, W)` tuple, and that is load-bearing.**
+`T.Resize(int)` resizes the shorter side and preserves aspect ratio; only 3.4 %
+of these crops are square, so the integer form would emit variable-width tensors
+and `default_collate` would raise on the first mixed batch. The tuple squashes
+every crop to a square instead — a real aspect-ratio distortion, chosen
+deliberately over a latent crash, and stated at the call site.
+
+**Why the defaults changed.** The submitted default was `horizontal_flip_prob:
+0.0` and nothing else, so stage-2 training saw each image exactly once per epoch,
+deterministically. The stated rationale — that the representation is already
+invariant from stage 1 — is a good argument against *heavy* augmentation but not
+against any: SSL invariance of the frozen **encoder** says nothing about the
+sample efficiency of the **head**, which is ~9 M freshly-initialised parameters
+fit from ~7.5 k training images.
+
+`wo_stage2_augmentation` reproduces the submitted pipeline as an ablation,
+because "does stage-2 augmentation help when the encoder is frozen?" is a
+legitimate question whose answer belongs in the paper rather than in a config
+default.
 
 Both pipelines normalize with ImageNet statistics —
 `mean=(0.485, 0.456, 0.406)`, `std=(0.229, 0.224, 0.225)` — for compatibility

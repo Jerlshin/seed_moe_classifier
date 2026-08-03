@@ -36,17 +36,60 @@ def checkpoint(tmp_path) -> Path:
 # ----------------------------------------------------------- suite definitions
 
 
-def test_ablation_suite_covers_the_six_requested_variants():
-    from scripts.run_ablations import ABLATION_VARIANTS
+def test_ablation_suite_keeps_every_originally_requested_variant():
+    """The submitted six must all survive, so the revision stays comparable."""
+    from scripts.run_ablations import VARIANTS_BY_NAME
 
-    assert [spec.name for spec in ABLATION_VARIANTS] == [
-        "full_model",
-        "wo_moe",
-        "wo_arcface",
-        "wo_residual",
-        "wo_kl",
-        "wo_cross_attn",
-    ]
+    for name in ("full_model", "wo_moe", "wo_residual", "wo_kl", "wo_cross_attn"):
+        assert name in VARIANTS_BY_NAME
+    # `wo_arcface` was renamed, because it never measured what its name claimed:
+    # swapping ArcFace for a plain Linear removes the margin AND the embedding
+    # normalisation AND the centre normalisation AND the logit scale.
+    assert "wo_arcface" not in VARIANTS_BY_NAME
+    assert "wo_angular_head" in VARIANTS_BY_NAME
+
+
+def test_confounded_ablations_have_single_factor_counterparts():
+    """Only ``wo_kl`` and ``wo_cross_attn`` were ever one-factor changes.
+
+    Each confounded toggle now has a control that isolates the factor its name
+    claims, so the table can attribute rather than assert.
+    """
+    from scripts.run_ablations import VARIANTS_BY_NAME
+
+    controls = {
+        # routing, holding active capacity fixed
+        "wo_moe_capacity_matched": "model.head.dense_capacity_multiplier=2",
+        # learned routing, holding sparse capacity fixed
+        "moe_fixed_router": "model.head.router_mode=hash",
+        # the angular margin alone, keeping the hypersphere geometry
+        "wo_margin_only": "model.head.sub_head_variant=normface",
+    }
+    for name, expected in controls.items():
+        assert name in VARIANTS_BY_NAME, f"missing single-factor control {name}"
+        assert expected in VARIANTS_BY_NAME[name].overrides
+
+
+def test_leakage_ablation_is_present_and_changes_only_the_split():
+    """Quantifying the crop-level leak is a result, not a cleanup step."""
+    from scripts.run_ablations import VARIANTS_BY_NAME
+
+    spec = VARIANTS_BY_NAME["leakage_ungrouped"]
+    assert spec.overrides == ["experiment.training.split_protocol=stratified"]
+
+
+def test_seed_expansion_gives_every_variant_its_own_directory():
+    """Repeated seeds must not overwrite each other's summary.json."""
+    from src.trainers.runner import DEFAULT_SEEDS, VariantSpec, expand_seeds
+
+    specs = expand_seeds([VariantSpec("full_model", "reference")], DEFAULT_SEEDS)
+    assert len(specs) == len(DEFAULT_SEEDS) == 5
+
+    root = Path("/tmp/outputs")
+    paths = {spec.save_path(root) for spec in specs}
+    assert len(paths) == len(specs)
+    assert all(path.name.startswith("seed") for path in paths)
+    assert all(f"seed={spec.seed}" in build_command(spec, spec.save_path(root), None) for spec in specs)
 
 
 def test_full_model_variant_overrides_nothing():
@@ -60,7 +103,6 @@ def test_full_model_variant_overrides_nothing():
     ("variant", "flag"),
     [
         ("wo_moe", "use_moe"),
-        ("wo_arcface", "use_arcface"),
         ("wo_residual", "use_residual"),
         ("wo_kl", "use_kl_loss"),
         ("wo_cross_attn", "use_cross_attention"),
@@ -75,13 +117,23 @@ def test_each_ablation_disables_exactly_one_component(variant, flag):
     )
 
 
-def test_baseline_suite_covers_the_three_requested_models():
+def test_baseline_suite_covers_the_requested_models_plus_the_missing_controls():
+    """The three submitted baselines, plus the two the suite could not do without.
+
+    ``linear_probe`` answers the question a reviewer asks before any other --
+    does the head machinery beat a linear layer on the same frozen features? --
+    and ``hierarchical_cce`` is not that control, because it keeps the residual
+    and the SubVarietyEmbedding MLP. ``swinv2_supervised`` is the only variant
+    that separates in-domain self-supervision from the architecture.
+    """
     from scripts.run_baselines import BASELINE_VARIANTS
 
     assert sorted(spec.name for spec in BASELINE_VARIANTS) == [
         "hierarchical_cce",
+        "linear_probe",
         "resnet50",
         "swin_tiny",
+        "swinv2_supervised",
     ]
     for spec in BASELINE_VARIANTS:
         assert spec.experiment.startswith("baseline_")

@@ -63,14 +63,21 @@ REQUESTED_COLUMNS = [
 
 #: Additional context appended to the right of the requested columns.
 EXTRA_COLUMNS = [
+    "Seeds",
+    "p (vs full)",
+    "p (Holm)",
     "Seed-Type Accuracy",
     "Seed-Type Macro F1",
     "Sub-Variety AUC (macro OvR)",
+    "ECE",
+    "Expert NMI (sub-variety)",
+    "Dead Experts",
     "Experts",
     "Top-K",
     "Throughput (FPS)",
     "GFLOPs/sample",
     "Peak Memory (MB)",
+    "Split Protocol",
     "Group",
     "Run Directory",
 ]
@@ -94,7 +101,24 @@ class RunSummary:
     metrics: dict[str, float] = field(default_factory=dict)
     efficiency: dict[str, Any] = field(default_factory=dict)
     history: dict[str, list[float]] = field(default_factory=dict)
-    component_flags: dict[str, bool] = field(default_factory=dict)
+    component_flags: dict[str, Any] = field(default_factory=dict)
+    loss_flags: dict[str, Any] = field(default_factory=dict)
+    """Every loss-side setting a variant can move. Without this a ``wo_kl`` run's
+    machine-readable trace was byte-identical to ``full_model``'s -- only the
+    variant name distinguished them, which is exactly the kind of implicit
+    difference this repository otherwise refuses to tolerate."""
+
+    split: dict[str, Any] = field(default_factory=dict)
+    """Split protocol, seed, and the dataset's provenance diagnostics. The
+    headline accuracy is uninterpretable without knowing whether crops of the
+    same source photograph could appear on both sides of the boundary."""
+
+    fold_metrics: dict[str, dict[str, float]] = field(default_factory=dict)
+    """``{metric: {mean, std, min, max, folds}}`` across cross-validation folds.
+    Reporting the *best* fold's test score is a selection procedure whose
+    expected value exceeds a single fold's, so the mean is what the table uses;
+    the best fold is kept only for the artifact that gets shipped."""
+
     config: dict[str, Any] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)
 
@@ -157,29 +181,40 @@ class RunSummary:
             "Total Params (M)": self._efficiency("parameters", "total_millions"),
             "Active Params (M)": self._efficiency("parameters", "active_millions"),
             "Inference Latency (ms)": latency.get("latency_ms_per_sample"),
+            "Seeds": 1,
+            "p (vs full)": None,
+            "p (Holm)": None,
             "Seed-Type Accuracy": self._metric("seed_type/accuracy"),
             "Seed-Type Macro F1": self._metric("seed_type/f1_macro"),
             "Sub-Variety AUC (macro OvR)": self._metric("sub_variety/auc_macro_ovr"),
+            "ECE": self._metric("calibration/ece"),
+            "Expert NMI (sub-variety)": self._metric("moe/nmi_sub_variety"),
+            "Dead Experts": self._metric("moe/dead_experts"),
             "Experts": self._efficiency("parameters", "num_experts"),
             "Top-K": self._efficiency("parameters", "top_k"),
             "Throughput (FPS)": latency.get("throughput_fps"),
             "GFLOPs/sample": self._efficiency("gflops_per_sample"),
             "Peak Memory (MB)": self._efficiency("peak_memory_mb"),
+            "Split Protocol": self.split.get("protocol", ""),
             "Group": self.group,
             "Run Directory": self.run_dir,
         }
 
 
 def collect_run_summaries(roots: Iterable[str | Path]) -> list[RunSummary]:
-    """Load every ``summary.json`` found under ``roots``, sorted by group then name."""
+    """Load every ``summary.json`` found under ``roots``, sorted by group then name.
+
+    Globs three directory levels, which is what the multi-seed layout
+    ``outputs/{group}/{variant}/seed{n}/`` needs.
+    """
     summaries: list[RunSummary] = []
     for root in roots:
         base = Path(root)
         if not base.exists():
             continue
         candidates = [base / SUMMARY_FILENAME] if (base / SUMMARY_FILENAME).exists() else []
-        candidates.extend(sorted(base.glob(f"*/{SUMMARY_FILENAME}")))
-        candidates.extend(sorted(base.glob(f"*/*/{SUMMARY_FILENAME}")))
+        for depth in ("*", "*/*", "*/*/*"):
+            candidates.extend(sorted(base.glob(f"{depth}/{SUMMARY_FILENAME}")))
         for path in dict.fromkeys(candidates):  # de-duplicate, keep order
             try:
                 summaries.append(RunSummary.load(path))
@@ -188,26 +223,163 @@ def collect_run_summaries(roots: Iterable[str | Path]) -> list[RunSummary]:
     return sorted(summaries, key=lambda summary: (summary.group, summary.name))
 
 
+# ------------------------------------------------------------- multi-seed table
+
+
+def _mean_std(values: Sequence[float]) -> tuple[float, float]:
+    finite = [float(value) for value in values if value == value]
+    if not finite:
+        return float("nan"), float("nan")
+    mean = sum(finite) / len(finite)
+    if len(finite) == 1:
+        return mean, 0.0
+    variance = sum((value - mean) ** 2 for value in finite) / (len(finite) - 1)
+    return mean, variance**0.5
+
+
+def aggregate_by_variant(summaries: Sequence[RunSummary]) -> list[dict[str, Any]]:
+    """Collapse repeated seeds of one variant into a single mean +- std row.
+
+    Why this exists, stated concretely. On a 1,871-image test split at ~95 %
+    accuracy the 95 % CI half-width on a *single* accuracy is +-0.99 pp, and on a
+    *difference* of two accuracies +-1.40 pp -- before any training-seed variance
+    (dropout, shuffling, router initialisation, and for a MoE specifically, which
+    experts happen to win the early race). For a 27-class fine-grained task where
+    component contributions of 0.5--2 pp are the normal magnitude, a single run
+    per variant cannot resolve the table it is being asked to support.
+
+    Rows carry ``{column}`` (the mean) and ``{column} SD``, plus ``Seeds``.
+    """
+    grouped: dict[tuple[str, str], list[RunSummary]] = {}
+    for summary in summaries:
+        grouped.setdefault((summary.group, summary.name), []).append(summary)
+
+    rows: list[dict[str, Any]] = []
+    for (group, name), runs in sorted(grouped.items()):
+        per_run = [run.as_row() for run in runs]
+        row: dict[str, Any] = dict(per_run[0])
+
+        for column in REQUESTED_COLUMNS + EXTRA_COLUMNS:
+            values = [entry.get(column) for entry in per_run]
+            numeric = [value for value in values if isinstance(value, (int, float))]
+            if len(numeric) != len(values) or not numeric:
+                continue
+            mean, std = _mean_std(numeric)
+            row[column] = mean
+            if len(runs) > 1:
+                row[f"{column} SD"] = std
+
+        # Set after the averaging loop: `Seeds` is a count of the runs, not a
+        # per-run measurement to average (every run reports 1).
+        row["Seeds"] = len(runs)
+        row["Group"] = group
+        row["Model/Variant"] = name
+        row["Run Directory"] = "; ".join(sorted(run.run_dir for run in runs))
+        rows.append(row)
+    return rows
+
+
+def paired_significance(
+    prediction_paths: dict[str, Sequence[str | Path]],
+    reference: str = "full_model",
+    task: str = "sub",
+) -> dict[str, dict[str, float]]:
+    """McNemar's exact test of every variant against ``reference``.
+
+    Every variant in a suite trains on the byte-identical split, so their test
+    predictions are **paired** -- which makes McNemar both valid and strictly
+    more powerful than comparing independent confidence intervals, and it needs
+    nothing beyond the ``test_predictions.npz`` files already on disk.
+
+    Multi-seed runs are pooled by concatenating each variant's predictions in a
+    fixed seed order; that keeps the pairing intact as long as every variant ran
+    the same seeds, which the suite scripts guarantee.
+
+    Args:
+        prediction_paths: ``{variant: [test_predictions.npz, ...]}``.
+        reference: Variant every other is compared against.
+        task: ``"sub"`` or ``"seed"``.
+    """
+    from src.utils.metrics import holm_bonferroni, mcnemar_test
+
+    def correctness(paths: Sequence[str | Path]) -> np.ndarray | None:
+        chunks = []
+        for path in sorted(str(item) for item in paths):
+            try:
+                payload = load_test_predictions(path)
+            except (OSError, ValueError):
+                return None
+            true_key, pred_key = (f"{task}_true", f"{task}_pred")
+            if true_key not in payload or pred_key not in payload:
+                return None
+            chunks.append(payload[true_key] == payload[pred_key])
+        return np.concatenate(chunks) if chunks else None
+
+    if reference not in prediction_paths:
+        return {}
+    reference_correct = correctness(prediction_paths[reference])
+    if reference_correct is None:
+        return {}
+
+    results: dict[str, dict[str, float]] = {}
+    for variant, paths in prediction_paths.items():
+        if variant == reference:
+            continue
+        variant_correct = correctness(paths)
+        if variant_correct is None or variant_correct.size != reference_correct.size:
+            continue
+        outcome = mcnemar_test(reference_correct, variant_correct)
+        if outcome:
+            results[variant] = outcome
+
+    adjusted = holm_bonferroni({name: value["p_value"] for name, value in results.items()})
+    for name, value in adjusted.items():
+        results[name]["p_value_holm"] = value
+    return results
+
+
 def write_summary_csv(
     path: str | Path,
     summaries: Sequence[RunSummary],
     float_format: str = "{:.4f}",
+    aggregate: bool = True,
+    significance: Mapping[str, Mapping[str, float]] | None = None,
 ) -> str:
     """Write the comparison table and return its path.
 
     Missing measurements are written as empty cells rather than ``nan``: a blank
     reads unambiguously as "not measured", whereas ``nan`` in a results table
     invites a reader to treat it as a failed run.
+
+    Args:
+        path: Destination CSV.
+        summaries: Loaded run summaries.
+        float_format: Numeric formatting.
+        aggregate: Collapse repeated seeds of a variant into mean +- SD. Set
+            ``False`` for the per-run table.
+        significance: ``{variant: {p_value, p_value_holm, ...}}`` from
+            :func:`paired_significance`, filled into the ``p (vs full)`` and
+            ``p (Holm)`` columns.
     """
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    columns = REQUESTED_COLUMNS + EXTRA_COLUMNS
+
+    rows = aggregate_by_variant(summaries) if aggregate else [summary.as_row() for summary in summaries]
+    for row in rows:
+        outcome = (significance or {}).get(str(row.get("Model/Variant")))
+        if outcome:
+            row["p (vs full)"] = outcome.get("p_value")
+            row["p (Holm)"] = outcome.get("p_value_holm")
+
+    columns = list(REQUESTED_COLUMNS + EXTRA_COLUMNS)
+    # Standard deviations sit immediately right of the column they qualify.
+    extra = [key for row in rows for key in row if key not in columns]
+    columns.extend(sorted(dict.fromkeys(extra)))
 
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         writer.writeheader()
-        for summary in summaries:
-            row = summary.as_row()
+        for row in rows:
             writer.writerow({column: _format_cell(row.get(column), float_format) for column in columns})
     return str(output)
 
@@ -237,9 +409,19 @@ def save_test_predictions(
     sub_scores: np.ndarray | None = None,
     embeddings: np.ndarray | None = None,
     expert_indices: np.ndarray | None = None,
+    sub_logits: np.ndarray | None = None,
+    tokens_per_sample: int = 1,
     filename: str = PREDICTIONS_FILENAME,
 ) -> str:
-    """Persist raw held-out predictions so figures can be regenerated offline."""
+    """Persist raw held-out predictions so figures can be regenerated offline.
+
+    ``sub_logits`` are stored alongside ``sub_scores`` because temperature
+    scaling has to be fitted on logits; recovering them from float32 softmax
+    output is not reliable. ``tokens_per_sample`` records how many routing
+    decisions each image contributed, which is what lets
+    :func:`~src.utils.metrics.expert_label_nmi` line ``expert_indices`` up with
+    the labels under grid routing.
+    """
     output = Path(directory) / filename
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -251,9 +433,12 @@ def save_test_predictions(
         "seed_type_names": np.array(list(seed_type_names), dtype=object),
         "subvariety_names": np.array(list(sub_variety_names), dtype=object),
         "subvariety_to_seed_type": np.asarray(list(subvariety_to_seed_type), dtype=np.int64),
+        "tokens_per_sample": np.asarray(int(tokens_per_sample), dtype=np.int64),
     }
     if sub_scores is not None:
         payload["sub_scores"] = np.asarray(sub_scores, dtype=np.float32)
+    if sub_logits is not None:
+        payload["sub_logits"] = np.asarray(sub_logits, dtype=np.float32)
     if embeddings is not None:
         payload["embeddings"] = np.asarray(embeddings, dtype=np.float32)
     if expert_indices is not None:

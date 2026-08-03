@@ -1,12 +1,22 @@
 #!/usr/bin/env python
 """Run the supervised and simple-hierarchical baselines.
 
-    python scripts/run_baselines.py                          # all three
+    python scripts/run_baselines.py                          # all five
     python scripts/run_baselines.py --models resnet50
     python scripts/run_baselines.py --dry-run
     python scripts/run_baselines.py -- experiment.training.epochs=30
 
-Three reference points, each answering a different question:
+Five reference points, each answering a different question:
+
+``linear_probe``
+    Frozen self-supervised encoder plus two linear heads, plain CE. The
+    cheapest possible read of what stage 1 alone learned, with no head
+    machinery to credit or blame.
+
+``swinv2_supervised``
+    ImageNet SwinV2-Base with the full hierarchical head, but no self-supervised
+    stage at all. Isolates what DINO pretraining contributes while holding the
+    encoder family and head architecture fixed.
 
 ``resnet50``
     ImageNet-pretrained ResNet-50, trained end to end. The conventional CNN
@@ -22,12 +32,13 @@ Three reference points, each answering a different question:
     cross-attention or ArcFace. Answers how much comes from being hierarchical
     at all, as opposed to from the specific machinery on top. It reuses the
     proposed model's encoder and code path with toggles flipped, so it is the
-    tightest of the three controls.
+    tightest of the five controls.
 
-Results land in ``outputs/baselines/{model}/``. The two end-to-end baselines own
-their backbones and therefore ignore the DINOv2 checkpoint by design;
-``hierarchical_cce`` reads the same shared encoder as the ablation suite, which
-is what keeps it comparable with the full model.
+Results land in ``outputs/baselines/{model}/``. ``resnet50``, ``swin_tiny`` and
+``swinv2_supervised`` own their backbones and therefore ignore the DINOv2
+checkpoint by design; ``linear_probe`` and ``hierarchical_cce`` read the same
+shared encoder as the ablation suite, which is what keeps them comparable with
+the full model.
 
 Build the combined table afterwards with ``python scripts/generate_plots.py``.
 """
@@ -43,9 +54,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.trainers.runner import (
+    DEFAULT_SEEDS,
     VariantSpec,
     default_checkpoint_path,
     ensure_pretrained_checkpoint,
+    expand_seeds,
     output_root,
     print_summary,
     run_suite,
@@ -53,6 +66,18 @@ from src.trainers.runner import (
 )
 
 BASELINE_VARIANTS: list[VariantSpec] = [
+    VariantSpec(
+        name="linear_probe",
+        description="Frozen self-supervised encoder + two linear layers, plain CE",
+        group="baseline",
+        experiment="baseline_linear_probe",
+    ),
+    VariantSpec(
+        name="swinv2_supervised",
+        description="ImageNet SwinV2-Base + the full hierarchical head, no self-supervised stage",
+        group="baseline",
+        experiment="baseline_swinv2_supervised",
+    ),
     VariantSpec(
         name="resnet50",
         description="ImageNet-pretrained ResNet-50, supervised end to end",
@@ -75,8 +100,18 @@ BASELINE_VARIANTS: list[VariantSpec] = [
 
 VARIANTS_BY_NAME = {spec.name: spec for spec in BASELINE_VARIANTS}
 
-#: Baselines that own their backbone and must not be handed the DINOv2 encoder.
-END_TO_END_BASELINES = {"resnet50", "swin_tiny"}
+#: Baselines that own their backbone and must not be handed the self-supervised
+#: encoder. A SwinV2 state dict would at best be ignored by a ResNet and at worst
+#: partially loaded; `swinv2_supervised` is the shape-compatible case and is
+#: excluded deliberately, since its whole purpose is to NOT read stage 1.
+END_TO_END_BASELINES = {"resnet50", "swin_tiny", "swinv2_supervised"}
+
+#: Learning rates swept per end-to-end baseline. A single shared value cannot be
+#: right for both end-to-end ImageNet fine-tuning and frozen-encoder head
+#: training, and "our method wins against an under-tuned baseline" is the most
+#: common objection any comparison table attracts. Six extra runs remove it.
+LR_SWEEP = (1e-5, 3e-5, 1e-4)
+SWEEPABLE = {"resnet50", "swin_tiny"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +133,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Proceed when the shared encoder is absent. Only hierarchical_cce needs it.",
     )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=list(DEFAULT_SEEDS),
+        help="Training seeds to repeat every baseline over (default: 42-46).",
+    )
+    parser.add_argument(
+        "--lr-sweep",
+        action="store_true",
+        help="Also sweep {1e-5, 3e-5, 1e-4} for resnet50 and swin_tiny, reporting each one's best. "
+        "Removes the under-tuned-baseline objection.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the commands without running them.")
     parser.add_argument("--stop-on-failure", action="store_true", help="Abort at the first failure.")
     parser.add_argument(
@@ -111,12 +159,32 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     root = Path(args.output_root) if args.output_root else output_root()
-    specs = [VARIANTS_BY_NAME[name] for name in args.models]
+    selected = [VARIANTS_BY_NAME[name] for name in args.models]
+    if args.lr_sweep:
+        expanded: list[VariantSpec] = []
+        for spec in selected:
+            if spec.name not in SWEEPABLE:
+                expanded.append(spec)
+                continue
+            for lr in LR_SWEEP:
+                expanded.append(
+                    VariantSpec(
+                        name=f"{spec.name}_lr{lr:g}",
+                        description=f"{spec.description} (lr={lr:g})",
+                        overrides=[*spec.overrides, f"experiment.training.learning_rate={lr}"],
+                        group=spec.group,
+                        experiment=spec.experiment,
+                    )
+                )
+        selected = expanded
+    specs = expand_seeds(selected, args.seeds)
     extra = [item for item in args.overrides if item != "--"]
 
     # Only resolve the shared encoder if a selected baseline actually consumes
     # it; requiring it to run ResNet-50 would be a pointless barrier.
-    needs_encoder = any(spec.name not in END_TO_END_BASELINES for spec in specs)
+    needs_encoder = any(
+        not any(spec.name.startswith(name) for name in END_TO_END_BASELINES) for spec in specs
+    )
     checkpoint = None
     if needs_encoder:
         checkpoint = ensure_pretrained_checkpoint(
@@ -129,7 +197,10 @@ def main() -> int:
             # encoder raises when it is absent, so say "none" explicitly.
             extra = [*extra, "model.backbone.checkpoint_path=null"]
 
-    print(f"Baseline suite: {len(specs)} models -> {root / 'baselines'}")
+    print(
+        f"Baseline suite: {len(selected)} models x {len(args.seeds)} seeds "
+        f"= {len(specs)} runs -> {root / 'baselines'}"
+    )
     if extra:
         print(f"Extra overrides: {' '.join(extra)}")
 
@@ -138,7 +209,11 @@ def main() -> int:
         # An end-to-end baseline builds its own ImageNet backbone. Passing it a
         # SwinV2 DINO checkpoint would be meaningless at best and a silent
         # partial load at worst.
-        spec_checkpoint = None if spec.name in END_TO_END_BASELINES else checkpoint
+        spec_checkpoint = (
+            None
+            if any(spec.name.startswith(name) for name in END_TO_END_BASELINES)
+            else checkpoint
+        )
         results.extend(
             run_suite(
                 [spec],

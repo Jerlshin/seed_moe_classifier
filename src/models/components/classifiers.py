@@ -1,7 +1,7 @@
 """Stage-1 seed-type classifier and the stage-2 sub-variety embedding network.
 
-Paper Section 5.1 (Eqs. 5-6) defines stage 1 as a plain MLP over the DINOv2
-embedding::
+Paper Section 5.1 (Eqs. 5-6) defines stage 1 as a plain MLP over the
+self-supervised embedding::
 
     s   = g(z),          s in R^4
     p_s = softmax(s)
@@ -54,6 +54,10 @@ class SeedTypeClassifier(nn.Module):
             raise ValueError(f"variant must be one of {SEED_CLASSIFIER_VARIANTS}, got {variant!r}")
         self.variant = variant
         hidden_dim = max(int(feature_dim * hidden_ratio), 1)
+        #: Width of the pre-logit activation. FiLM fusion conditions on this
+        #: rather than on ``p_s``, because a 4-way softmax saturates to one of
+        #: four one-hot vectors and takes its own Jacobian to zero with it.
+        self.hidden_dim = hidden_dim
 
         self.fc1 = nn.Linear(feature_dim, hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -77,17 +81,26 @@ class SeedTypeClassifier(nn.Module):
             )
             self.stochastic_depth = nn.Dropout(p=min(dropout_rate, 0.1))
 
+    def forward_with_hidden(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(logits, hidden)``.
+
+        ``hidden`` is the activation immediately before the classifier layer --
+        pre-softmax and ``hidden_dim``-wide -- which is what FiLM conditioning
+        consumes.
+        """
+        hidden = self.dropout1(self.act1(self.norm1(self.fc1(x))))
+        if self.variant == "mlp":
+            return self.fc2(hidden), hidden
+        hidden = hidden * self.se(hidden)
+        hidden = self.gate(hidden) * hidden
+        return self.fc2(self.stochastic_depth(hidden)), hidden
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return seed-type logits ``s`` of shape ``[batch, num_seed_types]``."""
-        x = self.dropout1(self.act1(self.norm1(self.fc1(x))))
-        if self.variant == "mlp":
-            return self.fc2(x)
-        x = x * self.se(x)
-        x = self.gate(x) * x
-        return self.fc2(self.stochastic_depth(x))
+        return self.forward_with_hidden(x)[0]
 
     def extra_repr(self) -> str:
-        return f"variant={self.variant}"
+        return f"variant={self.variant}, hidden_dim={self.hidden_dim}"
 
 
 class SubVarietyEmbedding(nn.Module):

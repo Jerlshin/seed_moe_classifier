@@ -93,7 +93,7 @@ centering follows `C_t = 0.9·C_{t−1} + 0.1·q̄`; and that a student matching
 teacher attains the teacher's entropy, the loss's true lower bound.
 
 **Suite integrity.** Each ablation variant must change exactly one override; no
-two variants may share an output directory; and every DINOv2-path variant must
+two variants may share an output directory; and every self-supervised-path variant must
 reference the same encoder checkpoint. A suite that violated any of these would
 still run to completion and produce a table that looked entirely normal.
 

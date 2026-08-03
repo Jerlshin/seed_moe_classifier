@@ -23,8 +23,29 @@ experiment:
     epochs: 100
     max_batches: null
 
+    # -----------------------------------------------------------------------
+    # Split protocol. "grouped" keeps every crop of one source photograph on one
+    # side of the boundary; "stratified" is the submitted crop-level split.
+    #
+    # This is not a stylistic choice here. The 9,357 crops under
+    # Cropped_Samples come from 81 source photographs -- a mean of 115 crops per
+    # source -- so crop-level splitting puts near-duplicate views of the same
+    # physical seeds (same lighting, same background, overlapping bounding boxes)
+    # on both sides, and the reported accuracy is substantially a memorisation
+    # score. The trainer logs how many source photographs straddle the boundary
+    # under either protocol.
+    #
+    # Known limit the protocol cannot fix: 5 of 27 sub-varieties have crops from
+    # exactly ONE photograph, so no grouped split can place them on both sides.
+    # `leakage_ungrouped` in run_ablations.py measures the delta between the two
+    # protocols, which is a result worth reporting rather than a fix to hide.
+    # -----------------------------------------------------------------------
+    split_protocol: "grouped"
+
     # Section 6.2 reports "consistent performance across all folds"; set
-    # num_folds > 1 to switch from a single split to StratifiedKFold.
+    # num_folds > 1 to switch to StratifiedGroupKFold. Fold test metrics are
+    # aggregated as mean +- std, NOT taken from the best fold -- a maximum over
+    # K folds has a higher expected value than a single draw.
     num_folds: 1
     test_size: 0.2
 
@@ -32,7 +53,32 @@ experiment:
     weight_decay: 0.0001
     clip_grad: 3.0
     amp: false                     # only honoured on CUDA
-    horizontal_flip_prob: 0.0
+
+    # -----------------------------------------------------------------------
+    # Stage-2 augmentation. The submitted default was flip p=0.0 and nothing
+    # else, i.e. each image seen exactly once per epoch, deterministically. SSL
+    # invariance of the frozen *encoder* says nothing about the sample efficiency
+    # of the *head*, which is ~9 M fresh parameters fit from ~7.5 k images.
+    # Set random_resized_crop_scale: null and horizontal_flip_prob: 0.0 to
+    # reproduce the submitted configuration (the `wo_stage2_augmentation`
+    # ablation does exactly that).
+    # -----------------------------------------------------------------------
+    horizontal_flip_prob: 0.5
+    random_resized_crop_scale: [0.8, 1.0]
+    vertical_flip_prob: 0.0
+    rotation_degrees: 0.0
+
+    # Inverse-frequency sampling over sub-varieties. The hierarchy is 13 rice +
+    # 8 millet + 3 + 3, so seed-type accuracy is structurally rice-dominated.
+    # Macro-F1 is reported either way; this is the option that trains for it.
+    balanced_sampler: false
+
+    # Fraction of training over which the ArcFace margin ramps 0 -> m. Full
+    # margin from step 0 is a documented convergence hazard on small backbones
+    # and small datasets.
+    margin_warmup_fraction: 0.15
+    # Fraction over which router gating noise anneals to exactly zero.
+    router_noise_fraction: 0.3
 
     save_interval: 50
     keep_last_n_checkpoints: 1
@@ -62,5 +108,11 @@ experiment:
     # batch_sizes[0] doubles as the FLOP-counting batch, so keep 1 first to get
     # a clean per-sample figure.
     batch_sizes: [1, 8, 32]
-    warmup: 3
-    iterations: 10
+    # 50 timed iterations, reported as median + IQR. Ten iterations on a
+    # contended device gives a mean with no dispersion estimate at all. The
+    # sweep also tiles from real, DISTINCT test images: identical rows produce
+    # identical routing, hence exactly K expert kernels for the whole batch,
+    # which understates sparse-dispatch overhead exactly where batch 32 is
+    # meant to measure it.
+    warmup: 5
+    iterations: 50

@@ -191,12 +191,38 @@ def test_csv_writes_blanks_rather_than_nan(tmp_path):
     assert "None" not in text
 
 
-def test_csv_holds_one_row_per_run(tmp_path):
+def test_per_run_csv_holds_one_row_per_run(tmp_path):
     summaries = [make_summary("full_model"), make_summary("wo_moe"), make_summary("wo_kl")]
-    path = write_summary_csv(tmp_path / "summary_metrics.csv", summaries)
+    path = write_summary_csv(
+        tmp_path / "summary_metrics.csv", summaries, aggregate=False
+    )
     with open(path, newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert [row["Model/Variant"] for row in rows] == ["full_model", "wo_moe", "wo_kl"]
+
+
+def test_aggregated_csv_collapses_repeated_seeds_into_mean_and_sd(tmp_path):
+    """Five runs of one variant are one row, with a dispersion estimate.
+
+    A single run per variant cannot resolve gaps of the size an ablation table
+    reports: the 95 % CI half-width on a *difference* of two accuracies on this
+    test split is +-1.40 pp, against component contributions of 0.5-2 pp.
+    """
+    summaries = [
+        make_summary("full_model", metrics={"sub_variety/accuracy": 0.90}),
+        make_summary("full_model", metrics={"sub_variety/accuracy": 0.94}),
+        make_summary("wo_moe", metrics={"sub_variety/accuracy": 0.80}),
+    ]
+    path = write_summary_csv(tmp_path / "summary_metrics.csv", summaries)
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = {row["Model/Variant"]: row for row in csv.DictReader(handle)}
+
+    assert set(rows) == {"full_model", "wo_moe"}
+    assert rows["full_model"]["Seeds"] == "2"
+    assert float(rows["full_model"]["Accuracy"]) == pytest.approx(0.92, abs=1e-4)
+    # Sample SD of {0.90, 0.94} is 0.0283.
+    assert float(rows["full_model"]["Accuracy SD"]) == pytest.approx(0.0283, abs=1e-3)
+    assert rows["wo_moe"]["Seeds"] == "1"
 
 
 def test_collect_finds_summaries_one_level_down(tmp_path):

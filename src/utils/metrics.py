@@ -16,6 +16,33 @@ Section 5.2, expert utilisation              :func:`expert_utilization_counts`
 Figs. 8-9, t-SNE of the embeddings           :func:`tsne_projection`
 ===========================================  ===========================================
 
+The revision adds four measurements the submitted suite could not make:
+
+:func:`expert_label_nmi`
+    Utilisation bars show *balance*, not *specialisation*. Normalised mutual
+    information between the routed expert and the label says whether the router
+    learned anything about the task, which is the question Section 5.2's claim
+    actually rests on. Computable from an existing ``test_predictions.npz`` with
+    no retraining.
+
+:func:`expected_calibration_error` / :func:`fit_temperature`
+    ``sub_scores`` are ``softmax(s cos theta)`` and therefore overconfident by
+    construction. A hierarchical classifier's practical value depends on
+    trustworthy confidence, so ECE is reported with a temperature fitted on the
+    validation split.
+
+:func:`mcnemar_test`
+    All variants share a byte-identical test split, so their predictions are
+    *paired* and McNemar's exact test is both valid and more powerful than
+    comparing independent confidence intervals. It is what turns "wo_moe is
+    0.6 pp lower" into a claim. Implemented against ``scipy.stats.binomtest``
+    rather than statsmodels so the reporting path adds no new dependency.
+
+:func:`per_seed_type_breakdown`
+    The hierarchy is 13 rice + 8 millet + 3 + 3, so an overall figure is
+    structurally dominated by rice. This reports each seed type's sub-variety
+    accuracy and macro-F1 separately.
+
 The alignment rate deserves a precise definition, since the paper only names it.
 A prediction is *hierarchically aligned* when the parent seed type of the
 predicted sub-variety equals the independently predicted seed type::
@@ -292,6 +319,241 @@ def expert_utilization_counts(top_k_indices: Any, num_experts: int) -> np.ndarra
     return counts / counts.sum()
 
 
+def expert_label_nmi(
+    expert_indices: Any,
+    labels: Any,
+    tokens_per_sample: int = 1,
+) -> float:
+    """Normalised mutual information between the top-1 expert and the label.
+
+    Balanced utilisation is necessary but not sufficient for the "expert
+    specialisation" the paper claims: six experts each taking a sixth of the
+    traffic at random are perfectly balanced and perfectly uninformative. NMI
+    against the labels is the measurement that separates the two, and it is what
+    makes a seed-conditioned router's effect reportable rather than asserted.
+
+    Args:
+        expert_indices: ``[n, top_k]`` routed expert indices from
+            ``test_predictions.npz``.
+        labels: ``[n_samples]`` seed-type or sub-variety labels.
+        tokens_per_sample: Routing tokens per image. Above 1 (grid routing) the
+            per-image expert is the modal top-1 choice across that image's
+            tokens, since the label is a property of the image, not the token.
+    """
+    from sklearn.metrics import normalized_mutual_info_score
+
+    indices = _as_array(expert_indices)
+    targets = _as_array(labels).reshape(-1)
+    if indices.size == 0 or targets.size == 0:
+        return float("nan")
+    if indices.ndim == 1:
+        indices = indices.reshape(-1, 1)
+
+    top1 = indices[:, 0].astype(np.int64)
+    tokens = max(int(tokens_per_sample), 1)
+    if tokens > 1:
+        if top1.size % tokens != 0:
+            return float("nan")
+        grouped = top1.reshape(-1, tokens)
+        num_experts = int(grouped.max()) + 1
+        counts = np.stack([(grouped == e).sum(axis=1) for e in range(num_experts)], axis=1)
+        top1 = counts.argmax(axis=1)
+
+    if top1.size != targets.size:
+        return float("nan")
+    if np.unique(top1).size < 2 or np.unique(targets).size < 2:
+        # One expert took everything, or one class is present: MI is 0 either
+        # way, and reporting it as such is more useful than reporting nan.
+        return 0.0
+    return float(normalized_mutual_info_score(targets, top1))
+
+
+def fit_temperature(
+    logits: Any,
+    labels: Any,
+    max_iterations: int = 200,
+    learning_rate: float = 0.01,
+) -> float:
+    """Fit a single softmax temperature by NLL (Guo et al., 2017).
+
+    Fitted on **validation** predictions and applied to the test ones; fitting it
+    on the test split would make the resulting ECE meaningless.
+
+    Args:
+        logits: ``[n, num_classes]`` pre-softmax scores.
+        labels: ``[n]`` integer targets.
+    """
+    import torch
+
+    scores = torch.as_tensor(_as_array(logits), dtype=torch.float32)
+    targets = torch.as_tensor(_as_array(labels), dtype=torch.long)
+    if scores.ndim != 2 or scores.shape[0] == 0:
+        return 1.0
+
+    log_temperature = torch.zeros(1, requires_grad=True)
+    optimizer = torch.optim.LBFGS([log_temperature], lr=learning_rate, max_iter=max_iterations)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = torch.nn.functional.cross_entropy(scores / log_temperature.exp(), targets)
+        loss.backward()
+        return loss
+
+    try:
+        optimizer.step(closure)
+    except RuntimeError:
+        return 1.0
+    return float(log_temperature.detach().exp().clamp(0.05, 100.0))
+
+
+def expected_calibration_error(
+    probabilities: Any,
+    labels: Any,
+    num_bins: int = 15,
+) -> dict[str, float]:
+    """Equal-width-binned ECE plus the mean confidence/accuracy gap.
+
+    ``ece`` is the support-weighted mean absolute gap between confidence and
+    accuracy over ``num_bins`` confidence bins. ``overconfidence`` is
+    ``mean(confidence) - accuracy``, signed, which says *which way* the model is
+    miscalibrated -- for a ``softmax(s cos theta)`` head the answer is
+    emphatically positive before temperature scaling.
+    """
+    probs = _as_array(probabilities).astype(np.float64)
+    targets = _as_array(labels).reshape(-1).astype(np.int64)
+    if probs.ndim != 2 or probs.shape[0] == 0 or probs.shape[0] != targets.size:
+        return {}
+
+    confidence = probs.max(axis=1)
+    predictions = probs.argmax(axis=1)
+    correct = (predictions == targets).astype(np.float64)
+
+    edges = np.linspace(0.0, 1.0, int(num_bins) + 1)
+    ece = 0.0
+    for lower, upper in zip(edges[:-1], edges[1:]):
+        mask = (confidence > lower) & (confidence <= upper)
+        if not mask.any():
+            continue
+        ece += mask.mean() * abs(correct[mask].mean() - confidence[mask].mean())
+
+    return {
+        "ece": float(ece),
+        "mean_confidence": float(confidence.mean()),
+        "accuracy": float(correct.mean()),
+        "overconfidence": float(confidence.mean() - correct.mean()),
+    }
+
+
+def mcnemar_test(
+    reference_correct: Any,
+    variant_correct: Any,
+    exact: bool = True,
+) -> dict[str, float]:
+    """McNemar's paired test between two classifiers on the same samples.
+
+    Valid precisely because the ablation suite guarantees a byte-identical test
+    split across variants: the two prediction vectors are paired, so the
+    discordant counts are the whole of the evidence and the concordant ones carry
+    none.
+
+    Args:
+        reference_correct: Boolean per-sample correctness of the reference
+            (normally ``full_model``).
+        variant_correct: Boolean per-sample correctness of the variant.
+        exact: Use the exact binomial test. ``False`` uses the
+            continuity-corrected chi-square approximation, which is only
+            appropriate when ``n01 + n10`` is large.
+
+    Returns ``n01`` (reference right, variant wrong), ``n10`` (the reverse), the
+    p-value, and the accuracy difference. Empty when the inputs disagree in
+    length.
+    """
+    reference = _as_array(reference_correct).reshape(-1).astype(bool)
+    variant = _as_array(variant_correct).reshape(-1).astype(bool)
+    if reference.size == 0 or reference.size != variant.size:
+        return {}
+
+    n01 = int((reference & ~variant).sum())
+    n10 = int((~reference & variant).sum())
+    discordant = n01 + n10
+
+    if discordant == 0:
+        p_value = 1.0
+    elif exact:
+        from scipy.stats import binomtest
+
+        p_value = float(binomtest(min(n01, n10), n=discordant, p=0.5).pvalue)
+    else:
+        from scipy.stats import chi2
+
+        statistic = (abs(n01 - n10) - 1.0) ** 2 / discordant
+        p_value = float(chi2.sf(statistic, df=1))
+
+    return {
+        "n01": float(n01),
+        "n10": float(n10),
+        "discordant": float(discordant),
+        "p_value": p_value,
+        "accuracy_delta": float(variant.mean() - reference.mean()),
+    }
+
+
+def holm_bonferroni(p_values: dict[str, float]) -> dict[str, float]:
+    """Holm-Bonferroni step-down adjustment over a family of comparisons.
+
+    Six ablations each tested against the full model is six chances to find a
+    difference; without correction the family-wise error rate is around 26 % at
+    nominal 0.05.
+    """
+    if not p_values:
+        return {}
+    ordered = sorted(p_values.items(), key=lambda item: item[1])
+    total = len(ordered)
+    adjusted: dict[str, float] = {}
+    running = 0.0
+    for rank, (name, value) in enumerate(ordered):
+        running = max(running, min(1.0, (total - rank) * float(value)))
+        adjusted[name] = running
+    return adjusted
+
+
+def per_seed_type_breakdown(
+    sub_true: Any,
+    sub_pred: Any,
+    subvariety_to_seed_type: Sequence[int],
+    seed_type_names: Sequence[str] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Sub-variety accuracy and macro-F1 within each seed type.
+
+    13 of 27 sub-varieties are rice, so an overall macro-F1 still lets the
+    largest branch dominate the impression the table gives. This makes each
+    branch's difficulty visible separately.
+    """
+    from sklearn.metrics import accuracy_score, f1_score
+
+    true = _as_array(sub_true).reshape(-1).astype(np.int64)
+    pred = _as_array(sub_pred).reshape(-1).astype(np.int64)
+    if true.size == 0:
+        return {}
+
+    parent = np.asarray(list(subvariety_to_seed_type), dtype=np.int64)
+    num_seed_types = int(parent.max()) + 1 if parent.size else 0
+    names = list(seed_type_names) if seed_type_names else [str(i) for i in range(num_seed_types)]
+
+    breakdown: dict[str, dict[str, float]] = {}
+    for seed_index in range(num_seed_types):
+        mask = parent[true] == seed_index
+        if not mask.any():
+            continue
+        name = names[seed_index] if seed_index < len(names) else str(seed_index)
+        breakdown[name] = {
+            "accuracy": float(accuracy_score(true[mask], pred[mask])),
+            "f1_macro": float(f1_score(true[mask], pred[mask], average="macro", zero_division=0)),
+            "support": float(int(mask.sum())),
+        }
+    return breakdown
+
+
 def tsne_projection(
     embeddings: Any,
     perplexity: float = 30.0,
@@ -336,6 +598,10 @@ class HierarchicalEvaluation:
     sub_confusion: np.ndarray
     sub_misclassification: dict[str, float]
     expert_utilization: np.ndarray
+    per_seed_type_sub: dict[str, dict[str, float]] = field(default_factory=dict)
+    calibration: dict[str, float] = field(default_factory=dict)
+    expert_nmi: dict[str, float] = field(default_factory=dict)
+    dead_experts: int = 0
 
     def scalar_metrics(self) -> dict[str, float]:
         """Flatten every scalar into tracker-ready ``prefix/name`` keys."""
@@ -349,8 +615,16 @@ class HierarchicalEvaluation:
             metrics[f"seed_type_class/{entry.name}/f1"] = entry.f1
         for entry in self.per_class_sub:
             metrics[f"sub_variety_class/{entry.name}/f1"] = entry.f1
+        for name, values in self.per_seed_type_sub.items():
+            for key, value in values.items():
+                metrics[f"sub_variety_by_seed_type/{name}/{key}"] = float(value)
         for index, share in enumerate(self.expert_utilization):
             metrics[f"moe/expert_{index}_utilization"] = float(share)
+        metrics["moe/dead_experts"] = float(self.dead_experts)
+        for key, value in self.expert_nmi.items():
+            metrics[f"moe/nmi_{key}"] = float(value)
+        for key, value in self.calibration.items():
+            metrics[f"calibration/{key}"] = float(value)
         return metrics
 
 
@@ -367,12 +641,25 @@ def evaluate_hierarchical(
     sub_scores: Any | None = None,
     top_k_indices: Any | None = None,
     num_experts: int = 6,
+    tokens_per_sample: int = 1,
 ) -> HierarchicalEvaluation:
     """Run the full paper evaluation suite over one set of predictions."""
     seed_metrics = classification_metrics(seed_true, seed_pred)
     sub_metrics = classification_metrics(sub_true, sub_pred)
     if sub_scores is not None:
         sub_metrics.update(roc_auc_ovr(sub_true, sub_scores, num_classes=num_sub_varieties))
+
+    utilization = (
+        expert_utilization_counts(top_k_indices, num_experts)
+        if top_k_indices is not None
+        else np.zeros(num_experts)
+    )
+    expert_nmi: dict[str, float] = {}
+    if top_k_indices is not None and num_experts > 1:
+        expert_nmi = {
+            "seed_type": expert_label_nmi(top_k_indices, seed_true, tokens_per_sample),
+            "sub_variety": expert_label_nmi(top_k_indices, sub_true, tokens_per_sample),
+        }
 
     return HierarchicalEvaluation(
         seed_type=seed_metrics,
@@ -391,9 +678,13 @@ def evaluate_hierarchical(
         sub_misclassification=misclassification_rates(
             sub_true, sub_pred, sub_variety_names, num_sub_varieties
         ),
-        expert_utilization=(
-            expert_utilization_counts(top_k_indices, num_experts)
-            if top_k_indices is not None
-            else np.zeros(num_experts)
+        expert_utilization=utilization,
+        per_seed_type_sub=per_seed_type_breakdown(
+            sub_true, sub_pred, subvariety_to_seed_type, seed_type_names
         ),
+        calibration=(
+            expected_calibration_error(sub_scores, sub_true) if sub_scores is not None else {}
+        ),
+        expert_nmi=expert_nmi,
+        dead_experts=int((utilization == 0).sum()) if num_experts > 1 else 0,
     )

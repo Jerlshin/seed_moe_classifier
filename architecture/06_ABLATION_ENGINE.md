@@ -30,87 +30,162 @@ dataclass (see [`00_OVERVIEW.md`](00_OVERVIEW.md) §3), the losses, the metrics
 stack, and the figure generators need **zero** branching to support any
 variant.
 
-## 2. The five component toggles
+## 2. What each toggle actually changes
 
-All five live under `model.head` in
-`conf/model/head/hierarchical_moe.yaml:55-59`:
+A named "one-toggle" ablation is only interpretable if it flips one factor. Of
+the six variants the revision originally shipped, **only two did**.
 
-```yaml
-use_moe: true
-use_arcface: true
-use_residual: true
-use_cross_attention: true
-use_kl_loss: true
-```
+| Variant | Intended factor | Factors actually changed | Clean? |
+| --- | --- | --- | --- |
+| `wo_moe` | routing | routing + active capacity + 2 regularisers | **No** |
+| `wo_arcface` | angular margin | margin + embedding L2-norm + centre L2-norm + logit scale | **No** |
+| `wo_residual` | Eq. 9 fusion | Eq. 9 + the entire compactness term | **No** |
+| `wo_kl` | Eq. 10 | Eq. 10 | Yes |
+| `wo_cross_attn` | Eqs. 11-12 | Eqs. 11-12 | Yes |
 
-| Flag | Effect when `False` | Where enforced |
+The design principle in §1 — *"an ablation routed through a second training loop
+would differ from the full model in ways nobody intentionally chose"* — is
+exactly right, and the three failing rows are that same failure one level down:
+the *config* differences nobody intentionally chose. The principle had to be
+applied to the toggle semantics as well as to the trainer.
+
+### `wo_moe` changed three things
+
+1. Removed learned routing — the intended factor.
+2. Halved active capacity: the full model activates `top_k = 2` experts per token
+   and a `DenseExpertBlock` activates one. The gap conflated routing with a 2x
+   cut in active FLOPs — the very quantity the efficiency section is built on.
+3. Zeroed **both** MoE regularisers. This document used to present that as a
+   feature (*"no downstream consumer needs a special case"*); the plumbing is
+   elegant, but it means `wo_moe` optimised a **strictly smaller objective** than
+   the full model.
+
+Resolved by keeping `wo_moe` as the historical comparison and adding three
+controls: `wo_moe_capacity_matched` (`dense_capacity_multiplier=2`, capacity held
+fixed), `moe_fixed_router` (`router_mode=hash` — all six experts, sparse capacity
+held fixed, *learning* removed from the routing) and `moe_uniform_router`
+(`router_mode=uniform` — ensembling, sparsity removed). `moe_fixed_router` is the
+important one: it is the only configuration that can say whether the router
+learned anything, and it is the direct answer to the question a reviewer asks
+about Section 5.2.
+
+### `wo_arcface` changed four things
+
+Margin, embedding L2-norm, centre L2-norm and logit scale — the last of which
+also changes the sharpness of `P_sub` feeding the KL term and the geometry the
+t-SNE panels visualise. See
+[`04_HIERARCHICAL_FUSION.md`](04_HIERARCHICAL_FUSION.md) §7.
+
+Resolved by adding `NormFaceHead` and splitting the variant into
+`wo_margin_only` (the true single-factor margin control: normalised embedding and
+centres, `m = 0`, same scale) and `wo_angular_head` (the four-factor change,
+honestly named).
+
+### `wo_residual` changed two things
+
+Under `cosine_mode="residual"`, `use_residual=false` set `projected_seed = 0`, so
+`L_cos = 1 - cos(h, h) = 0` identically for every sample for the whole run. The
+toggle removed Eq. 9 **and** the paper's Section-1 contribution. Given that the
+cosine term's minimisers destroy the residual anyway, this confound could
+plausibly have made `wo_residual` look *better* than the full model, with no way
+to explain why.
+
+Resolved by dissolving it rather than patching it: `cosine_mode` defaults to
+`intra_class`, which is a property of the ArcFace embedding and does not ride on
+the residual. `wo_residual` now removes Eq. 9 and only Eq. 9; `wo_layer_scale`
+isolates the gain separately. A test asserts both halves — that compactness
+survives the toggle, and that the submitted formulation still collapses.
+
+### Allocation discipline (unchanged, and worth keeping)
+
+A disabled block is **not allocated**: the attribute is set to `None`, never
+`nn.Identity`, so an ablation's reported parameter count reflects the model
+actually trained. `use_moe=False` substitutes one dense block rather than nothing,
+so the gap measures routing rather than a missing layer's capacity — the
+rationale was right, it just needed the capacity-matched counterpart above.
+
+### Machine-readable traces
+
+`component_flags()` reports every axis a variant can move — `token_mode`,
+`fusion_mode`, `sub_head_variant`, `router_mode`, `gate_conditioning`,
+`num_experts`, `top_k`, `dense_capacity_multiplier` — and the criterion
+contributes `loss_flags()` (all lambdas, `kl_mode`, `tau_kl`,
+`detach_kl_seed_target`, `weighting_mode`, `cosine_mode`, `moe_load_mode`).
+
+This matters concretely: reporting only the four architectural booleans made a
+`wo_kl` run **byte-identical to `full_model`** in `summary.json`, with only the
+variant *name* separating them. `summary.json` also carries a `split` block
+recording the protocol and the dataset's provenance diagnostics.
+
+## 3. The variant grid (`scripts/run_ablations.py`)
+
+Eighteen variants, each documented with the factors it moves. `full_model` is the
+reference every other is compared against.
+
+| Variant | Override | Isolates |
 | --- | --- | --- |
-| `use_moe` | `DenseExpertBlock` (one dense transformer block, no routing) replaces `MixtureOfExperts` | `HierarchicalSeedClassifier.__init__`, `builder.py:249-265` |
-| `use_arcface` | `LinearSubVarietyHead` (plain linear + implicit CE) replaces `ArcFaceHead` | `builder.py:297-309` |
-| `use_residual` | `h' = h`; `self.seed_projection = None`; `projected_seed` fabricated as zeros | `builder.py:267-277`, `forward` at `builder.py:355-362` |
-| `use_cross_attention` | `h'' = h'`; `self.cross_attention = None` | `builder.py:280-289`, `forward` at `builder.py:364-376` |
-| `use_kl_loss` | Eq. 10 not computed at all (not weighted to zero) | `CombinedHierarchicalLoss.__init__`/`forward`, `hierarchical.py:243-246, 281-290` |
+| `full_model` | *(none)* | reference |
+| `wo_moe` | `use_moe=false` | routing + capacity + 2 regularisers (historical) |
+| `wo_moe_capacity_matched` | `+ dense_capacity_multiplier=2` | routing, capacity fixed |
+| `moe_fixed_router` | `router_mode=hash` | **learned** routing, sparse capacity fixed |
+| `moe_uniform_router` | `router_mode=uniform`, `top_k=6` | sparsity, ensembling fixed |
+| `wo_gate_conditioning` | `gate_conditioning=false` | the hierarchical link into the router |
+| `wo_margin_only` | `sub_head_variant=normface` | the angular margin, alone |
+| `wo_angular_head` | `sub_head_variant=linear` | margin + normalisation + scale |
+| `wo_residual` | `use_residual=false` | Eq. 9 fusion |
+| `wo_layer_scale` | `residual_layer_scale=null` | the residual gain |
+| `film_fusion` | `fusion_mode=film` | additive vs. multiplicative conditioning |
+| `wo_kl` | `use_kl_loss=false` | Eq. 10 |
+| `kl_jsd` | `kl_mode=jsd` | forward KL vs. symmetric JSD |
+| `wo_cross_attn` | `use_cross_attention=false` | Eqs. 11-12 |
+| `pooled_tokens` | `token_mode=pooled` | **routing granularity** — the submitted architecture |
+| `load_entropy` | `moe_load_mode=entropy` | dispatch-aware vs. soft-only balancing |
+| `wo_stage2_augmentation` | flip + crop off | stage-2 augmentation |
+| `leakage_ungrouped` | `split_protocol=stratified` | **the crop-level leak, as a number** |
 
-`use_kl_loss` lives on `model.head` (not `model.loss`) purely so all five
-toggles have one physical home; `conf/model/loss/arcface_kl.yaml:16` reaches
-it via interpolation: `use_kl_loss: ${model.head.use_kl_loss}`. One flag, two
-consumers (the loss builder reads it directly; nothing in the model itself
-branches on it), no way for them to disagree.
+Three of these are not architecture ablations and are worth calling out:
 
-**Two design rules every toggle obeys** (stated in `REVISION_NOTES.md` §4 and
-`src/README.md`, and checked by dedicated tests in
-`tests/test_models.py`):
+* **`pooled_tokens`** measures what keeping SwinV2's token grid buys. Under
+  `pooled` the expert and cross-attention Q/K projections are not built at all,
+  because a length-1 attention can never use them.
+* **`load_entropy`** reproduces the submitted load-balancing loss. `L_load(entropy)`
+  against `L_load(switch)` on one split converts a correctness finding into a
+  small empirical result.
+* **`leakage_ungrouped`** is the full model under crop-level splitting. The delta
+  against `full_model` quantifies what the source-photograph leak was worth. That
+  is a methods result worth reporting, not a cleanup step to hide — the applied-DL
+  literature reports it exactly this way.
 
-1. **A disabled component is never allocated.** The attribute is set to
-   `None`, not `nn.Identity` — an ablation's reported parameter count
-   describes the model that was actually trained, not the full model with
-   dead weights sitting alongside it.
-2. **Replace, don't delete, when capacity is at stake.** `use_moe=False`
-   substitutes `DenseExpertBlock` — architecturally identical to a single
-   expert — rather than removing the layer outright, so the `wo_moe` gap
-   against the full model is attributable to *routing*, not to a missing
-   block's capacity. `use_arcface=False` similarly substitutes
-   `LinearSubVarietyHead`, which mirrors `ArcFaceHead`'s `(logits,
-   margin_logits)` return contract so the model body and the loss need no
-   branch (see [`04_HIERARCHICAL_FUSION.md`](04_HIERARCHICAL_FUSION.md) §7
-   and [`05_LOSS_FUNCTIONS.md`](05_LOSS_FUNCTIONS.md)).
+### Every variant runs at five seeds
 
-`component_flags()` (`builder.py:321-328`) reports the four architectural
-booleans for logging (`use_kl_loss` excluded — it belongs to the loss, not
-the model) and is written into `summary.json`'s `component_flags` field by
-`write_run_summary` (`moe_finetune.py:1018`).
+`DEFAULT_SEEDS = (42, 43, 44, 45, 46)`, expanded by `expand_seeds()` into
+`outputs/ablations/{variant}/seed{n}/`.
 
-## 3. The six component-wise ablation variants (`scripts/run_ablations.py`)
+One run per variant cannot resolve the table it is being asked to support. On a
+1,871-image test split at ~95 % accuracy:
 
-```python
-ABLATION_VARIANTS = [
-    VariantSpec("full_model",     overrides=[]),
-    VariantSpec("wo_moe",         overrides=["model.head.use_moe=false"]),
-    VariantSpec("wo_arcface",     overrides=["model.head.use_arcface=false"]),
-    VariantSpec("wo_residual",    overrides=["model.head.use_residual=false"]),
-    VariantSpec("wo_kl",          overrides=["model.head.use_kl_loss=false"]),
-    VariantSpec("wo_cross_attn",  overrides=["model.head.use_cross_attention=false"]),
-]
+```text
+SE(p)         = sqrt(0.95 . 0.05 / 1871) = 0.00504  ->  +-0.99 pp   (95 % CI half-width)
+SE(p1 - p2)   = sqrt(2) . 0.00504        = 0.00713  ->  +-1.40 pp   (unpaired difference)
 ```
 
-Each variant flips **exactly one** toggle, and every variant reads the same
-published DINOv2 encoder. Results land in
-`outputs/ablations/{variant}/`, one self-contained directory holding its
-Hydra config snapshot, logs, checkpoints, figures, `summary.json`, and
-`test_predictions.npz`.
+So **any ablation gap below ~1.4 pp sits inside the noise floor of the test split
+alone** — before any training-seed variance from dropout, shuffling, router
+initialisation, or (for a MoE specifically) which experts happen to win the early
+race. For a 27-class fine-grained task where component contributions of 0.5-2 pp
+are the normal magnitude, that is not enough resolution.
 
-```bash
-python scripts/run_ablations.py                        # all six
-python scripts/run_ablations.py --variants wo_moe wo_kl
-python scripts/run_ablations.py --dry-run               # print commands only
-python scripts/run_ablations.py -- data.batch_size=8 experiment.training.epochs=20
-```
+`scripts/generate_plots.py` aggregates to **mean ± SD** and adds **McNemar's exact
+test** against `full_model`, Holm-adjusted across the family. The paired test is
+available precisely because the suite guarantees a byte-identical test split, and
+it is strictly more powerful than comparing independent intervals. It needs
+nothing beyond the `test_predictions.npz` files already on disk.
 
 ### `ablation_flat_classifier` — a distinct, seventh ablation
 
 `conf/experiment/ablation_flat_classifier.yaml` (reached via `python main.py
 ablation`, **not** part of the `run_ablations.py` suite) is architecturally
-different from the six above: it removes the coarse stage's *influence on the
+different from the variants above: it removes the coarse stage's *influence on the
 gradient* rather than one structural block. The seed-type head still runs and
 is still scored, but:
 
@@ -128,19 +203,54 @@ model:
     lambda_arcface: 1.0    # ArcFace alone drives the classifier
 ```
 
-The gap against the full model here measures the **combined** contribution
-of coarse supervision plus expert specialization, distinct from the six
-variants' one-ingredient-at-a-time isolation.
+The gap against the full model here measures the **combined** contribution of
+coarse supervision plus expert specialization, distinct from the suite's
+one-factor-at-a-time isolation. It is deliberately excluded from
+`run_ablations.py`, and the paper should keep that framing.
 
 ## 4. Baselines (`scripts/run_baselines.py`, `src/models/baselines.py`)
 
-Three reference points, each answering a different question:
+Five reference points. The submitted suite had three, and was missing the one a
+reviewer asks for first.
 
 | Baseline | Backbone | Trained | What the gap isolates |
 | --- | --- | --- | --- |
+| **`linear_probe`** | Same self-supervised encoder, frozen | `Linear(384,4)` + `Linear(384,27)`, plain CE | **Does any of the head machinery beat a linear layer on the same features?** |
+| `swinv2_supervised` | ImageNet SwinV2-Base | End-to-end, full hierarchical head | In-domain self-supervision, separated from the architecture |
 | `resnet50` | ImageNet ResNet-50 | End-to-end, supervised | Conventional CNN reference point |
-| `swin_tiny` | ImageNet Swin-T (`swin_tiny_patch4_window7_224`) | End-to-end, supervised | DINOv2 pretraining + hierarchical head, with the shifted-window family held constant |
-| `hierarchical_cce` | Same DINOv2-SwinV2 encoder as the proposed model | Frozen encoder, head-only (like the full model) | Whether being hierarchical at all helps, independent of MoE/cross-attention/ArcFace |
+| `swin_tiny` | ImageNet Swin-T | End-to-end, supervised | Shifted-window family held constant |
+| `hierarchical_cce` | Same encoder, frozen | Head-only, plain CE at both levels | Whether being hierarchical at all helps |
+
+### `linear_probe` — run this one first
+
+If the full architecture does not clear a linear layer on identical frozen
+features by a comfortable, seed-stable margin, that is the single most important
+number in the paper. It shares the encoder path with the proposed model exactly,
+so the gap is attributable to the head rather than to a different representation.
+
+**`hierarchical_cce` is not this control.** It keeps `use_residual: true`, so it
+retains the coarse-to-fine link and the `SubVarietyEmbedding` MLP. It is a
+composed point in the ablation lattice (`wo_moe` + `wo_angular_head` +
+`wo_cross_attn` + `wo_kl`), not an independent baseline, and reading it as one
+would overstate what the head contributes.
+
+### `swinv2_supervised` — separating SSL from architecture
+
+ImageNet-initialised SwinV2-Base with the *full* hierarchical head and no stage-1
+checkpoint (`checkpoint_path: null`, `freeze: false`). The only variant that
+separates "in-domain self-supervised pretraining" from "the architecture".
+`validate_swinv2_name` reserves `model/backbone` for the self-supervised path, so
+this is configured through its own experiment file.
+
+### The under-tuned-baseline objection
+
+`resnet50` and `swin_tiny` train end to end while the proposed model trains a head
+against a frozen encoder. Those have genuinely different optimal learning rates,
+and a single shared value cannot be right for both — "our method wins against an
+under-tuned baseline" is the most common objection any comparison table attracts.
+
+`--lr-sweep` runs `{1e-5, 3e-5, 1e-4}` per end-to-end baseline and reports each
+one's best. Six extra runs, and the objection goes away.
 
 ### `FlatSupervisedBaseline` (`src/models/baselines.py:74-193`)
 
@@ -154,7 +264,7 @@ images --backbone--> pooled --Linear+LayerNorm--> z in R^384
 27-way head would make the hierarchical alignment rate identically `1.0` by
 construction — the seed type would be *derived* from the sub-variety
 prediction, so the two could never disagree, making that column meaningless.
-Independent heads give `resnet50`/`swin_tiny` a real, comparable alignment
+Independent heads give the supervised baselines a real, comparable alignment
 measurement. The `EmbedDim=384` projection is likewise not required by the
 baseline itself; it exists purely so the t-SNE panels and the embedding-space
 column of the results table stay comparable with the proposed model's.

@@ -1,0 +1,26 @@
+# @package _global_
+#
+# Baseline: linear probe on the frozen self-supervised encoder.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_linear_probe
+#   python scripts/run_baselines.py --models linear_probe
+#
+# Run this one first. If the full hierarchical head does not clear it by a
+# comfortable, seed-stable margin, that is the single most important number in
+# the paper. It reads the same published encoder checkpoint as every other
+# variant, so the features are byte-identical and the gap is the head's.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: linear_probe
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_linear_probe"
+  group: "baseline"
+  variant: "linear_probe"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/linear_probe"
+    # Two linear layers over frozen features converge quickly and tolerate a
+    # higher rate than a 9 M-parameter head does.
+    learning_rate: 0.001

@@ -5,8 +5,8 @@ required by either training stage.
 
 | Path | Contents |
 | --- | --- |
-| `abalation_studies/tasks.md` | Protocol for the supervised-baseline comparison |
-| `abalation_studies/resnet_comparison.ipynb` | Stub for that comparison |
+| `abalation_studies/tasks.md` | Original protocol sketch for the supervised-baseline comparison (historical) |
+| `abalation_studies/resnet_comparison.ipynb` | Empty stub predating that implementation (historical) |
 
 ## Relationship to the paper's Limitations section
 
@@ -17,8 +17,18 @@ work"*. `tasks.md` sketches the protocol for closing that gap: a shared backbone
 trained on `L = 0.5·L_coarse + 0.5·L_fine`, compared on accuracy / precision /
 recall / F1 plus parameter count, GFLOPs, and per-image latency.
 
+**That gap is now closed for real**, not in this directory: `scripts/run_baselines.py`
+runs `resnet50` and `swin_tiny` as full Hydra experiments
+(`conf/experiment/baseline_resnet50.yaml`, `baseline_swin_tiny.yaml`), each
+trained end to end with the same coarse/fine heads and metrics `tasks.md`
+specifies. The one deliberate deviation from the sketch: `swin_tiny` stands in
+for the originally-proposed ViT-B/16, because it is in the same shifted-window
+family as the paper's own encoder, which isolates DINOv2 pretraining as the only
+variable (see the module docstring in `run_baselines.py`). `tasks.md` and the
+stub notebook are kept here as the original design record, not as an open TODO.
+
 Note that `tasks.md` names **Amaranthus** as the third seed type, matching the
-paper; the dataset on disk has **Seasame**. See `PAPER_AUDIT.md` §6.2 — worth
+paper; the dataset on disk has **Seasame**. See `PAPER_AUDIT.md` §7.2 — worth
 resolving before these results are written up.
 
 ## Architecture ablations belong in `conf/`, not here
@@ -39,6 +49,7 @@ python main.py finetune model.head.seed_classifier_variant=se_gated
 Each writes a fully-resolved config snapshot into its run directory, so the exact
 configuration behind any number stays recoverable.
 
-The supervised-baseline comparison in `tasks.md` genuinely needs new code — it
-uses neither the DINO backbone nor the hierarchical head — which is why it lives
-here rather than as an experiment config.
+The supervised-baseline comparison sketched in `tasks.md` used neither the DINO
+backbone nor the hierarchical head, which is why the original stub lived here
+rather than as an experiment config — it needed real new code, now written as
+`scripts/run_baselines.py` and its baseline experiment configs.

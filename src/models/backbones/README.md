@@ -1,6 +1,8 @@
 # `src/models/backbones/` — self-supervised encoders
 
-Paper Section 4: DINOv2 self-distillation with a Swin Transformer V2 backbone.
+Paper Section 4: DINO-style self-distillation with a Swin Transformer V2
+backbone. Not DINOv2 -- see `src/losses/dino.py` for exactly which of DINOv2's
+four components are and are not implemented.
 
 | File | Contents |
 | --- | --- |
@@ -48,7 +50,7 @@ Two collapse guards, both on that final 65,536-wide layer:
 `DINO.__init__` runs both before building anything:
 
 * `validate_swinv2_name()` rejects any backbone name that is not a SwinV2
-  variant. DINOv2 pretraining is standardised on SwinV2, so a stale or mistyped
+  variant. Self-supervised pretraining is standardised on SwinV2, so a stale or mistyped
   name must fail in the first second rather than after an epoch of
   self-distillation against the wrong encoder.
 * The backbone's `num_features` must equal the head's `in_dim`. Without this, a
@@ -71,5 +73,5 @@ Two collapse guards, both on that final 65,536-wide layer:
 
 Non-SwinV2 architectures are **not** added here. Supervised comparison
 backbones (ResNet-50, Swin-T) go through `src/models/baselines.py` and
-`conf/experiment/baseline_*.yaml`; they are not DINOv2-pretrained, so putting
+`conf/experiment/baseline_*.yaml`; they are not self-supervised-pretrained, so putting
 them in this group would invite exactly the mix-up the validator prevents.

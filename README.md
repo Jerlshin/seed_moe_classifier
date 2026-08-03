@@ -4,7 +4,7 @@ Reference implementation of **"Hierarchical Deep Learning for Fine-Grained Seed
 Classification: A Self-Supervised and Mixture-of-Experts Approach"**
 (`../paper/sn-article.pdf`).
 
-Two stages: DINOv2 self-supervised pretraining of a Swin Transformer V2 encoder,
+Two stages: DINO-style self-supervised pretraining of a Swin Transformer V2 encoder,
 then a hierarchical head that classifies 4 seed types and 27 sub-varieties with
 a Mixture-of-Experts, cross-attention refinement, and ArcFace metric learning.
 
@@ -69,7 +69,7 @@ python main.py finetune model.backbone.freeze=false        # fine-tune end to en
 python scripts/dry_run.py         # synthetic end-to-end smoke test, no dataset needed
 python main.py pretrain           # produces the shared encoder, run once
 python scripts/run_ablations.py   # six component-wise variants
-python scripts/run_baselines.py   # ResNet-50, Swin-T, hierarchical CCE
+python scripts/run_baselines.py   # linear probe, SwinV2-supervised, ResNet-50, Swin-T, hierarchical CCE
 python scripts/generate_plots.py  # figures + outputs/reports/summary_metrics.csv
 ```
 
@@ -90,10 +90,13 @@ forwarded to every run as a Hydra override.
 | --- | --- | --- |
 | `full_model` | nothing (Top-2 MoE + ArcFace + residual + KL + cross-attention) | — |
 | `wo_moe` | sparse routing; one dense transformer block instead | `model.head.use_moe=false` |
-| `wo_arcface` | angular margin; linear head under plain CE | `model.head.use_arcface=false` |
+| `wo_margin_only` | the angular margin alone (NormFace keeps the geometry) | `model.head.sub_head_variant=normface` |
+| `wo_angular_head` | margin **and** normalisation **and** logit scale | `model.head.sub_head_variant=linear` |
 | `wo_residual` | Eq. 9 seed-type fusion | `model.head.use_residual=false` |
 | `wo_kl` | Eq. 10 hierarchy-consistency loss | `model.head.use_kl_loss=false` |
 | `wo_cross_attn` | Eqs. 11–12 Q/K/V refinement | `model.head.use_cross_attention=false` |
+| `linear_probe` | everything but a frozen encoder + two linear heads | `experiment=baseline_linear_probe` |
+| `swinv2_supervised` | the self-supervised stage (ImageNet SwinV2-Base instead) | `experiment=baseline_swinv2_supervised` |
 | `resnet50` | ImageNet ResNet-50, supervised end to end | `experiment=baseline_resnet50` |
 | `swin_tiny` | ImageNet Swin-T, supervised end to end | `experiment=baseline_swin_tiny` |
 | `hierarchical_cce` | two-stage hierarchy, plain CCE, no MoE/attn/ArcFace | `experiment=baseline_hierarchical_cce` |
@@ -213,7 +216,7 @@ $SEED_OUTPUT_DIR/
     test_predictions.npz           # raw held-out predictions + 384-D embeddings
     hydra/                         # logs, config snapshot, tensorboard, wandb, figures
   ablations/{full_model,wo_moe,wo_arcface,wo_residual,wo_kl,wo_cross_attn}/
-  baselines/{resnet50,swin_tiny,hierarchical_cce}/
+  baselines/{linear_probe,swinv2_supervised,resnet50,swin_tiny,hierarchical_cce}/
   reports/
     summary_metrics.csv            # one row per variant, all metrics + cost
     {variant}_confusion_seed_type.png
@@ -237,7 +240,7 @@ no teacher weights. Turning these on for a 300-epoch run is how the disk fills.
 ## Testing
 
 ```bash
-python -m pytest tests/ -q          # 280 tests, no network access, ~7s
+python -m pytest tests/ -q          # 341 tests, no network access, ~8s
 python scripts/dry_run.py           # real encoder, synthetic data, full pipeline
 ```
 

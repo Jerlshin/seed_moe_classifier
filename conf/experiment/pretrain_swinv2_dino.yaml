@@ -1,10 +1,12 @@
 # @package _global_
 #
-# Stage 1: DINOv2 self-supervised pretraining (paper Section 4, Table 1).
+# Stage 1: self-supervised pretraining (paper Section 4, Table 1).
 #
 #   python main.py pretrain
 #
-# Every value below that Table 1 states is annotated with `# Table 1`.
+# DINO (Caron et al., 2021) with a SwinV2 trunk, plus KoLeo and Sinkhorn-Knopp
+# from DINOv2. Values Table 1 states are annotated `# Table 1`; values the
+# revision changed carry the reason.
 
 defaults:
   - override /model/head: dino
@@ -18,10 +20,27 @@ experiment:
     epochs: 300                    # Table 1
     max_batches: null              # cap batches/epoch for smoke runs
     learning_rate: 0.0005          # Section 6.1: "initial learning rate of 0.0005"
-    weight_decay: 0.01
-    momentum_teacher: 0.996        # Table 1
     clip_grad: 3.0                 # Table 1: "Clip Gradient 3"
     freeze_last_layer_epochs: 1    # Section 6.1: last layer frozen for first epoch
+
+    # -----------------------------------------------------------------------
+    # Teacher momentum, now SCHEDULED. Table 1 fixes 0.996; DINO cosine-anneals
+    # 0.996 -> 1.0, the point being a fast-adapting teacher early and a stable
+    # target late. A constant 0.996 gives neither end of that trade-off. Set
+    # momentum_teacher_final: null to hold it constant.
+    # -----------------------------------------------------------------------
+    momentum_teacher: 0.996        # Table 1
+    momentum_teacher_final: 1.0
+
+    # Weight decay, likewise scheduled: DINO cosine-schedules 0.04 -> 0.4. The
+    # submitted constant 0.01 is below even DINO's starting value.
+    weight_decay: 0.04
+    weight_decay_final: 0.4
+
+    # Every collapse guard in DINO is a batch statistic, and batch 16 is far
+    # below the regime they were designed for. Accumulate to an effective batch
+    # of >= 64 before stepping.
+    gradient_accumulation_steps: 4
 
     save_interval: 50
     keep_last_n_checkpoints: 1

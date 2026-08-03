@@ -3,9 +3,48 @@
 What changed in this tree relative to the **submitted manuscript**
 (`../paper/sn-article.pdf`), and how to reproduce either version.
 
-[`PAPER_AUDIT.md`](PAPER_AUDIT.md) is a different document: it records where the
-*original code* diverged from the *paper as written*. This file records where
-the *revision* deliberately departs from the submitted paper.
+Three documents, three jobs:
+
+* [`PAPER_AUDIT.md`](PAPER_AUDIT.md) — where the *original code* diverged from the
+  *paper as written*.
+* [`AUDIT_RESPONSE.md`](AUDIT_RESPONSE.md) — the disposition of every finding in
+  the independent audit `CHANGES.md`, including the dataset measurements that
+  gate the whole protocol.
+* **This file** — where the *revision* deliberately departs from the submitted
+  paper, and how to reproduce either version.
+
+---
+
+## 0. Everything reversible, in one table
+
+Each row is a departure the audit forced, and the override that restores the
+submitted behaviour. Most are also ablation variants, so the comparison can be
+*measured* rather than argued — see `scripts/run_ablations.py`.
+
+| Departure | Override to reproduce the submitted form | Ablation variant |
+| --- | --- | --- |
+| Top-2 routing | `model.head.top_k=4` | — |
+| Token-grid routing | `model.head.token_mode=pooled` | `pooled_tokens` |
+| Seed-conditioned gate | `model.head.gate_conditioning=false` | `wo_gate_conditioning` |
+| Switch load balancing | `model.loss.moe_load_mode=entropy` | `load_entropy` |
+| Sparsity off | `model.loss.lambda_moe_sparsity=0.01` | — |
+| Log-space KL | *not reversible* — the old form was gradient-dead | — |
+| Detached KL target | `model.loss.detach_kl_seed_target=false` | — |
+| AdaCos scale | `model.head.arcface_scale=30.0` | — |
+| Margin warm-up | `experiment.training.margin_warmup_fraction=0.0` | — |
+| Intra-class compactness | `model.loss.cosine_mode=residual` | — |
+| LayerScale residual | `model.head.residual_layer_scale=null` | `wo_layer_scale` |
+| Grouped splits | `experiment.training.split_protocol=stratified` | `leakage_ungrouped` |
+| Stage-2 augmentation | `horizontal_flip_prob=0.0 random_resized_crop_scale=null` | `wo_stage2_augmentation` |
+| Sinkhorn centering | `model.loss.centering=ema` | — |
+| 8,192 prototypes | `model.head.out_dim=65536` | — |
+| Teacher temps `0.04→0.07` | `warmup_teacher_temp=0.02 teacher_temp=0.04` | — |
+| Multi-seed reporting | `--seeds 42` | — |
+
+The two that are *not* reversible are the ones where the submitted behaviour was
+not a design choice but a defect: the KL term's `clamp → log` composition had
+zero gradient exactly where the term was supposed to act, and the comparative
+ViT-S/14 path was removed outright.
 
 ---
 
@@ -205,6 +244,39 @@ produce a figure that means nothing.
 
 ---
 
+## 7b. What the second-round audit changed, in one place
+
+`CHANGES.md` is an independent audit conducted against `architecture/` after the
+first revision landed. Its findings are dispositioned in
+[`AUDIT_RESPONSE.md`](AUDIT_RESPONSE.md); the five that materially changed what
+this tree *is*:
+
+1. **The token grid stopped being pooled away.** Over a length-1 sequence
+   attention is an affine map, so Eqs. 11-12 and every expert's self-attention
+   were linear layers with ~2.07 M unreachable parameters — counted as *active*
+   in the results table. Grid routing makes them real; pooled mode no longer
+   allocates them.
+2. **The load-balancing loss started seeing the dispatch.** The entropy form
+   scores 92 % of "perfect balance" on a router that sends every sample to two of
+   six experts, and its global optimum produces maximally imbalanced hard
+   routing. The Switch form couples `f` to `P`.
+3. **The KL term stopped being gradient-dead.** `clamp_min(1e-8) → log` had zero
+   gradient exactly in the confident-disagreement case the term exists for.
+   `logsumexp` over each parent's children is exact.
+4. **The compactness term stopped rewarding its own deletion.** `1 − cos(h +
+   P(p_s), h)` is minimised by `P(p_s) = 0`. Structural control (LayerScale)
+   replaced it, and compactness moved to the intra-class reading with EMA
+   centroids — which also dissolved the `wo_residual` confound.
+5. **The split protocol became group-aware.** 9,357 crops from 81 photographs.
+   This one changes what every existing number means, and no protocol can fully
+   fix it for the five single-source sub-varieties.
+
+Alongside those: multi-seed reporting with McNemar's paired test, per-term
+gradient telemetry, expert-label NMI, ECE with temperature scaling, a linear
+probe, and honest naming for stage 1.
+
+---
+
 ## 8. Verification performed
 
 | Check | Result |
@@ -220,3 +292,24 @@ produce a figure that means nothing.
 The suite runs used a reduced configuration (SwinV2-Tiny, 1 epoch, 3 batches,
 random encoder) to exercise the plumbing quickly. Accuracies from those runs are
 near chance by construction and are not results.
+
+---
+
+## 9. What has *not* been re-run
+
+Nothing in this tree has been retrained. Every number in the submitted
+manuscript's Section 6 was produced under crop-level splitting, `s = 30`, the
+soft-gate load loss and a gradient-dead KL term, so none of it carries over.
+
+Before any table is updated:
+
+```bash
+python main.py pretrain                                   # stage 1, recalibrated
+python scripts/run_baselines.py --models linear_probe     # run this one first
+python scripts/run_ablations.py                           # 18 variants x 5 seeds
+python scripts/run_baselines.py --lr-sweep
+python scripts/generate_plots.py                          # mean +- SD, McNemar
+```
+
+`AUDIT_RESPONSE.md` §8 lists what each of those has to establish before the
+paper's claims can be restated.
