@@ -1,9 +1,7 @@
+
 # ==============================================================================
 # Python Cache and Bytecode
 # ==============================================================================
-# Directory patterns below are anchored with a leading "/" so they only match at
-# the repository root. An unanchored "lib/" or "build/" would also match
-# "src/.../lib/", which is how a source directory ends up silently untracked.
 __pycache__/
 *.py[cod]
 *$py.class
@@ -42,7 +40,7 @@ Thumbs.db
 *.swo
 
 # ==============================================================================
-# Virtual Environments & Packages
+# Virtual Environments & Environments
 # ==============================================================================
 .env
 .venv
@@ -55,7 +53,7 @@ ai_env/
 conda-env/
 
 # ==============================================================================
-# IDEs / Editors
+# IDEs & Editor Metadata
 # ==============================================================================
 .idea/
 .vscode/
@@ -63,12 +61,10 @@ conda-env/
 *.sublime-workspace
 .ipynb_checkpoints/
 .jupyter/
-.cursorrules
 
 # ==============================================================================
-# Deep Learning / Model Checkpoints / Weights
+# Model Checkpoints, Weights & Serialized Artifacts
 # ==============================================================================
-# Ignore all raw model files, checkpoints, and serialized architectures
 *.pt
 *.pth
 *.ckpt
@@ -80,41 +76,39 @@ conda-env/
 *.joblib
 *.pkl
 *.pickle
+*.npz
 
 # ==============================================================================
-# Experiment Tracking & Logs (Hydra, Tensorboard, WandB)
+# Experiment Tracking, Logs & Local Outputs
 # ==============================================================================
-# Hydra output folders for local run logs and snapshots
 /outputs/
 /multirun/
-
-# Tensorboard logs
 /runs/
 .tensorboard/
-
-# Weights & Biases logs (written into each Hydra run directory)
 wandb/
-
-# MLflow tracking
 /mlruns/
-
-# General log files
 *.log
 *.log.jsonl
 events.out.tfevents.*
 
 # ==============================================================================
-# Dataset / Data / Dataframes
+# Dataset, Data Inputs & Exported Reports
 # ==============================================================================
-# Datasets dropped into the repository root. These MUST stay anchored: an
-# unanchored "datasets/" also matches the source package "src/datasets/", which
-# would silently untrack every new module added there.
 /data/
 /data_inputs/
 /datasets/
 /raw_data/
 *.xlsx
 *.parquet
-
-# Generated metadata manifests (see data.save_csv_path), not source data.
 *.csv
+
+# ==============================================================================
+# Tools (Hidden Workspace Files & Notes)
+# ==============================================================================
+.claude/
+CLAUDE.md
+CHANGES.md
+PAPER_AUDIT.md
+REVISION_NOTES.md
+AUDIT_RESPONSE.md
+.cursorrules
