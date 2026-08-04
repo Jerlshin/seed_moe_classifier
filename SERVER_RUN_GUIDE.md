@@ -1,12 +1,5 @@
 # Server run guide
 
-Operational reference for launching the full pretrain -> finetune -> ablation ->
-baseline -> report pipeline on a remote GPU box. This is a companion to
-`CLAUDE.md` (architecture/behavioural contracts), `PAPER_AUDIT.md` (paper vs.
-first-cut code), `REVISION_NOTES.md` (paper vs. this revision) and
-`AUDIT_RESPONSE.md` (independent audit disposition) — read those for *why*;
-this file is only *how* and *what to type*.
-
 Verified locally before this pipeline was cleared for a server run: 344/344
 tests pass, `scripts/dry_run.py` completes cleanly, and a real 2-batch,
 1-epoch pass through both `main.py pretrain` and `main.py finetune` on the
