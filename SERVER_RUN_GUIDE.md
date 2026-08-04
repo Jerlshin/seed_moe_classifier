@@ -1,0 +1,413 @@
+# Server run guide
+
+Operational reference for launching the full pretrain -> finetune -> ablation ->
+baseline -> report pipeline on a remote GPU box. This is a companion to
+`CLAUDE.md` (architecture/behavioural contracts), `PAPER_AUDIT.md` (paper vs.
+first-cut code), `REVISION_NOTES.md` (paper vs. this revision) and
+`AUDIT_RESPONSE.md` (independent audit disposition) — read those for *why*;
+this file is only *how* and *what to type*.
+
+Verified locally before this pipeline was cleared for a server run: 344/344
+tests pass, `scripts/dry_run.py` completes cleanly, and a real 2-batch,
+1-epoch pass through both `main.py pretrain` and `main.py finetune` on the
+actual 9,357-image dataset produced `summary.json`, `test_predictions.npz` and
+a checkpoint with no NaN/Inf anywhere and no unhandled exceptions.
+
+---
+
+## 1. Environment setup
+
+Python `>=3.11` (`pyproject.toml`); developed and tested against **3.12**.
+
+```bash
+# Fresh environment (conda shown; venv works identically)
+conda create -n seed-moe python=3.12 -y
+conda activate seed-moe
+
+# CUDA build of PyTorch first, matched to the box's driver — check with
+# `nvidia-smi` and pick the matching index URL from pytorch.org/get-started.
+# Example for CUDA 12.1:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# Project + extras (tracking = tensorboard/wandb/pynvml, dev = pytest)
+cd seed-moe-classifier
+python -m pip install -e ".[tracking,dev]"
+```
+
+`device: auto` (the default) resolves to `cuda` when available, else `mps`,
+else `cpu`. AMP and `pin_memory` are gated on `device.type == "cuda"` — no
+action needed on the server beyond having a CUDA build of torch installed.
+
+Confirm the install:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -m pytest tests/ -q          # expect all passing in ~8-15s on CPU
+python scripts/dry_run.py           # synthetic pipeline, no dataset needed
+```
+
+---
+
+## 2. Dataset requirements
+
+Expected layout, read by `HierarchicalSeedDataset` (`src/datasets/dataset.py`):
+
+```
+<SEED_DATA_ROOT>/
+  Millet/
+    Baryard/*.png
+    Browntop/*.png
+    FingerMillet/*.png
+    KarurKuruvai/*.png
+    PearlMillet/*.png
+    ProsaMillet/*.png
+    ...                       (8 sub-varieties total)
+  Mustard/
+    Jagnath/*.png
+    PM30/*.png
+    Unknown1/*.png            (3 sub-varieties)
+  Rice/
+    ...                       (13 sub-varieties)
+  Seasame/
+    VRI1/*.png
+    VRI2/*.png
+    VRI4/*.png                (3 sub-varieties)
+```
+
+- **4 seed types, 27 sub-varieties total** (13 rice + 8 millet + 3 + 3).
+  Labels are assigned from **sorted directory names** — adding, removing or
+  renaming a folder shifts every index and invalidates any checkpoint trained
+  against the old tree. The trainer refuses to start if the discovered counts
+  disagree with `data.num_seed_types` / `data.num_sub_varieties`.
+- **9,357 image crops from 81 source photographs** (mean 115.5 crops/source).
+  Filenames encode provenance: `IMG_0502_bbox137.png` is bbox 137 cut from
+  source photograph `IMG_0502`. Do not rename crops — the grouped split
+  protocol parses this pattern to keep every crop of one source photograph on
+  one side of the train/test boundary.
+- **5 sub-varieties have crops from exactly one source photograph**
+  (`Baryard`, `Browntop`, `FingerMillet`, `PearlMillet`, `ProsaMillet`). No
+  split protocol can put any of their crops on both sides; the trainer logs
+  this at startup and records it in `summary.json`. This is a dataset
+  property, not a bug to chase.
+- Images are **small and non-square**: median 52x51 px, all under 256px on
+  both sides, only 3.4% square. The pipeline resizes with a `(H, W)` tuple and
+  upsamples ~5x before the backbone sees anything — expected.
+- Supported extensions: `.png .jpg .jpeg .bmp .tif .tiff .webp`.
+
+Point the trainer at the dataset with an environment variable (no code change
+needed):
+
+```bash
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+```
+
+---
+
+## 3. Execution commands
+
+### 3.1 One-off sanity pass (always run this first on a new box)
+
+```bash
+python -m pytest tests/ -q
+python scripts/dry_run.py --device cuda      # or leave --device out for auto
+```
+
+### 3.2 Environment variables (set once per shell / put in the launch script)
+
+```bash
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_OUTPUT_DIR=/workspace/outputs
+export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth"
+mkdir -p "${SEED_OUTPUT_DIR}"
+```
+
+`scripts/train_distributed.sh` sets these three with the same vast.ai-shaped
+defaults (`/workspace/...`) if you don't export them yourself — despite the
+name it is a single-process launcher, not a distributed one.
+
+### 3.3 Stage 1 — DINO self-supervised pretraining (run once)
+
+```bash
+python main.py pretrain
+# equivalent to:
+python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
+```
+
+Produces and publishes the **one** encoder checkpoint every downstream run
+reads: `${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth`. Do not
+run this per-variant — every ablation and baseline that consumes it must start
+from byte-identical weights, or the comparison table partly measures
+self-supervised initialisation noise instead of the architecture change under
+test.
+
+300 epochs at the paper's schedule. Budget for a multi-hour run on a single
+modern GPU; checkpoint every `save_interval` (50) epochs so it can resume.
+
+### 3.4 Stage 2 — single finetune run (smoke-test the head before the full suite)
+
+```bash
+python main.py finetune
+# with overrides, e.g. the submitted (not revised) configuration:
+python main.py finetune model.head.top_k=4 model.head.token_mode=pooled
+```
+
+### 3.5 Full ablation suite — 18 variants x 5 seeds = 90 runs
+
+```bash
+# Verify command construction first, no training:
+python scripts/run_ablations.py --dry-run
+
+# Real run, all variants, all 5 seeds (42-46):
+python scripts/run_ablations.py
+
+# Subset, single seed (quick check the suite plumbing works on this box):
+python scripts/run_ablations.py --variants full_model wo_moe wo_kl --seeds 42
+```
+
+Requires the Stage 1 checkpoint to exist (`ensure_pretrained_checkpoint()`
+refuses to start otherwise). Runs land in
+`${SEED_OUTPUT_DIR}/ablations/{variant}/seed{n}/`, each self-contained
+(Hydra snapshot, logs, checkpoint, `summary.json`, `test_predictions.npz`).
+
+### 3.6 Full baseline suite — 5 models x 5 seeds = 25 runs (+ optional LR sweep)
+
+```bash
+python scripts/run_baselines.py --dry-run
+python scripts/run_baselines.py
+python scripts/run_baselines.py --lr-sweep   # +6 runs: resnet50/swin_tiny x {1e-5,3e-5,1e-4}
+```
+
+Run `linear_probe` first if you only have time for one — its outcome bounds
+what the rest of the paper can claim. `resnet50`, `swin_tiny` and
+`swinv2_supervised` own their own ImageNet backbones and deliberately do
+**not** read the Stage 1 checkpoint; `linear_probe` and `hierarchical_cce` do.
+
+### 3.7 Report generation
+
+```bash
+python scripts/generate_plots.py
+# or restrict to specific run roots:
+python scripts/generate_plots.py --roots outputs/ablations outputs/baselines
+```
+
+Re-scores every run from its raw `test_predictions.npz` rather than trusting
+`summary.json`, so the table and the figures are computed by the same code.
+Writes `outputs/reports/summary_metrics.csv`, `summary_metrics_per_run.csv`
+and 300 DPI figures.
+
+### 3.8 Running detached (nohup / tmux)
+
+**tmux (recommended — lets you reattach and watch progress):**
+
+```bash
+tmux new -s seedmoe
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_OUTPUT_DIR=/workspace/outputs
+python main.py pretrain
+# Ctrl-b d to detach; `tmux attach -t seedmoe` to come back
+```
+
+**nohup, for a scripted end-to-end sequence:**
+
+```bash
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_OUTPUT_DIR=/workspace/outputs
+mkdir -p "${SEED_OUTPUT_DIR}/logs"
+
+nohup bash -c '
+  set -e
+  python main.py pretrain
+  python scripts/run_ablations.py
+  python scripts/run_baselines.py
+  python scripts/generate_plots.py
+' > "${SEED_OUTPUT_DIR}/logs/full_run.log" 2>&1 &
+
+echo "Launched PID $!"
+disown
+# tail -f "${SEED_OUTPUT_DIR}/logs/full_run.log" to watch
+```
+
+**Or, using the bundled launcher** (sets the three env vars for you if unset):
+
+```bash
+nohup scripts/train_distributed.sh pretrain   > logs/pretrain.log   2>&1 & disown
+# wait for it to finish, then:
+nohup scripts/train_distributed.sh ablations  > logs/ablations.log  2>&1 & disown
+nohup scripts/train_distributed.sh baselines  > logs/baselines.log  2>&1 & disown
+nohup scripts/train_distributed.sh report     > logs/report.log     2>&1 & disown
+```
+
+Each stage must finish before the next starts (ablations/baselines both read
+the checkpoint pretrain publishes) — do not launch them concurrently in the
+background expecting them to race safely.
+
+---
+
+## 4. Hyperparameter reference
+
+### 4.1 Data / training loop
+
+| Hyperparameter | Value | Where |
+| --- | --- | --- |
+| `data.batch_size` | 16 | `conf/data/hierarchical_seeds.yaml` |
+| `data.image_size` | 256 | must match backbone window resolution |
+| Stage 1 `learning_rate` | 0.0005 | `conf/experiment/pretrain_swinv2_dino.yaml` |
+| Stage 1 `epochs` | 300 | — |
+| Stage 1 `clip_grad` | 3.0 | — |
+| Stage 1 `gradient_accumulation_steps` | 4 (effective batch 64) | — |
+| Stage 1 teacher momentum | 0.996 -> 1.0 (cosine) | — |
+| Stage 1 weight decay | 0.04 -> 0.4 (cosine) | — |
+| Stage 2 `learning_rate` | 0.0001 | `conf/experiment/finetune_hierarchical_moe.yaml` |
+| Stage 2 `epochs` | 100 | — |
+| Stage 2 `weight_decay` | 0.0001 | — |
+| Stage 2 `clip_grad` | 3.0 | — |
+| `split_protocol` | `grouped` (default) / `stratified` (submitted) | — |
+| `test_size` | 0.2 | — |
+| `num_folds` | 1 (set >1 for `StratifiedGroupKFold`) | — |
+| `margin_warmup_fraction` | 0.15 | ArcFace margin ramps 0 -> m |
+| `router_noise_fraction` | 0.3 | gate noise anneals to 0 |
+| `horizontal_flip_prob` (stage 2) | 0.5 | — |
+| `random_resized_crop_scale` (stage 2) | [0.8, 1.0] | — |
+
+### 4.2 Model / MoE head (`conf/model/head/hierarchical_moe.yaml`)
+
+| Hyperparameter | Value | Notes |
+| --- | --- | --- |
+| `embed_dim` (z, Eq. 4) | 384 | encoder invariant, always 384 regardless of backbone width |
+| `num_experts` | 6 | Eq. 8 |
+| `top_k` | **2** (revised) / 4 (submitted) | `model.head.top_k=4` to reproduce the paper |
+| `moe_hidden_dim` | 512 | per-expert transformer hidden size |
+| `token_mode` | `grid` (revised) / `pooled` (submitted) | grid keeps the 8x8 token grid; pooled collapses attention to affine |
+| `router_mode` | `learned` | `hash` / `uniform` are ablation-only |
+| `gate_conditioning` | true | gate sees detached `p_s`; experts always see `z` |
+| `router_noise_std` | 0.3 | annealed to 0 |
+| `num_heads` (cross-attention) | 8 | only real under `token_mode=grid` |
+| `fusion_mode` | `additive` (Eq. 9) / `film` (ablation) | — |
+| `residual_layer_scale` | 0.0001 | LayerScale init |
+| `sub_head_variant` | `arcface` | `normface` / `linear` for ablation |
+| `arcface_scale` | `"auto"` -> 4.61 (AdaCos, C=27) | submitted value: 30.0 |
+| `arcface_margin` | 0.5 | ramped 0 -> 0.5 over `margin_warmup_fraction` |
+| `arcface_sub_centers` | 1 | data-cleaning tool, not a suite variant |
+
+### 4.3 Loss (`conf/model/loss/arcface_kl.yaml`)
+
+| Hyperparameter | Value | Notes |
+| --- | --- | --- |
+| `weighting_mode` | `fixed` (`uncertainty` learns 3 scalars) | — |
+| `lambda_seed` | 1.0 | Eq. 7 |
+| `lambda_arcface` | 1.0 | Eq. 13 |
+| `lambda_kl` | 1.0 | Eq. 10 |
+| `tau_kl` | 1.0 | decoupled from `arcface_scale` |
+| `lambda_moe_load` | 0.01 | — |
+| `lambda_moe_sparsity` | 0.0 | redundant under `renormalize_top_k` |
+| `lambda_moe_z` | 0.001 | ST-MoE router z-loss |
+| `lambda_cosine` | 0.1 | Section 1 compactness |
+| `lambda_residual` | 0.01 | hinge, zero below `residual_tau` |
+| `residual_tau` | 0.5 | — |
+| `moe_load_mode` | `switch` (revised) / `entropy` (submitted) | `model.loss.moe_load_mode=entropy` to reproduce the paper |
+| `cosine_mode` | `intra_class` (EMA centroids) / `residual` (submitted, collapses) | — |
+| `centroid_momentum` | 0.9 | EMA over class centroids |
+| `detach_kl_seed_target` | true | — |
+| `kl_mode` | `forward` (Eq. 10) / `jsd` (ablation) | — |
+
+### 4.4 Suite-level
+
+| Hyperparameter | Value | Notes |
+| --- | --- | --- |
+| `seeds` | `(42, 43, 44, 45, 46)` — `DEFAULT_SEEDS` in `src/trainers/runner.py` | every variant repeats over all 5 |
+| Ablation variants | 18 (see `scripts/run_ablations.py`) | `full_model` is the reference |
+| Baseline models | 5: `linear_probe`, `swinv2_supervised`, `resnet50`, `swin_tiny`, `hierarchical_cce` | see `scripts/run_baselines.py` |
+| LR sweep (optional) | `{1e-5, 3e-5, 1e-4}` for `resnet50`/`swin_tiny` | `--lr-sweep` flag |
+
+To reproduce the **submitted manuscript's** configuration point-for-point
+instead of the revision, chain the override table in `REVISION_NOTES.md` §0
+(e.g. `model.head.top_k=4 model.head.token_mode=pooled
+model.loss.moe_load_mode=entropy model.head.arcface_scale=30.0
+model.loss.cosine_mode=residual experiment.training.split_protocol=stratified`).
+
+---
+
+## 5. Output contract
+
+Every run — full model, every ablation variant, every baseline — writes to
+its own directory under `${SEED_OUTPUT_DIR}` and leaves the same set of
+artifacts, which is what lets `scripts/generate_plots.py` process all of them
+uniformly without retraining anything:
+
+```
+${SEED_OUTPUT_DIR}/
+  checkpoints/
+    dinov2_swinv2_pretrained.pth      # the ONE shared Stage-1 encoder
+  pretrain_swinv2_dino/
+    dino_pretrained_final.pth
+    dino_pretrained_backbone.pth
+    dino_checkpoint_epoch_XXXX.pth    # rolling, keep_last_n_checkpoints=1
+  finetune_hierarchical_moe/          # `main.py finetune` (single run)
+    summary.json
+    test_predictions.npz
+    split_manifest.npz
+    hierarchical_moe_final.pth
+    best_hierarchical_moe.pth
+  ablations/
+    {variant}/seed{42..46}/
+      summary.json
+      test_predictions.npz
+      split_manifest.npz
+      hydra/                          # full config snapshot for that run
+      *.pth
+    suite_manifest.json                # one row per (variant, seed): status, duration, path
+  baselines/
+    {model}/seed{42..46}/              # same contract as above
+    suite_manifest.json
+  reports/
+    summary_metrics.csv               # Model/Variant, Accuracy, Precision, Recall,
+                                       # Macro F1, Micro F1, KL Alignment Rate (%),
+                                       # Total Params (M), Active Params (M),
+                                       # Inference Latency (ms), + AUC/throughput/
+                                       # FLOPs/peak-memory appended to the right
+    summary_metrics_per_run.csv       # unaggregated, one row per (variant, seed)
+    *.png                             # confusion matrices, t-SNE, loss curves,
+                                       # expert utilization, metric heatmaps — 300 DPI
+  metadata/
+    seed_dataset.csv                  # image_path, seed_type(_label), subvariety(_label)
+  hydra/<date>/<time>/
+    tensorboard/                      # per-run TensorBoard logs
+  events.jsonl                        # append-only tracker event log, every run
+```
+
+Key points:
+
+- **`summary.json`** is the source of truth per run: scalar metrics,
+  `component_flags()` (every architectural axis, so `wo_kl` is
+  machine-distinguishable from `full_model`), `loss_flags()`, `split`
+  (protocol + leakage/provenance diagnostics), `fold_metrics`
+  (mean +- std across folds, not best-fold), efficiency report, loss history.
+- **`test_predictions.npz`** carries raw predictions, scores, 384-D
+  embeddings, routed expert indices and class names — `generate_plots.py`
+  re-scores from this rather than trusting `summary.json`.
+- **`split_manifest.npz`** persists the exact split (indices, source groups,
+  class mappings) so a reviewer can verify grouping rather than trust the
+  protocol name.
+- W&B runs in **offline mode** by default (never blocks on credentials);
+  TensorBoard is always on. A missing tracking backend degrades to a logged
+  warning, not a crash.
+- Defaults are tuned for a 16 GB disk: no optimizer-state checkpoints, no
+  teacher weights saved, `keep_last_n_checkpoints: 1`, histograms off. A
+  300-epoch pretrain run with those turned on is how the disk fills — leave
+  them off unless actively debugging.
+
+---
+
+## 6. Known, expected warnings (not bugs)
+
+- `Grouped splitting left these sub-varieties out of training entirely: [...]`
+  — expected for the 5 single-source-photograph sub-varieties (and possible
+  for others by chance under a small `test_size`). Logged and recorded in
+  `summary.json`, not a failure.
+- A `pynvml` deprecation `FutureWarning` on import — cosmetic, from a
+  transitive dependency.
+- A `lr_scheduler.step() before optimizer.step()` warning **only** appears in
+  artificially short smoke runs where `max_batches` is smaller than
+  `gradient_accumulation_steps` (so the optimizer never actually steps within
+  that truncated epoch). It does not occur in a real run, where an epoch
+  contains many accumulation windows.
