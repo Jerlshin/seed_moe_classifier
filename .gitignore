@@ -101,6 +101,7 @@ events.out.tfevents.*
 *.xlsx
 *.parquet
 *.csv
+/architecture/
 
 # ==============================================================================
 # Tools (Hidden Workspace Files & Notes)

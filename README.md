@@ -1,8 +1,7 @@
 # seed-moe-classifier
 
 Reference implementation of **"Hierarchical Deep Learning for Fine-Grained Seed
-Classification: A Self-Supervised and Mixture-of-Experts Approach"**
-(`../paper/sn-article.pdf`).
+Classification: A Self-Supervised and Mixture-of-Experts Approach"**.
 
 Two stages: DINO-style self-supervised pretraining of a Swin Transformer V2 encoder,
 then a hierarchical head that classifies 4 seed types and 27 sub-varieties with
