@@ -6,6 +6,7 @@ that do not require patch tokens -- KoLeo and Sinkhorn-Knopp centering. It is
 ``src/losses/dino.py``.
 
     python main.py pretrain
+    python main.py pretrain --gpus 2                     # DDP over 2 GPUs
     python main.py pretrain data.batch_size=2 experiment.training.epochs=1 \
         experiment.training.max_batches=2
 
@@ -76,10 +77,58 @@ per module at conversion time. See ``src/models/backbones/sdpa_attention.py``.
 
 Precision and compilation are configured under ``experiment.training`` -- see
 ``conf/experiment/pretrain_swinv2_dino.yaml``. ``amp: auto`` selects bf16 on
-Ampere and later, fp16 with a ``GradScaler`` on older CUDA cards, and off on
-CPU/MPS. The Sinkhorn normaliser, the prototype log-softmax and the KoLeo
-distances are pinned to fp32 inside the autocast region by ``src/losses/dino.py``;
-those three are the parts of this objective that fp16 cannot hold.
+Ampere and later, fp16 with a ``GradScaler`` on older CUDA cards (a T4 is one),
+and off on CPU/MPS. The Sinkhorn normaliser, the prototype log-softmax and the
+KoLeo distances are pinned to fp32 inside the autocast region by
+``src/losses/dino.py``; those three are the parts of this objective that fp16
+cannot hold.
+
+Running on more than one GPU
+============================
+
+    torchrun --standalone --nproc_per_node=2 -m src.trainers.contrastive_pretrain \
+        experiment=pretrain_swinv2_dino
+
+or ``python main.py pretrain --gpus 2``, which is the same thing with the run id
+pinned so every rank shares one output directory.
+
+**The effective batch is held fixed, not multiplied.** ``data.batch_size`` is the
+*per-rank* micro-batch, so launching on two GPUs would silently double the global
+batch -- and with it the LR/momentum regime the schedules are tuned to.
+``experiment.training.effective_batch_size`` is therefore the authority:
+:func:`resolve_accumulation` derives ``gradient_accumulation_steps`` from it and
+the world size, and refuses to start on a combination that does not divide
+exactly. One GPU at ``16 x 4`` and two at ``16 x 2`` are the same 64 images per
+optimizer step.
+
+**Holding the per-rank micro-batch fixed is also what preserves the objective.**
+Sinkhorn centering and KoLeo are batch statistics, not per-sample means, and both
+are already computed per *micro-batch* under accumulation. A rank that sees the
+same 16 images per micro-batch therefore computes the identical function to a
+single-GPU run's micro-batch. What genuinely must be synchronised is
+synchronised: gradients (by DDP, at accumulation boundaries only -- see
+:meth:`~src.models.backbones.swinv2_dino.DINO.no_sync`), the EMA centering buffer
+under ``centering="ema"``, and the teacher's weights at construction. Making the
+Sinkhorn assignment doubly stochastic over the *global* batch instead is
+available and exact (``model.loss.distributed_sinkhorn=true``), but it is a
+different objective from the single-GPU one and so is opt-in.
+
+Surviving an interrupted session
+================================
+
+``experiment.training.resume=auto`` continues from the newest valid checkpoint in
+the save directory, and starts fresh when there is none -- so the same command
+line works for the first launch and every relaunch after a Kaggle or vast.ai
+session ends. The resume checkpoint carries the teacher, the optimizer moments,
+the scheduler, the ``GradScaler``, the epoch, the global step, the micro-batch
+within the epoch and every rank's RNG state, which is what makes the continuation
+a continuation rather than a warm restart.
+
+Two triggers write it: ``resume_every_minutes`` (wall clock, the one that matters
+on a session-limited platform, where an epoch interval can easily be longer than
+the session) and a SIGTERM/SIGINT handler that finishes the current micro-batch
+and then saves. ``max_runtime_minutes`` stops the run cleanly before a hard
+session limit rather than relying on being signalled at all.
 """
 
 from __future__ import annotations
@@ -90,7 +139,9 @@ import random
 import shutil
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
+from typing import Any
 
 import hydra
 import numpy as np
@@ -109,20 +160,44 @@ from src.losses.dino import CustomDINOLoss
 from src.models.backbones.swinv2_dino import DINO, build_dino
 from src.utils.training import (
     CheckpointManager,
+    DistributedContext,
     ExperimentTracker,
+    InterruptGuard,
+    PeriodicSaver,
+    ResumeState,
     TeacherEmaUpdater,
+    TrainingProgress,
+    all_reduce_max,
+    all_reduce_mean,
     autocast_context,
+    barrier,
+    broadcast_object,
+    build_checkpoint_payload,
     build_grad_scaler,
     collect_device_stats,
+    collect_rng_states,
     configure_backend,
     log_attention_maps,
+    load_checkpoint_payload,
     resolve_amp,
-    select_device,
+    resolve_compile,
+    resolve_num_workers,
+    resolve_resume_path,
+    restore_components,
+    restore_rng_states,
+    setup_distributed,
     setup_experiment_logger,
+    shutdown_distributed,
     snapshot_run_configuration,
     to_cpu_state_dict,
 )
 from src.utils.visualization import plot_loss_curves
+
+#: Rolling resume checkpoints. Two, not one: on a preempted instance the newest
+#: file is the one a kill is most likely to have interrupted, and the previous
+#: one is what ``find_latest_checkpoint`` walks back to.
+RESUME_PREFIX = "dino_resume_step"
+RESUME_KEEP_LAST = 2
 
 
 def seed_everything(seed: int) -> None:
@@ -133,6 +208,13 @@ def seed_everything(seed: int) -> None:
     invokes with the run's ``deterministic`` setting. Stage 1 produces a single
     checkpoint rather than a row in a comparison table, so it defaults to
     autotuning; stage 2, where variants must be comparable, does not.
+
+    Every rank seeds **identically**, and that is deliberate: the student's
+    initialisation must match across ranks or DDP's construction-time broadcast
+    would be silently overwriting half the job's idea of the model. Divergence
+    where it is wanted -- the sample order, the augmentation stream -- comes from
+    the ``DistributedSampler`` and from a rank-offset dataloader generator, not
+    from the weights.
     """
     random.seed(seed)
     np.random.seed(seed)
@@ -153,6 +235,100 @@ def cosine_value(start: float, end: float, step: int, total: int) -> float:
         return float(end if total <= 1 else start)
     progress = min(max(step, 0), total) / total
     return float(end + (start - end) * (1.0 + math.cos(math.pi * progress)) / 2.0)
+
+
+def resolve_accumulation(
+    cfg: DictConfig,
+    context: DistributedContext,
+    logger,
+) -> tuple[int, int]:
+    """Return ``(accumulation_steps, effective_batch)``, honouring the world size.
+
+    ``experiment.training.effective_batch_size`` is the authority when it is set:
+    the accumulation count is *derived* from it, so the number of images behind
+    one optimizer step is identical on 1 GPU and on 8. That is not tidiness. The
+    learning rate, the teacher momentum schedule and every collapse guard in DINO
+    are tuned to a batch, and a run launched on two GPUs with the accumulation
+    left alone trains at twice the intended batch while every log line looks
+    normal.
+
+    A combination that does not divide exactly is refused rather than rounded.
+    Rounding would silently change the very number this function exists to pin,
+    and the fix -- change the micro-batch, or the target -- is one the operator
+    has to choose.
+
+    Falls back to the literal ``gradient_accumulation_steps`` when
+    ``effective_batch_size`` is null, warning if that makes the effective batch
+    world-size dependent.
+    """
+    micro_batch = int(cfg.data.batch_size)
+    configured = max(
+        int(OmegaConf.select(cfg, "experiment.training.gradient_accumulation_steps", default=1)), 1
+    )
+    target = OmegaConf.select(cfg, "experiment.training.effective_batch_size", default=None)
+
+    if target is None:
+        effective = micro_batch * configured * context.world_size
+        if context.world_size > 1:
+            logger.warning(
+                "effective_batch_size is null, so the effective batch is %s x %s x %s ranks = "
+                "%s images -- %sx the single-GPU value. Set "
+                "experiment.training.effective_batch_size to pin it instead.",
+                micro_batch, configured, context.world_size, effective, context.world_size,
+            )
+        return configured, effective
+
+    target = int(target)
+    per_step = micro_batch * context.world_size
+    if target % per_step != 0:
+        raise ValueError(
+            f"effective_batch_size={target} is not divisible by "
+            f"data.batch_size={micro_batch} x world_size={context.world_size} = {per_step}.\n"
+            "One optimizer step must consume a whole number of micro-batches on every rank. "
+            f"Use a multiple of {per_step}, or change data.batch_size."
+        )
+    accumulation = max(target // per_step, 1)
+    logger.info(
+        "Effective batch %s = %s per rank x %s ranks x %s accumulation steps.",
+        target, micro_batch, context.world_size, accumulation,
+    )
+    if accumulation != configured:
+        logger.info(
+            "gradient_accumulation_steps: %s configured -> %s derived from "
+            "effective_batch_size at this world size.",
+            configured, accumulation,
+        )
+    return accumulation, target
+
+
+def resume_position(
+    epoch: int,
+    global_step: int,
+    batch_idx: int,
+    is_last_batch: bool,
+    epochs: int,
+) -> TrainingProgress:
+    """Where a run stopping *here* should be recorded as having stopped.
+
+    The one non-obvious rule: a stop that lands on an epoch's **last**
+    micro-batch is recorded as the *start of the next epoch*, not as "this epoch,
+    fully consumed". Both describe the same position, but only the first one
+    survives a resume — the second re-enters an epoch with nothing left in it,
+    and the loop then finds zero batches where it expected the tail of one.
+
+    That state is not exotic: ``is_last_batch`` forces an optimizer step, so the
+    final micro-batch of every epoch is always a checkpoint opportunity.
+    """
+    if is_last_batch:
+        return TrainingProgress(
+            epoch=epoch + 1,
+            global_step=global_step,
+            micro_step=0,
+            completed=epoch + 1 >= epochs,
+        )
+    return TrainingProgress(
+        epoch=epoch, global_step=global_step, micro_step=batch_idx + 1, completed=False
+    )
 
 
 def build_optimizer(parameters, cfg: DictConfig, device: torch.device, logger) -> optim.Optimizer:
@@ -301,9 +477,16 @@ def save_dino_checkpoint(
 ) -> str:
     """Save student weights, and optionally the teacher and optimizer state.
 
-    Reads the *uncompiled* modules deliberately: ``DINO`` keeps any compiled
-    callables off the module tree precisely so these keys stay free of the
-    ``_orig_mod.`` prefix ``torch.compile`` would otherwise introduce.
+    The lightweight *artifact* writer: what a later run needs in order to read
+    the encoder. :func:`save_resume_checkpoint` is the other one, and it saves
+    everything needed to *continue*.
+
+    Reads the *uncompiled, unwrapped* modules deliberately: ``DINO`` keeps both
+    the compiled callables and the DDP wrapper off the module tree precisely so
+    these keys stay free of the ``_orig_mod.`` and ``module.`` prefixes those
+    wrappers would otherwise introduce. That state dict is the only handoff to
+    stage 2, where ``checkpoint_strict: false`` would turn a prefixed key set
+    into zero matches, one log line, and a full run against a random encoder.
     """
     payload = {
         "epoch": epoch,
@@ -316,6 +499,68 @@ def save_dino_checkpoint(
     if include_optimizer:
         payload["optimizer"] = optimizer.state_dict()
         payload["scheduler"] = scheduler.state_dict() if scheduler is not None else None
+    return checkpoint_manager.save(filename, payload, rolling_prefix=rolling_prefix)
+
+
+def resume_components(
+    model: DINO,
+    criterion: CustomDINOLoss,
+    optimizer: optim.Optimizer,
+    scheduler,
+    scaler,
+) -> dict[str, Any]:
+    """The named state a resume must carry, in one place used by save and load.
+
+    Keeping the mapping in a function rather than writing it out twice is what
+    stops the two sides drifting -- a component saved but never restored is a
+    resume that looks complete and quietly reinitialises something. The names
+    match :func:`save_dino_checkpoint`'s so one payload satisfies both readers.
+
+    The teacher is here because it *is* the training target: resuming without it
+    would rebuild it from the current student and throw away the EMA's entire
+    history. ``criterion`` is here for the centering buffer under
+    ``centering="ema"``, and the ``GradScaler`` because its scale is state --
+    restarting it at 65536 means a handful of skipped steps at every resume.
+    """
+    return {
+        "student_backbone": model.student_backbone,
+        "student_head": model.student_head,
+        "teacher_backbone": model.teacher_backbone,
+        "teacher_head": model.teacher_head,
+        "criterion": criterion,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
+        "scaler": scaler,
+    }
+
+
+def save_resume_checkpoint(
+    checkpoint_manager: CheckpointManager,
+    filename: str,
+    *,
+    components: dict[str, Any],
+    progress: TrainingProgress,
+    context: DistributedContext,
+    cfg: DictConfig,
+    loader_generator: torch.Generator | None,
+    extra: dict[str, Any] | None = None,
+    rolling_prefix: str | None = RESUME_PREFIX,
+) -> str:
+    """Write a fully resumable checkpoint. Collective: every rank must call it.
+
+    The RNG gather is a collective, so this cannot be guarded by ``if is_main``
+    at the call site -- the non-main ranks have to reach the gather or rank 0
+    blocks in it until the timeout. The *write* is guarded instead, inside
+    :class:`~src.utils.training.checkpoint.CheckpointManager`.
+    """
+    payload = build_checkpoint_payload(
+        components=components,
+        progress=progress,
+        context=context,
+        config=cfg,
+        rng_states=collect_rng_states(context, loader_generator),
+        extra={"epoch": progress.epoch, **(extra or {})},
+    )
     return checkpoint_manager.save(filename, payload, rolling_prefix=rolling_prefix)
 
 
@@ -348,26 +593,51 @@ def publish_shared_backbone(cfg: DictConfig, backbone_file: Path, logger) -> Pat
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # Before anything else: a rank has to know which device it owns before the
+    # first tensor is created, and NCCL binds its communicator to whatever device
+    # is current when the group comes up.
+    context = setup_distributed(
+        str(cfg.device),
+        timeout_minutes=float(
+            OmegaConf.select(cfg, "experiment.training.ddp.timeout_minutes", default=30)
+        ),
+    )
+    device = context.device
+
+    # Every rank must agree on the output directory. Hydra's `${now:...}` is
+    # evaluated per process, so two ranks launched in the same second can still
+    # land in different directories -- and one that did would write half the
+    # run's artifacts somewhere nobody looks. `SEED_RUN_ID` pins it at the
+    # launcher; this broadcast makes it hold even when it was not set.
+    output_dir = broadcast_object(str(cfg.tracking.output_dir), context)
     logger = setup_experiment_logger(
-        log_dir=cfg.tracking.output_dir,
+        log_dir=output_dir,
         name="seed_moe.dino_pretrain",
         level=cfg.tracking.log_level,
-        console=cfg.tracking.console,
+        console=bool(cfg.tracking.console) and context.is_main,
         structured_jsonl=cfg.tracking.structured_jsonl,
+        rank=context.rank,
+        world_size=context.world_size,
     )
-    tracker = ExperimentTracker(cfg, logger)
+    tracker = ExperimentTracker(cfg, logger, enabled=context.is_main)
     training_started = time.perf_counter()
+    interrupted = False
 
     try:
         logger.info("========== DINO pretraining: %s ==========", cfg.experiment.name)
+        if context.enabled:
+            logger.info(
+                "Distributed run | %s ranks, backend=%s, this rank owns %s.",
+                context.world_size, context.backend, device,
+            )
         seed_everything(int(cfg.seed))
-        snapshot_paths = snapshot_run_configuration(cfg, cfg.tracking.output_dir)
-        logger.info(
-            "Saved run configuration snapshots.",
-            extra={"snapshots": {key: str(value) for key, value in snapshot_paths.items()}},
-        )
+        if context.is_main:
+            snapshot_paths = snapshot_run_configuration(cfg, output_dir)
+            logger.info(
+                "Saved run configuration snapshots.",
+                extra={"snapshots": {key: str(value) for key, value in snapshot_paths.items()}},
+            )
 
-        device = select_device(cfg.device)
         backend = configure_backend(
             device,
             allow_tf32=bool(OmegaConf.select(cfg, "experiment.training.allow_tf32", default=True)),
@@ -382,11 +652,13 @@ def main(cfg: DictConfig) -> None:
             ),
             logger=logger,
         )
-        tracker.log_event("backend", backend)
+        tracker.log_event("backend", {**backend, "distributed": context.as_dict()})
         logger.info("Selected training device: %s", device)
         tracker.log_metrics(collect_device_stats(device), step=0)
 
-        amp = resolve_amp(device, OmegaConf.select(cfg, "experiment.training.amp", default="auto"))
+        amp = resolve_amp(
+            device, OmegaConf.select(cfg, "experiment.training.amp", default="auto"), logger=logger
+        )
         scaler = build_grad_scaler(amp)
         logger.info(
             "Mixed precision: %s (grad scaler: %s). bf16 needs no loss scaling; fp16 does.",
@@ -404,12 +676,17 @@ def main(cfg: DictConfig) -> None:
             return_original=False,
         )
         loader_generator = torch.Generator()
-        loader_generator.manual_seed(int(cfg.seed))
+        # Offset by rank so the augmentation streams are independent while rank 0
+        # stays byte-identical to a single-process run.
+        loader_generator.manual_seed(int(cfg.seed) + context.rank)
+        num_workers = resolve_num_workers(
+            OmegaConf.select(cfg, "data.num_workers", default=8), context, logger=logger
+        )
         dataloader = get_pretrain_dataloader(
             data_dir=cfg.data.root_path,
             transform=transform,
             batch_size=int(cfg.data.batch_size),
-            num_workers=int(cfg.data.num_workers),
+            num_workers=num_workers,
             dataset_format=str(cfg.data.dataset_format),
             image_size=int(cfg.data.image_size),
             pin_memory=bool(cfg.data.pin_memory) and device.type == "cuda",
@@ -422,9 +699,16 @@ def main(cfg: DictConfig) -> None:
             cache_limit_mb=float(OmegaConf.select(cfg, "data.cache_limit_mb", default=4096)),
             generator=loader_generator,
             logger=logger,
+            world_size=context.world_size,
+            rank=context.rank,
         )
         if len(dataloader) == 0:
-            raise RuntimeError("Dataloader is empty. Lower the batch size or check data.root_path.")
+            raise RuntimeError(
+                "Dataloader is empty. Lower data.batch_size, or -- on a distributed run -- "
+                "note that the dataset is sharded first, so each rank needs at least one "
+                "full batch of its own share."
+            )
+        sampler = dataloader.sampler if context.enabled else None
         num_crops = transform.num_crops
         logger.info(
             "Loaded %s batches of %s images, %s views each (2 global + %s local).",
@@ -454,8 +738,10 @@ def main(cfg: DictConfig) -> None:
             freeze_last_layer_epochs=int(cfg.experiment.training.freeze_last_layer_epochs),
         ).to(device)
         runtime = model.configure_runtime(
-            compile_enabled=bool(
-                OmegaConf.select(cfg, "experiment.training.compile.enabled", default=False)
+            compile_enabled=resolve_compile(
+                OmegaConf.select(cfg, "experiment.training.compile.enabled", default="auto"),
+                device,
+                logger,
             ),
             compile_mode=str(
                 OmegaConf.select(cfg, "experiment.training.compile.mode", default="default")
@@ -504,22 +790,90 @@ def main(cfg: DictConfig) -> None:
                 OmegaConf.select(cfg, "model.loss.sinkhorn_iterations", default=3)
             ),
             lambda_koleo=float(OmegaConf.select(cfg, "model.loss.lambda_koleo", default=0.0)),
+            context=context,
+            distributed_sinkhorn=bool(
+                OmegaConf.select(cfg, "model.loss.distributed_sinkhorn", default=False)
+            ),
         ).to(device)
         logger.info(
-            "Stage 1 objective: DINO self-distillation | centering=%s koleo=%s prototypes=%s",
+            "Stage 1 objective: DINO self-distillation | centering=%s koleo=%s prototypes=%s "
+            "distributed_sinkhorn=%s",
             criterion.centering,
             criterion.lambda_koleo,
             int(cfg.model.head.out_dim),
+            criterion.distributed_sinkhorn,
         )
+
+        # DDP goes on *after* the runtime options, so the compiled callables and
+        # the SDPA rebinding are already in place when the reducer is built.
+        distributed_runtime = model.configure_distributed(
+            context,
+            gradient_as_bucket_view=bool(
+                OmegaConf.select(cfg, "experiment.training.ddp.gradient_as_bucket_view", default=True)
+            ),
+            static_graph=bool(
+                OmegaConf.select(cfg, "experiment.training.ddp.static_graph", default=False)
+            ),
+            find_unused_parameters=bool(
+                OmegaConf.select(
+                    cfg, "experiment.training.ddp.find_unused_parameters", default=False
+                )
+            ),
+            bucket_cap_mb=OmegaConf.select(
+                cfg, "experiment.training.ddp.bucket_cap_mb", default=None
+            ),
+            logger=logger,
+        )
+        tracker.log_event("distributed_runtime", distributed_runtime)
 
         optimizer = build_optimizer(student_parameters, cfg, device, logger)
         scheduler = build_scheduler(optimizer, cfg)
 
         save_path = Path(cfg.experiment.training.save_path)
-        save_path.mkdir(parents=True, exist_ok=True)
+        if context.is_main:
+            save_path.mkdir(parents=True, exist_ok=True)
+        barrier(context)
         checkpoint_manager = CheckpointManager(
-            save_path, keep_last_n=int(cfg.experiment.training.keep_last_n_checkpoints)
+            save_path,
+            keep_last_n=int(cfg.experiment.training.keep_last_n_checkpoints),
+            enabled=context.is_main,
         )
+        resume_manager = CheckpointManager(
+            save_path, keep_last_n=RESUME_KEEP_LAST, enabled=context.is_main
+        )
+
+        # ------------------------------------------------------------- resume
+        components = resume_components(model, criterion, optimizer, scheduler, scaler)
+        resume = ResumeState()
+        resume_path = resolve_resume_path(
+            OmegaConf.select(cfg, "experiment.training.resume", default=False),
+            save_path,
+            patterns=(f"{RESUME_PREFIX}*.pth",),
+            logger=logger,
+        )
+        # Rank 0 decides; every rank obeys. Two ranks scanning the same directory
+        # can disagree the moment one of them sees a file mid-write, and a job
+        # where half the ranks resumed is worse than one where none did.
+        resume_path = broadcast_object(str(resume_path) if resume_path else None, context)
+        if resume_path:
+            payload = load_checkpoint_payload(resume_path, map_location=device, logger=logger)
+            report = restore_components(payload, components, strict=True, logger=logger)
+            restore_rng_states(payload, context, loader_generator, logger=logger)
+            resume = ResumeState(
+                path=Path(resume_path),
+                progress=TrainingProgress.from_dict(payload.get("progress")),
+                report=report,
+            )
+            logger.info("Resume | %s", resume.describe())
+            tracker.log_event(
+                "resume",
+                {
+                    "path": str(resume_path),
+                    "saved_world_size": (payload.get("distributed") or {}).get("world_size"),
+                    "world_size": context.world_size,
+                    **resume.progress.as_dict(),
+                },
+            )
 
         # ------------------------------------------------------- loop config
         epochs = int(cfg.experiment.training.epochs)
@@ -532,24 +886,26 @@ def main(cfg: DictConfig) -> None:
         weight_decay_final = OmegaConf.select(
             cfg, "experiment.training.weight_decay_final", default=None
         )
-        accumulation_steps = max(
-            int(OmegaConf.select(cfg, "experiment.training.gradient_accumulation_steps", default=1)), 1
-        )
+        accumulation_steps, effective_batch = resolve_accumulation(cfg, context, logger)
         # Every collapse guard in DINO is a batch statistic, so the number that
         # matters is the effective batch, not `data.batch_size`.
         logger.info(
-            "Effective batch: %s x %s accumulation = %s images (%s teacher views/step, "
-            "%s student views/step)",
+            "Effective batch: %s x %s ranks x %s accumulation = %s images "
+            "(%s teacher views/step, %s student views/step)",
             int(cfg.data.batch_size),
+            context.world_size,
             accumulation_steps,
-            int(cfg.data.batch_size) * accumulation_steps,
-            int(cfg.data.batch_size) * accumulation_steps * 2,
-            int(cfg.data.batch_size) * accumulation_steps * num_crops,
+            effective_batch,
+            effective_batch * 2,
+            effective_batch * num_crops,
         )
         clip_grad = cfg.experiment.training.clip_grad
         save_interval = int(cfg.experiment.training.save_interval)
         save_full_checkpoints = bool(cfg.experiment.training.save_full_checkpoints)
         save_teacher = bool(cfg.experiment.training.save_teacher_in_checkpoints)
+        fast_forward = bool(
+            OmegaConf.select(cfg, "experiment.training.resume_fast_forward", default=True)
+        )
 
         intervals = cfg.tracking.intervals
         artifacts = cfg.tracking.artifacts
@@ -562,7 +918,7 @@ def main(cfg: DictConfig) -> None:
         gradient_norm_every_steps = int(
             OmegaConf.select(cfg, "tracking.intervals.gradient_norm_every_steps", default=200)
         )
-        global_step = 0
+        global_step = resume.progress.global_step
         loss_history: list[float] = []
 
         momentum = momentum_start
@@ -574,291 +930,482 @@ def main(cfg: DictConfig) -> None:
             momentum_final if momentum_final is not None else "(constant)",
         )
 
-        for epoch in range(epochs):
-            epoch_started = time.perf_counter()
-            # Accumulated on the device. Summing `float(loss)` here would put a
-            # full pipeline stall in every micro-batch.
-            total_loss = torch.zeros((), device=device, dtype=torch.float32)
-            batches_seen = 0
-            data_wait = 0.0
-            model.train()
-            if device.type == "cuda":
-                torch.cuda.reset_peak_memory_stats()
+        periodic = PeriodicSaver(
+            OmegaConf.select(cfg, "experiment.training.resume_every_minutes", default=None)
+        )
+        # How often the ranks compare notes about stopping and saving. Every
+        # rank reaches the same `global_step`, so this is the one schedule they
+        # can agree on without a collective per step.
+        resume_check_every = max(
+            int(OmegaConf.select(cfg, "experiment.training.resume_check_every_steps", default=20)), 1
+        )
+        guard_ctx = InterruptGuard(
+            OmegaConf.select(cfg, "experiment.training.max_runtime_minutes", default=None),
+            logger=logger,
+        )
 
-            momentum = (
-                cosine_value(momentum_start, float(momentum_final), epoch, epochs)
-                if momentum_final is not None
-                else momentum_start
-            )
+        with guard_ctx as guard:
+            for epoch in range(resume.progress.epoch, epochs):
+                epoch_started = time.perf_counter()
+                # Accumulated on the device. Summing `float(loss)` here would put
+                # a full pipeline stall in every micro-batch.
+                total_loss = torch.zeros((), device=device, dtype=torch.float32)
+                batches_seen = 0
+                data_wait = 0.0
+                model.train()
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats()
 
-            optimizer.zero_grad(set_to_none=True)
-            micro_in_window = 0
-            wait_started = time.perf_counter()
+                # The sampler's permutation is a function of `seed + epoch`.
+                # Without this call every epoch replays the first one -- no
+                # error, no visible change in the loss magnitude, and 300 epochs
+                # of one epoch's data.
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
 
-            for batch_idx, batch in enumerate(dataloader):
-                if max_batches is not None and batch_idx >= max_batches:
-                    break
-                data_wait += time.perf_counter() - wait_started
-
-                is_last_batch = (
-                    batch_idx + 1 == len(dataloader)
-                    or (max_batches is not None and batch_idx + 1 >= max_batches)
+                momentum = (
+                    cosine_value(momentum_start, float(momentum_final), epoch, epochs)
+                    if momentum_final is not None
+                    else momentum_start
                 )
-                is_step = (micro_in_window + 1) % accumulation_steps == 0 or is_last_batch
-                will_log = is_step and (global_step % log_every_steps == 0)
-                # The collapse diagnostics are only ever read on logging steps,
-                # so on every other step they are not computed at all.
-                criterion.metrics_enabled = will_log
 
-                student_views, teacher_views, batch_size = batcher(batch)
+                optimizer.zero_grad(set_to_none=True)
+                micro_in_window = 0
+                skip_batches = 0
+                if epoch == resume.progress.epoch and resume.progress.micro_step > 0:
+                    skip_batches = int(resume.progress.micro_step)
+                    if not fast_forward:
+                        logger.warning(
+                            "resume_fast_forward=false: restarting epoch %s from its first "
+                            "batch instead of continuing at micro-batch %s.",
+                            epoch + 1, skip_batches,
+                        )
+                        skip_batches = 0
 
-                with autocast_context(amp):
-                    # One fused forward for the teacher's 2B globals ...
-                    teacher_out = model.forward_teacher_views(
-                        teacher_views, chunk_size=forward_chunk_size
-                    )
-                    # ... and one for the student's 6B views, view-major.
-                    student_out, bottleneck = model.forward_student_views(
-                        student_views, return_bottleneck=True, chunk_size=forward_chunk_size
-                    )
-                    # KoLeo measures uniformity of the *representation*, so it
-                    # reads the bottleneck of the global views, not the prototype
-                    # logits. The globals are the leading 2B rows.
-                    student_embeddings = (
-                        bottleneck[: 2 * batch_size] if criterion.lambda_koleo > 0 else None
-                    )
-                    loss = criterion(
-                        student_out,
-                        teacher_out,
-                        epoch=epoch,
-                        # Explicit view identifiers. Matching by position is only
-                        # correct while the student's first two views are the two
-                        # globals in the teacher's order -- an invariant nothing
-                        # enforced, and one whose violation would silently skip a
-                        # global-local pair and include a same-view pair.
-                        student_view_ids=transform.view_ids,
-                        teacher_view_ids=transform.global_view_ids,
-                        student_embeddings=student_embeddings,
+                iterator = enumerate(dataloader)
+                if skip_batches:
+                    logger.info(
+                        "Skipping %s already-consumed micro-batches of epoch %s.",
+                        skip_batches, epoch + 1,
                     )
 
-                scaled = loss / accumulation_steps
-                if scaler is not None:
-                    scaler.scale(scaled).backward()
-                else:
-                    scaled.backward()
+                wait_started = time.perf_counter()
+                for batch_idx, batch in iterator:
+                    if batch_idx < skip_batches:
+                        # Consumed and discarded, which is what makes the resume
+                        # land mid-epoch rather than restart it: the sample order
+                        # comes from the sampler's `seed + epoch` permutation (or
+                        # the restored generator state on one process), so the
+                        # batches after the skip are the ones the interrupted run
+                        # would have seen next. The cost is real augmentation
+                        # work thrown away, bounded by the save interval.
+                        wait_started = time.perf_counter()
+                        continue
+                    if max_batches is not None and batch_idx >= max_batches:
+                        break
+                    data_wait += time.perf_counter() - wait_started
 
-                gradient_norm = None
-                clipped_norm = None
+                    is_last_batch = (
+                        batch_idx + 1 == len(dataloader)
+                        or (max_batches is not None and batch_idx + 1 >= max_batches)
+                    )
+                    is_step = (micro_in_window + 1) % accumulation_steps == 0 or is_last_batch
+                    will_log = is_step and (global_step % log_every_steps == 0)
+                    # The collapse diagnostics are only ever read on logging
+                    # steps, so on every other step they are not computed at all.
+                    criterion.metrics_enabled = will_log
 
-                if is_step:
-                    if scaler is not None:
-                        # Gradients must be back on their true scale before
-                        # anything inspects or clips them.
-                        scaler.unscale_(optimizer)
+                    student_views, teacher_views, batch_size = batcher(batch)
 
-                    if (
-                        artifacts.log_gradient_norms
-                        and gradient_norm_every_steps > 0
-                        and global_step % gradient_norm_every_steps == 0
-                    ):
-                        gradient_norm = tracker.log_gradient_norms(model, global_step)
+                    # Suppress DDP's all-reduce except on the boundary. Without
+                    # this the full gradient crosses the interconnect once per
+                    # micro-batch instead of once per optimizer step, for an
+                    # identical result -- which on two T4s over PCIe is enough
+                    # to make the two-GPU run slower than the one-GPU run.
+                    sync_context = nullcontext() if is_step else model.no_sync()
+                    with sync_context:
+                        with autocast_context(amp):
+                            # One fused forward for the teacher's 2B globals ...
+                            teacher_out = model.forward_teacher_views(
+                                teacher_views, chunk_size=forward_chunk_size
+                            )
+                            # ... and one for the student's 6B views, view-major.
+                            student_out, bottleneck = model.forward_student_views(
+                                student_views, return_bottleneck=True, chunk_size=forward_chunk_size
+                            )
+                            # KoLeo measures uniformity of the *representation*,
+                            # so it reads the bottleneck of the global views, not
+                            # the prototype logits. The globals are the leading
+                            # 2B rows.
+                            student_embeddings = (
+                                bottleneck[: 2 * batch_size] if criterion.lambda_koleo > 0 else None
+                            )
+                            loss = criterion(
+                                student_out,
+                                teacher_out,
+                                epoch=epoch,
+                                # Explicit view identifiers. Matching by position
+                                # is only correct while the student's first two
+                                # views are the two globals in the teacher's
+                                # order -- an invariant nothing enforced, and one
+                                # whose violation would silently skip a
+                                # global-local pair and include a same-view pair.
+                                student_view_ids=transform.view_ids,
+                                teacher_view_ids=transform.global_view_ids,
+                                student_embeddings=student_embeddings,
+                            )
 
-                    if clip_grad is not None and float(clip_grad) > 0:
-                        clipped_norm = torch.nn.utils.clip_grad_norm_(
-                            student_parameters, max_norm=float(clip_grad)
+                        scaled = loss / accumulation_steps
+                        if scaler is not None:
+                            scaler.scale(scaled).backward()
+                        else:
+                            scaled.backward()
+
+                    gradient_norm = None
+                    clipped_norm = None
+
+                    if is_step:
+                        if scaler is not None:
+                            # Gradients must be back on their true scale before
+                            # anything inspects or clips them.
+                            scaler.unscale_(optimizer)
+
+                        if (
+                            artifacts.log_gradient_norms
+                            and gradient_norm_every_steps > 0
+                            and global_step % gradient_norm_every_steps == 0
+                        ):
+                            gradient_norm = tracker.log_gradient_norms(model, global_step)
+
+                        if clip_grad is not None and float(clip_grad) > 0:
+                            # Every rank clips the same all-reduced gradient, so
+                            # every rank computes the same scale factor and the
+                            # parameters stay bit-identical across the job.
+                            clipped_norm = torch.nn.utils.clip_grad_norm_(
+                                student_parameters, max_norm=float(clip_grad)
+                            )
+
+                        # Section 6.1: last layer frozen for the first epoch.
+                        # Cancelled *after* clipping and *before* step(),
+                        # matching the reference implementation's ordering.
+                        model.student_head.cancel_last_layer_gradients(current_epoch=epoch)
+
+                        if (
+                            artifacts.log_gradient_histograms
+                            and int(intervals.gradient_histogram_every_epochs) > 0
+                            and (epoch + 1) % int(intervals.gradient_histogram_every_epochs) == 0
+                            and batch_idx == 0
+                        ):
+                            tracker.log_gradient_histograms(model, global_step)
+
+                        if scaler is not None:
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+
+                        # EMA teacher update, cosine-scheduled 0.996 -> 1.0
+                        # (DINO). Every rank runs it on identical students, so
+                        # the teachers stay identical without a collective.
+                        ema.update(momentum)
+                        micro_in_window = 0
+                    else:
+                        micro_in_window += 1
+
+                    total_loss += loss.detach().float()
+                    batches_seen += 1
+
+                    if will_log:
+                        lr = optimizer.param_groups[0]["lr"]
+                        elapsed = max(time.perf_counter() - epoch_started, 1e-9)
+                        # One collective, on logging steps only, so the reported
+                        # loss is the global one rather than this rank's shard.
+                        logged_loss = all_reduce_mean(loss.detach().float().clone(), context)
+                        step_metrics = {
+                            # The single synchronisation point of the step.
+                            "loss": float(logged_loss),
+                            "lr": lr,
+                            "teacher_temp": criterion.teacher_temperature(epoch),
+                            "teacher_momentum": momentum,
+                            "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                            "images_per_second": (
+                                batches_seen * batch_size * context.world_size / elapsed
+                            ),
+                            "views_per_second": (
+                                batches_seen * batch_size * num_crops * context.world_size / elapsed
+                            ),
+                            # If this is large the GPU is starving and the fix is
+                            # in data.num_workers / prefetch_factor /
+                            # cache_images, not in the model.
+                            "data_wait_fraction": data_wait / elapsed,
+                            # The loss curve of a partially collapsed run looks
+                            # perfectly plausible. These are the numbers that do
+                            # not.
+                            **criterion.last_metrics,
+                        }
+                        if gradient_norm is not None:
+                            step_metrics["gradient_norm"] = gradient_norm
+                        if clipped_norm is not None:
+                            step_metrics["clipped_gradient_norm"] = float(clipped_norm)
+                        if scaler is not None:
+                            step_metrics["grad_scale"] = float(scaler.get_scale())
+                        tracker.log_metrics(step_metrics, global_step, prefix="train")
+                        logger.info(
+                            "Step %s | epoch=%s batch=%s loss=%.5f lr=%.6g tau_t=%.4f "
+                            "img/s=%.1f data_wait=%.1f%%",
+                            global_step, epoch + 1, batch_idx + 1, step_metrics["loss"],
+                            lr, criterion.teacher_temperature(epoch),
+                            step_metrics["images_per_second"],
+                            step_metrics["data_wait_fraction"] * 100.0,
                         )
 
-                    # Section 6.1: last layer frozen for the first epoch. Cancelled
-                    # *after* clipping and *before* step(), matching the reference
-                    # implementation's ordering.
-                    model.student_head.cancel_last_layer_gradients(current_epoch=epoch)
+                    if is_step and global_step % device_every_steps == 0:
+                        tracker.log_metrics(collect_device_stats(device), global_step)
 
                     if (
-                        artifacts.log_gradient_histograms
-                        and int(intervals.gradient_histogram_every_epochs) > 0
-                        and (epoch + 1) % int(intervals.gradient_histogram_every_epochs) == 0
+                        artifacts.log_embeddings
+                        and int(intervals.embedding_every_epochs) > 0
+                        and (epoch + 1) % int(intervals.embedding_every_epochs) == 0
                         and batch_idx == 0
                     ):
-                        tracker.log_gradient_histograms(model, global_step)
+                        tracker.log_embeddings(
+                            "dino/student_projection",
+                            student_out[:batch_size].detach(),
+                            global_step,
+                            metadata=[str(item) for item in batch.paths],
+                        )
 
-                    if scaler is not None:
-                        scaler.step(optimizer)
-                        scaler.update()
-                    else:
-                        optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
+                    if (
+                        artifacts.log_attention_maps
+                        and int(intervals.attention_every_epochs) > 0
+                        and (epoch + 1) % int(intervals.attention_every_epochs) == 0
+                        and batch_idx == 0
+                    ):
+                        log_attention_maps(
+                            tracker, model.student_backbone, student_views[:batch_size], global_step,
+                            logger=logger, max_images=int(artifacts.max_attention_images),
+                        )
 
-                    # EMA teacher update, cosine-scheduled 0.996 -> 1.0 (DINO).
-                    ema.update(momentum)
-                    micro_in_window = 0
+                    if is_step:
+                        global_step += 1
+
+                        # Checkpoints are written only here, at an accumulation
+                        # boundary with the gradients already applied and zeroed.
+                        # Saving mid-window would store a half-accumulated
+                        # gradient that nothing restores, so a resume would drop
+                        # part of one step's data -- silently.
+                        #
+                        # Latched every step (a monotonic clock comparison), but
+                        # *acted on* only at a step index every rank agrees on.
+                        # Both triggers are wall-clock based and so genuinely
+                        # differ between ranks: acting locally would put one rank
+                        # into the checkpoint's RNG gather -- a collective --
+                        # while its peers ran on, and the job would hang at the
+                        # collective timeout with no error to point at.
+                        stop = guard.should_stop()
+                        due = periodic.due()
+                        stop_now, stop_reason = stop.requested, stop.reason
+
+                        if context.enabled and global_step % resume_check_every == 0:
+                            flags = torch.tensor(
+                                [1.0 if due else 0.0, 1.0 if stop.requested else 0.0],
+                                device=device,
+                                dtype=torch.float32,
+                            )
+                            all_reduce_max(flags, context)
+                            due, stop_now = bool(flags[0] > 0), bool(flags[1] > 0)
+                            if stop_now and not stop_reason:
+                                stop_reason = "another rank requested a stop"
+                        elif context.enabled:
+                            # Not a decision point for the job: keep the latch,
+                            # take no collective.
+                            due, stop_now = False, False
+
+                        if due or stop_now:
+                            progress = resume_position(
+                                epoch, global_step, batch_idx, is_last_batch, epochs
+                            )
+                            path = save_resume_checkpoint(
+                                resume_manager,
+                                f"{RESUME_PREFIX}{global_step:09d}.pth",
+                                components=components,
+                                progress=progress,
+                                context=context,
+                                cfg=cfg,
+                                loader_generator=loader_generator,
+                                extra={"effective_batch_size": effective_batch},
+                            )
+                            periodic.mark()
+                            tracker.log_event(
+                                "resume_checkpoint",
+                                {"path": path, "reason": stop_reason or "interval", **progress.as_dict()},
+                            )
+                            logger.info(
+                                "Wrote resume checkpoint at step %s (%s): %s",
+                                global_step, stop_reason or "interval", path,
+                            )
+                        if stop_now:
+                            interrupted = True
+                            logger.warning("Stopping after step %s: %s", global_step, stop_reason)
+                            break
+
+                    wait_started = time.perf_counter()
+
+                if interrupted:
+                    break
+
+                if batches_seen == 0:
+                    if skip_batches == 0:
+                        raise RuntimeError(
+                            "No batches were processed. Check max_batches and the dataloader."
+                        )
+                    # Every micro-batch of this epoch was already consumed before
+                    # the interruption, and fewer are available now than were
+                    # then -- which happens when the job resumes at a smaller
+                    # world size, since each rank's share of the epoch grows.
+                    # The epoch is over; fall through so the scheduler and the
+                    # weight-decay ramp still advance for it.
+                    logger.warning(
+                        "Epoch %s had %s micro-batches to skip but only %s exist at this "
+                        "world size; treating it as complete and continuing.",
+                        epoch + 1, skip_batches, len(dataloader),
+                    )
+                    average_loss = float("nan")
                 else:
-                    micro_in_window += 1
+                    # Both are per-rank sums over an identical batch count, so
+                    # the mean of the means is the global mean.
+                    average_loss = float(all_reduce_mean(total_loss / batches_seen, context))
+                    loss_history.append(average_loss)
+                epoch_seconds = time.perf_counter() - epoch_started
 
-                total_loss += loss.detach().float()
-                batches_seen += 1
+                if scheduler is not None:
+                    scheduler.step()
+                new_lr = optimizer.param_groups[0]["lr"]
 
-                if will_log:
-                    lr = optimizer.param_groups[0]["lr"]
-                    elapsed = max(time.perf_counter() - epoch_started, 1e-9)
-                    step_metrics = {
-                        # The single synchronisation point of the step, taken
-                        # only on logging steps.
-                        "loss": float(loss.detach()),
-                        "lr": lr,
-                        "teacher_temp": criterion.teacher_temperature(epoch),
-                        "teacher_momentum": momentum,
-                        "weight_decay": optimizer.param_groups[0]["weight_decay"],
-                        "images_per_second": batches_seen * batch_size / elapsed,
-                        "views_per_second": batches_seen * batch_size * num_crops / elapsed,
-                        # If this is large the GPU is starving and the fix is in
-                        # data.num_workers / prefetch_factor / cache_images, not
-                        # in the model.
-                        "data_wait_fraction": data_wait / elapsed,
-                        # The loss curve of a partially collapsed run looks
-                        # perfectly plausible. These are the numbers that do not.
-                        **criterion.last_metrics,
-                    }
-                    if gradient_norm is not None:
-                        step_metrics["gradient_norm"] = gradient_norm
-                    if clipped_norm is not None:
-                        step_metrics["clipped_gradient_norm"] = float(clipped_norm)
-                    if scaler is not None:
-                        step_metrics["grad_scale"] = float(scaler.get_scale())
-                    tracker.log_metrics(step_metrics, global_step, prefix="train")
-                    logger.info(
-                        "Step %s | epoch=%s batch=%s loss=%.5f lr=%.6g tau_t=%.4f "
-                        "img/s=%.1f data_wait=%.1f%%",
-                        global_step, epoch + 1, batch_idx + 1, step_metrics["loss"],
-                        lr, criterion.teacher_temperature(epoch),
-                        step_metrics["images_per_second"],
-                        step_metrics["data_wait_fraction"] * 100.0,
+                # Weight decay is cosine-scheduled 0.04 -> 0.4 in DINO. The
+                # submitted constant 0.01 sat below even the schedule's starting
+                # value.
+                if weight_decay_final is not None:
+                    decay = cosine_value(
+                        weight_decay_start, float(weight_decay_final), epoch + 1, epochs
                     )
+                    for group in optimizer.param_groups:
+                        group["weight_decay"] = decay
 
-                if is_step and global_step % device_every_steps == 0:
-                    tracker.log_metrics(collect_device_stats(device), global_step)
-
-                if (
-                    artifacts.log_embeddings
-                    and int(intervals.embedding_every_epochs) > 0
-                    and (epoch + 1) % int(intervals.embedding_every_epochs) == 0
-                    and batch_idx == 0
-                ):
-                    tracker.log_embeddings(
-                        "dino/student_projection",
-                        student_out[:batch_size].detach(),
-                        global_step,
-                        metadata=[str(item) for item in batch.paths],
-                    )
-
-                if (
-                    artifacts.log_attention_maps
-                    and int(intervals.attention_every_epochs) > 0
-                    and (epoch + 1) % int(intervals.attention_every_epochs) == 0
-                    and batch_idx == 0
-                ):
-                    log_attention_maps(
-                        tracker, model.student_backbone, student_views[:batch_size], global_step,
-                        logger=logger, max_images=int(artifacts.max_attention_images),
-                    )
-
-                if is_step:
-                    global_step += 1
-                wait_started = time.perf_counter()
-
-            if batches_seen == 0:
-                raise RuntimeError("No batches were processed. Check max_batches and the dataloader.")
-
-            average_loss = float(total_loss) / batches_seen
-            loss_history.append(average_loss)
-            epoch_seconds = time.perf_counter() - epoch_started
-
-            if scheduler is not None:
-                scheduler.step()
-            new_lr = optimizer.param_groups[0]["lr"]
-
-            # Weight decay is cosine-scheduled 0.04 -> 0.4 in DINO. The submitted
-            # constant 0.01 sat below even the schedule's starting value.
-            if weight_decay_final is not None:
-                decay = cosine_value(
-                    weight_decay_start, float(weight_decay_final), epoch + 1, epochs
+                epoch_metrics = {
+                    "loss": average_loss,
+                    "duration_seconds": epoch_seconds,
+                    "batches": batches_seen * context.world_size,
+                    "lr": new_lr,
+                    "teacher_temp": criterion.teacher_temperature(epoch),
+                    "images_per_second": (
+                        batches_seen * int(cfg.data.batch_size) * context.world_size / epoch_seconds
+                    ),
+                    "data_wait_fraction": data_wait / epoch_seconds,
+                }
+                if device.type == "cuda":
+                    epoch_metrics["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1024**2
+                tracker.log_metrics(epoch_metrics, epoch + 1, prefix="epoch")
+                logger.info(
+                    "Epoch %s/%s | loss=%.5f batches=%s duration=%.2fs img/s=%.1f "
+                    "data_wait=%.1f%% peak_mem=%.0fMB",
+                    epoch + 1, epochs, average_loss, batches_seen, epoch_seconds,
+                    epoch_metrics["images_per_second"],
+                    epoch_metrics["data_wait_fraction"] * 100.0,
+                    epoch_metrics.get("peak_memory_mb", 0.0),
                 )
-                for group in optimizer.param_groups:
-                    group["weight_decay"] = decay
 
-            epoch_metrics = {
-                "loss": average_loss,
-                "duration_seconds": epoch_seconds,
-                "batches": batches_seen,
-                "lr": new_lr,
-                "teacher_temp": criterion.teacher_temperature(epoch),
-                "images_per_second": batches_seen * int(cfg.data.batch_size) / epoch_seconds,
-                "data_wait_fraction": data_wait / epoch_seconds,
-            }
-            if device.type == "cuda":
-                epoch_metrics["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1024**2
-            tracker.log_metrics(epoch_metrics, epoch + 1, prefix="epoch")
-            logger.info(
-                "Epoch %s/%s | loss=%.5f batches=%s duration=%.2fs img/s=%.1f "
-                "data_wait=%.1f%% peak_mem=%.0fMB",
-                epoch + 1, epochs, average_loss, batches_seen, epoch_seconds,
-                epoch_metrics["images_per_second"],
-                epoch_metrics["data_wait_fraction"] * 100.0,
-                epoch_metrics.get("peak_memory_mb", 0.0),
+                if (
+                    artifacts.log_parameter_histograms
+                    and int(intervals.histogram_every_epochs) > 0
+                    and (epoch + 1) % int(intervals.histogram_every_epochs) == 0
+                ):
+                    tracker.log_parameter_histograms(model, global_step)
+
+                figure_every = int(
+                    OmegaConf.select(cfg, "tracking.intervals.figure_every_epochs", default=5)
+                )
+                if figure_every > 0 and (epoch + 1) % figure_every == 0 and len(loss_history) > 1:
+                    tracker.log_figure(
+                        "pretrain/loss_curve",
+                        plot_loss_curves({"DINO loss": loss_history}, title="DINO pretraining loss"),
+                        epoch + 1,
+                    )
+
+                if save_interval > 0 and (epoch + 1) % save_interval == 0:
+                    checkpoint_file = save_dino_checkpoint(
+                        model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch + 1,
+                        checkpoint_manager=checkpoint_manager,
+                        filename=f"dino_checkpoint_epoch_{epoch + 1:04d}.pth",
+                        include_optimizer=save_full_checkpoints,
+                        include_teacher=save_teacher,
+                        rolling_prefix="dino_checkpoint_epoch_",
+                    )
+                    tracker.log_event("checkpoint", {"epoch": epoch + 1, "path": checkpoint_file})
+                    logger.info("Saved interval checkpoint: %s", checkpoint_file)
+
+                # End-of-epoch resume point. `micro_step=0` means the next epoch
+                # starts from its first batch with nothing to fast-forward.
+                save_resume_checkpoint(
+                    resume_manager,
+                    f"{RESUME_PREFIX}{global_step:09d}.pth",
+                    components=components,
+                    progress=TrainingProgress(
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                        micro_step=0,
+                        completed=epoch + 1 >= epochs,
+                    ),
+                    context=context,
+                    cfg=cfg,
+                    loader_generator=loader_generator,
+                    extra={"effective_batch_size": effective_batch},
+                )
+                periodic.mark()
+
+        if interrupted:
+            logger.warning(
+                "Run stopped early at step %s. Relaunch the identical command with "
+                "experiment.training.resume=auto to continue.",
+                global_step,
             )
-
-            if (
-                artifacts.log_parameter_histograms
-                and int(intervals.histogram_every_epochs) > 0
-                and (epoch + 1) % int(intervals.histogram_every_epochs) == 0
-            ):
-                tracker.log_parameter_histograms(model, global_step)
-
-            figure_every = int(OmegaConf.select(cfg, "tracking.intervals.figure_every_epochs", default=5))
-            if figure_every > 0 and (epoch + 1) % figure_every == 0 and len(loss_history) > 1:
-                tracker.log_figure(
-                    "pretrain/loss_curve",
-                    plot_loss_curves({"DINO loss": loss_history}, title="DINO pretraining loss"),
-                    epoch + 1,
-                )
-
-            if save_interval > 0 and (epoch + 1) % save_interval == 0:
-                checkpoint_file = save_dino_checkpoint(
-                    model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch + 1,
-                    checkpoint_manager=checkpoint_manager,
-                    filename=f"dino_checkpoint_epoch_{epoch + 1:04d}.pth",
-                    include_optimizer=save_full_checkpoints,
-                    include_teacher=save_teacher,
-                    rolling_prefix="dino_checkpoint_epoch_",
-                )
-                tracker.log_event("checkpoint", {"epoch": epoch + 1, "path": checkpoint_file})
-                logger.info("Saved interval checkpoint: %s", checkpoint_file)
+            tracker.log_event(
+                "training_interrupted",
+                {"global_step": global_step, "duration_seconds": time.perf_counter() - training_started},
+            )
+            return
 
         # ------------------------------------------------------- final saves
+        # Rank 0 alone writes the artifacts; the barrier keeps the others from
+        # tearing down the process group while it is still writing.
         final_file = save_dino_checkpoint(
             model=model, optimizer=optimizer, scheduler=scheduler, epoch=epochs,
             checkpoint_manager=checkpoint_manager, filename="dino_pretrained_final.pth",
             include_optimizer=save_full_checkpoints, include_teacher=save_teacher,
         )
-        # The bare backbone state dict is the handoff to stage 2.
         backbone_file = save_path / "dino_pretrained_backbone.pth"
-        torch.save(to_cpu_state_dict(model.student_backbone.state_dict()), backbone_file)
+        if context.is_main:
+            # The bare backbone state dict is the handoff to stage 2.
+            torch.save(to_cpu_state_dict(model.student_backbone.state_dict()), backbone_file)
 
-        # Publish the same weights at the shared, stage-independent path that
-        # every downstream run reads. The ablation and baseline suites compare
-        # architectures, so they must all start from *one* set of encoder
-        # weights; a per-run pretraining stage would make each variant's result
-        # partly a function of its own self-supervised seed.
-        shared_file = publish_shared_backbone(cfg, backbone_file, logger)
-        if shared_file is not None:
-            tracker.log_event("shared_backbone", {"path": str(shared_file)})
+            # Publish the same weights at the shared, stage-independent path that
+            # every downstream run reads. The ablation and baseline suites compare
+            # architectures, so they must all start from *one* set of encoder
+            # weights; a per-run pretraining stage would make each variant's
+            # result partly a function of its own self-supervised seed.
+            shared_file = publish_shared_backbone(cfg, backbone_file, logger)
+            if shared_file is not None:
+                tracker.log_event("shared_backbone", {"path": str(shared_file)})
 
-        if loss_history:
-            tracker.log_figure(
-                "pretrain/loss_curve",
-                plot_loss_curves({"DINO loss": loss_history}, title="DINO pretraining loss"),
-                epochs,
-            )
-        tracker.log_artifact(backbone_file, name="dino_pretrained_backbone", artifact_type="model")
+            if loss_history:
+                tracker.log_figure(
+                    "pretrain/loss_curve",
+                    plot_loss_curves({"DINO loss": loss_history}, title="DINO pretraining loss"),
+                    epochs,
+                )
+            tracker.log_artifact(backbone_file, name="dino_pretrained_backbone", artifact_type="model")
+        barrier(context)
 
         total_seconds = time.perf_counter() - training_started
         tracker.log_event(
@@ -868,6 +1415,8 @@ def main(cfg: DictConfig) -> None:
                 "checkpoint": final_file,
                 "student_backbone": str(backbone_file),
                 "amp": amp.label,
+                "effective_batch_size": effective_batch,
+                "world_size": context.world_size,
                 **{f"runtime_{key}": value for key, value in runtime.items()},
             },
         )
@@ -878,11 +1427,14 @@ def main(cfg: DictConfig) -> None:
 
     except Exception:
         logger.exception("DINO pretraining failed.")
-        tracker.log_event("exception", {"stage": "dino_pretraining"})
+        tracker.log_event("exception", {"stage": "dino_pretraining", "rank": context.rank})
         raise
     finally:
         tracker.log_event("training_end", {"duration_seconds": time.perf_counter() - training_started})
         tracker.close()
+        # No barrier here: this block also runs when one rank has raised, and a
+        # barrier would replace the traceback with a collective timeout.
+        shutdown_distributed(context)
 
 
 if __name__ == "__main__":

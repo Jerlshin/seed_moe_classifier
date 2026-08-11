@@ -41,13 +41,32 @@ experiment:
     # below the regime they were designed for. Accumulate to an effective batch
     # of >= 64 before stepping.
     #
-    # `data.batch_size` x this must stay >= 64. If autocast frees enough memory
-    # to raise the physical batch, HALVE this at the same time:
-    #     python main.py pretrain data.batch_size=32 \
-    #         experiment.training.gradient_accumulation_steps=2
-    # Raising the physical batch without lowering the accumulation changes the
-    # effective batch, hence the learning-rate/momentum regime, hence the run.
-    gradient_accumulation_steps: 4
+    # -----------------------------------------------------------------------
+    # effective_batch_size is the AUTHORITY. When it is set, the trainer derives
+    #
+    #     gradient_accumulation_steps = effective_batch_size
+    #                                   / (data.batch_size x world_size)
+    #
+    # and refuses to start if that does not divide exactly. So one GPU at 16x4,
+    # two GPUs at 16x2 and four at 16x1 are all the same 64 images per optimizer
+    # step -- which is the point, because the learning rate, the teacher momentum
+    # schedule and every collapse guard are tuned to that number. Raising
+    # data.batch_size, or launching on more GPUs, now adjusts the accumulation
+    # instead of silently changing the run.
+    #
+    # Holding data.batch_size fixed per rank is also what keeps the objective
+    # identical: Sinkhorn and KoLeo are batch statistics and are already computed
+    # per MICRO-batch, so a rank seeing 16 images per micro-batch computes the
+    # same function as a single-GPU run does. (Set
+    # model.loss.distributed_sinkhorn=true to normalise over the global batch
+    # instead -- exact, but a different objective.)
+    #
+    # Set to null to fall back to the literal gradient_accumulation_steps below,
+    # in which case the effective batch scales with the world size and the
+    # trainer warns about it.
+    # -----------------------------------------------------------------------
+    effective_batch_size: 64
+    gradient_accumulation_steps: 4    # used only when effective_batch_size is null
 
     # -----------------------------------------------------------------------
     # Execution. None of this changes the objective; all of it changes the
@@ -101,6 +120,14 @@ experiment:
     # torch.compile. Costs a few minutes of graph capture on the first step and
     # then fuses the pointwise chains around SwinV2's attention and MLP blocks.
     #
+    # enabled: "auto" compiles wherever a kernel can actually be produced --
+    # CUDA, compute capability >= 7.0 (a T4 qualifies), and Triton importable --
+    # and stays eager otherwise. That is what lets this one file run unchanged on
+    # a Linux CUDA box, on Kaggle's T4s, on Windows (where the wheels ship no
+    # Triton) and on CPU. `true` forces it and downgrades with a warning if the
+    # platform cannot; `false` never compiles. Which of the three happened is
+    # logged and written into the run's event stream.
+    #
     # mode: "default" is what is recommended here. "reduce-overhead" adds CUDA
     # graphs, which capture parameter pointers -- harmless for the student, but
     # the teacher's parameters are rewritten in place by the EMA every step, and
@@ -108,7 +135,7 @@ experiment:
     # under no_grad. "max-autotune" spends much longer searching and rarely wins
     # on a fixed-shape transformer.
     compile:
-      enabled: true
+      enabled: "auto"
       mode: "default"
 
     # Recompute student activations in backward instead of storing them: roughly
@@ -139,6 +166,66 @@ experiment:
     cudnn_benchmark: true
     allow_tf32: true
     matmul_precision: "high"
+
+    # -----------------------------------------------------------------------
+    # Multi-GPU. Nothing here is read on a single process.
+    #
+    #   torchrun --standalone --nproc_per_node=2 \
+    #       -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
+    #   python main.py pretrain --gpus 2        # same, with the run id pinned
+    #
+    # Images are sharded by a DistributedSampler; VIEWS are not, because Eq. 1
+    # pairs a student view against the teacher's output for the same image, so a
+    # sample's views have to be resident on one device. Gradients are all-reduced
+    # by DDP at accumulation boundaries only (see DINO.no_sync).
+    # -----------------------------------------------------------------------
+    ddp:
+      # Collective timeout. Generous because the first step of a compiled run can
+      # spend minutes in graph capture while its peers wait in a barrier.
+      timeout_minutes: 30
+      # Gradients alias DDP's reduction buckets instead of being copied into
+      # them: one full gradient's worth of memory back, which on a 16 GB T4 is
+      # the difference between fitting and not.
+      gradient_as_bucket_view: true
+      # Promise the autograd graph is identical every iteration so DDP can
+      # re-use its bucket plan. True in practice here, but off by default: a
+      # wrong promise surfaces as a hang at the end of an epoch, not an error.
+      static_graph: false
+      # Every student parameter receives a gradient every step, so leave this
+      # false -- true costs a graph traversal per iteration to rediscover it.
+      find_unused_parameters: false
+      bucket_cap_mb: null              # null keeps DDP's 25 MB default
+
+    # -----------------------------------------------------------------------
+    # Resume. `auto` continues from the newest VALID checkpoint under save_path
+    # and starts fresh when there is none, so one command line works for the
+    # first launch and every relaunch after a session ends. `false` always starts
+    # fresh; an explicit path fails loudly if it is missing.
+    #
+    # The resume checkpoint is a different file from the interval checkpoints
+    # above and carries much more: teacher, optimizer moments, scheduler,
+    # GradScaler, epoch, global step, micro-batch within the epoch, and every
+    # rank's RNG state. It is ~1.5 GB for SwinV2-Base, two are kept, and that is
+    # deliberate -- on a preempted instance the newest file is the one most
+    # likely to have been interrupted, and the previous one is the fallback.
+    # -----------------------------------------------------------------------
+    resume: false
+    # Wall-clock save interval. The trigger that matters on a session-limited
+    # platform: `save_interval: 50` epochs can easily exceed the whole session,
+    # in which case a killed run has produced nothing.
+    resume_every_minutes: 30
+    # How often the ranks compare notes about saving and stopping. Both triggers
+    # are wall-clock and so differ per rank; agreeing on a step index is what
+    # keeps the collective write in lockstep.
+    resume_check_every_steps: 20
+    # Replay the already-consumed micro-batches of a partially finished epoch so
+    # the resume lands exactly where it stopped. Costs their augmentation time.
+    # false restarts the epoch instead.
+    resume_fast_forward: true
+    # Stop cleanly (with a checkpoint) after this many minutes. Set it a few
+    # minutes under a hard session limit -- more reliable than being signalled,
+    # since not every platform signals before it kills. null disables it.
+    max_runtime_minutes: null
 
     save_interval: 50
     keep_last_n_checkpoints: 1

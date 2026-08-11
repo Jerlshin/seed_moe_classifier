@@ -48,6 +48,7 @@ from src.trainers.runner import (
     expand_seeds,
     output_root,
     print_summary,
+    parse_gpu_list,
     run_suite,
     write_suite_manifest,
 )
@@ -218,6 +219,17 @@ def parse_args() -> argparse.Namespace:
         help="Training seeds to repeat every variant over (default: 42-46). "
         "Pass a single seed for a smoke sweep; the table then reports no dispersion.",
     )
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help=(
+            "Run variants concurrently, one per device: '0,1' or 'auto'. This is the "
+            "preferred way to use more than one GPU for stage 2 -- the runs are already "
+            "independent processes, so there is no gradient traffic and each variant keeps "
+            "the exact numerics of a single-GPU run. Default: one variant at a time on the "
+            "default device."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the commands without running them.")
     parser.add_argument(
         "--stop-on-failure",
@@ -266,6 +278,7 @@ def main() -> int:
         extra_overrides=extra,
         dry_run=args.dry_run,
         stop_on_failure=args.stop_on_failure,
+        gpus=parse_gpu_list(args.gpus),
     )
 
     if not args.dry_run:

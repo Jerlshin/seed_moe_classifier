@@ -6,30 +6,47 @@
     python scripts/bench_pretrain_step.py --no-sdpa --no-compile     # baseline
     python scripts/bench_pretrain_step.py --batch-size 64 --accum 1 --grad-checkpointing
 
+    # single-GPU vs DDP, one command, printed as a scaling table
+    python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 16 --accum 2
+
+    # one rank of a DDP benchmark, launched by hand
+    torchrun --standalone --nproc_per_node=2 scripts/bench_pretrain_step.py
+
 Reproduces one micro-batch of ``src/trainers/contrastive_pretrain.py`` on
 synthetic data, byte-for-byte in structure: pinned ``uint8`` views in the
 collated ``[V, B, C, H, W]`` layout, the ``ViewBatcher`` H2D + normalise +
 deferred local upsample, one fused teacher forward over ``2B`` globals, one
 fused student forward over ``(2 + L)B`` views, the DINO loss with Sinkhorn
 centering and KoLeo, backward, and — on accumulation boundaries — clip, fused
-AdamW and the foreach EMA. What it does *not* reproduce is the CPU augmentation
-pipeline, which is the point: this isolates the GPU-resident step so execution
-options can be compared without dataloader noise. ``data_wait_fraction`` in a
-real run tells you which of the two you are limited by.
+AdamW and the foreach EMA. Under ``torchrun`` it also reproduces the DDP wrapper
+and the ``no_sync`` accumulation pattern, so the measured gradient traffic is the
+traffic a real run pays.
+
+What it does *not* reproduce is the CPU augmentation pipeline, which is the
+point: this isolates the GPU-resident step so execution options can be compared
+without dataloader noise. ``data_wait_fraction`` in a real run's step log tells
+you which of the two you are limited by; this tells you how fast the other one
+can go.
 
 Timing runs after a warmup that absorbs ``torch.compile`` graph capture and
 cuDNN autotuning, between explicit ``synchronize()`` calls — removing those
 would measure enqueue speed rather than execution speed, off by roughly an
 order of magnitude.
 
-Use it to answer, on the actual server GPU, in minutes:
+Reported per configuration: milliseconds per micro-batch, images/s and views/s
+(**job-wide**, so the DDP number is directly comparable to the single-GPU one),
+peak VRAM per rank, and mean/peak SM utilisation where NVML is available. Use it
+to answer, on the actual server GPU, in minutes:
 
 * what ``sdpa_attention`` buys (``--no-sdpa`` vs default);
 * whether a physical batch of 64 at ``--accum 1`` now fits, and its img/s
-  (the effective batch — physical x accumulation — must stay 64: the collapse
-  guards are batch statistics and the LR/momentum regime is tuned to it);
+  (the effective batch — physical x accumulation x ranks — must stay 64: the
+  collapse guards are batch statistics and the LR/momentum regime is tuned to
+  it);
 * whether ``--grad-checkpointing`` is needed to fit, and what it costs;
-* what a compile mode is worth (``--compile-mode max-autotune-no-cudagraphs``).
+* what a compile mode is worth (``--compile-mode max-autotune-no-cudagraphs``);
+* what a second GPU actually buys (``--scaling 1,2``), which on a T4 pair
+  without NVLink is a real question rather than a rhetorical one.
 
 Peak memory is reported per configuration, so the largest batch that fits can
 be found without sacrificing a real run to an OOM.
@@ -38,8 +55,12 @@ be found without sacrificing a real run to an OOM.
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -53,12 +74,16 @@ from src.losses.dino import CustomDINOLoss  # noqa: E402
 from src.models.backbones.swinv2_dino import DINO  # noqa: E402
 from src.trainers.contrastive_pretrain import ViewBatcher  # noqa: E402
 from src.utils.training import (  # noqa: E402
+    GpuUtilizationSampler,
     TeacherEmaUpdater,
+    all_reduce_mean,
     autocast_context,
     build_grad_scaler,
     configure_backend,
+    describe_accelerator,
     resolve_amp,
-    select_device,
+    setup_distributed,
+    shutdown_distributed,
 )
 
 NORMALIZE_MEAN = (0.485, 0.456, 0.406)
@@ -73,7 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-crop-size", type=int, default=101)
     parser.add_argument("--local-crops", type=int, default=4)
     parser.add_argument("--out-dim", type=int, default=8192)
-    parser.add_argument("--batch-size", type=int, default=16, help="physical images per micro-batch")
+    parser.add_argument("--batch-size", type=int, default=16, help="physical images per micro-batch per rank")
     parser.add_argument("--accum", type=int, default=4, help="micro-batches per optimizer step")
     parser.add_argument("--steps", type=int, default=24, help="timed micro-batches")
     parser.add_argument("--warmup", type=int, default=8, help="untimed micro-batches (compile capture)")
@@ -88,6 +113,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--sinkhorn-iterations", type=int, default=3)
     parser.add_argument("--lambda-koleo", type=float, default=0.1)
+    parser.add_argument(
+        "--scaling",
+        default=None,
+        help=(
+            "Comma-separated rank counts to compare, e.g. '1,2'. Re-invokes this script "
+            "under torch.distributed.run for each and prints a scaling table. Every other "
+            "flag is forwarded, so the per-rank micro-batch stays fixed and the job-wide "
+            "effective batch scales with the rank count -- which is what a scaling number "
+            "means."
+        ),
+    )
+    parser.add_argument("--json", default=None, help="Write this run's measurements to a JSON file.")
     return parser.parse_args()
 
 
@@ -116,21 +153,105 @@ def synthetic_batch(args: argparse.Namespace, pin: bool) -> MultiCropBatch:
     )
 
 
-def main() -> None:
+# ------------------------------------------------------------------- scaling
+
+
+def run_scaling(args: argparse.Namespace) -> int:
+    """Re-invoke this script at each rank count and print the comparison.
+
+    Each configuration runs in a **fresh process group**, which is the only way
+    to measure them independently: a cached allocator, a warmed autotuner and an
+    already-negotiated NCCL communicator would all leak from one measurement into
+    the next.
+    """
+    counts = [int(item) for item in str(args.scaling).replace(" ", "").split(",") if item]
+    forwarded = [
+        argument
+        for argument in sys.argv[1:]
+        if not argument.startswith("--scaling") and argument not in {str(args.scaling)}
+    ]
+    # `--json` is repurposed per configuration; drop any caller-supplied one.
+    forwarded = [
+        argument for index, argument in enumerate(forwarded)
+        if not argument.startswith("--json") and (index == 0 or not forwarded[index - 1].startswith("--json"))
+    ]
+
+    rows: list[dict] = []
+    for count in counts:
+        output = PROJECT_ROOT / f".bench_scaling_{count}.json"
+        if count <= 1:
+            command = [sys.executable, str(Path(__file__).resolve()), *forwarded, "--json", str(output)]
+        else:
+            command = [
+                sys.executable, "-m", "torch.distributed.run",
+                "--standalone", f"--nproc_per_node={count}",
+                str(Path(__file__).resolve()), *forwarded, "--json", str(output),
+            ]
+        print(f"\n$ {' '.join(command)}", flush=True)
+        environment = dict(os.environ)
+        environment.setdefault("OMP_NUM_THREADS", str(max((os.cpu_count() or 2) // count, 1)))
+        code = subprocess.call(command, cwd=str(PROJECT_ROOT), env=environment)
+        if code != 0:
+            print(f"Configuration with {count} rank(s) failed (exit {code}).")
+            continue
+        rows.append(json.loads(output.read_text()))
+        output.unlink(missing_ok=True)
+
+    if not rows:
+        return 1
+
+    print("\n" + "=" * 88)
+    print(
+        f"{'ranks':>5}  {'ms/micro-batch':>15}  {'img/s (job)':>12}  {'views/s (job)':>14}  "
+        f"{'peak GiB/rank':>13}  {'GPU %':>6}  {'speedup':>8}"
+    )
+    print("-" * 88)
+    baseline = rows[0]["images_per_second"]
+    for row in rows:
+        utilisation = row.get("gpu_utilization_mean")
+        print(
+            f"{row['world_size']:>5}  {row['ms_per_micro_batch']:>15.1f}  "
+            f"{row['images_per_second']:>12.1f}  {row['views_per_second']:>14.1f}  "
+            f"{row.get('peak_memory_gib', float('nan')):>13.2f}  "
+            f"{(f'{utilisation:.0f}' if utilisation is not None else 'n/a'):>6}  "
+            f"{row['images_per_second'] / baseline:>7.2f}x"
+        )
+    print("=" * 88)
+    print(
+        "Effective batch scales with the rank count here, because the per-rank micro-batch "
+        "is held fixed -- that is what a scaling measurement means. For a REAL run, keep the "
+        "effective batch at 64 by lowering experiment.training.gradient_accumulation_steps, "
+        "or just set experiment.training.effective_batch_size and let it derive."
+    )
+    return 0
+
+
+# ---------------------------------------------------------------------- main
+
+
+def main() -> int:
     args = parse_args()
-    device = select_device(args.device)
+    if args.scaling:
+        return run_scaling(args)
+
+    context = setup_distributed(args.device)
+    device = context.device
     configure_backend(device, allow_tf32=True, cudnn_benchmark=True, matmul_precision="high")
     amp = resolve_amp(device, args.amp)
     scaler = build_grad_scaler(amp)
 
     num_crops = 2 + args.local_crops
-    print(
-        f"device={device} amp={amp.label} backbone={args.backbone} "
-        f"batch={args.batch_size} x accum={args.accum} (effective {args.batch_size * args.accum}) "
-        f"views/micro-batch={args.batch_size * num_crops} "
-        f"sdpa={args.sdpa} compile={args.compile}({args.compile_mode}) "
-        f"grad_ckpt={args.grad_checkpointing}"
-    )
+    if context.is_main:
+        report = describe_accelerator(device)
+        print(report.summary_line())
+        print(
+            f"device={device} ranks={context.world_size} amp={amp.label} backbone={args.backbone} "
+            f"batch={args.batch_size}/rank x accum={args.accum} x {context.world_size} ranks "
+            f"(effective {args.batch_size * args.accum * context.world_size}) "
+            f"views/micro-batch/rank={args.batch_size * num_crops} "
+            f"sdpa={args.sdpa} compile={args.compile}({args.compile_mode}) "
+            f"grad_ckpt={args.grad_checkpointing}"
+        )
 
     model = DINO(
         backbone_name=args.backbone,
@@ -147,9 +268,11 @@ def main() -> None:
         channels_last=args.channels_last,
         sdpa_attention=args.sdpa,
     )
-    print(f"runtime={runtime}")
-    if args.sdpa and not runtime.get("sdpa_attention_modules"):
-        print("WARNING: sdpa_attention converted 0 modules; benchmarking the eager path.")
+    model.configure_distributed(context)
+    if context.is_main:
+        print(f"runtime={runtime}")
+        if args.sdpa and not runtime.get("sdpa_attention_modules"):
+            print("WARNING: sdpa_attention converted 0 modules; benchmarking the eager path.")
 
     criterion = CustomDINOLoss(
         out_dim=args.out_dim,
@@ -161,6 +284,7 @@ def main() -> None:
         centering="sinkhorn",
         sinkhorn_iterations=args.sinkhorn_iterations,
         lambda_koleo=args.lambda_koleo,
+        context=context,
     ).to(device)
     criterion.metrics_enabled = False
 
@@ -182,27 +306,32 @@ def main() -> None:
 
     def micro_step(index: int) -> None:
         """One micro-batch, ordered exactly as the trainer orders it."""
+        is_step = (index + 1) % args.accum == 0
         student_views, teacher_views, batch_size = batcher(batch)
-        with autocast_context(amp):
-            teacher_out = model.forward_teacher_views(teacher_views)
-            student_out, bottleneck = model.forward_student_views(
-                student_views, return_bottleneck=True
-            )
-            embeddings = bottleneck[: 2 * batch_size] if criterion.lambda_koleo > 0 else None
-            loss = criterion(
-                student_out,
-                teacher_out,
-                epoch=0,
-                student_view_ids=student_ids,
-                teacher_view_ids=teacher_ids,
-                student_embeddings=embeddings,
-            )
-        scaled = loss / args.accum
-        if scaler is not None:
-            scaler.scale(scaled).backward()
-        else:
-            scaled.backward()
-        if (index + 1) % args.accum == 0:
+        # The same `no_sync` pattern the trainer uses: gradient traffic once per
+        # optimizer step, not once per micro-batch. Benchmarking without it would
+        # report `accum` times the real communication cost.
+        with nullcontext() if is_step else model.no_sync():
+            with autocast_context(amp):
+                teacher_out = model.forward_teacher_views(teacher_views)
+                student_out, bottleneck = model.forward_student_views(
+                    student_views, return_bottleneck=True
+                )
+                embeddings = bottleneck[: 2 * batch_size] if criterion.lambda_koleo > 0 else None
+                loss = criterion(
+                    student_out,
+                    teacher_out,
+                    epoch=0,
+                    student_view_ids=student_ids,
+                    teacher_view_ids=teacher_ids,
+                    student_embeddings=embeddings,
+                )
+            scaled = loss / args.accum
+            if scaler is not None:
+                scaler.scale(scaled).backward()
+            else:
+                scaled.backward()
+        if is_step:
             if scaler is not None:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(student_parameters, max_norm=3.0)
@@ -221,24 +350,67 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
-    started = time.perf_counter()
-    for index in range(args.steps):
-        micro_step(index)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elapsed = time.perf_counter() - started
+    sampler = GpuUtilizationSampler(context.local_rank if device.type == "cuda" else 0)
+    with sampler:
+        started = time.perf_counter()
+        for index in range(args.steps):
+            micro_step(index)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
 
-    images = args.steps * args.batch_size
-    print(
-        f"{elapsed / args.steps * 1000:.1f} ms/micro-batch | "
-        f"{images / elapsed:.1f} img/s | {images * num_crops / elapsed:.1f} views/s"
-        + (
-            f" | peak_mem={torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB"
-            if device.type == "cuda"
-            else ""
+    # Averaged across ranks: a straggler makes the whole job slower, so the mean
+    # step time is the honest per-step cost and rank 0's own is not.
+    elapsed_tensor = torch.tensor([elapsed], dtype=torch.float64, device=device)
+    all_reduce_mean(elapsed_tensor, context)
+    elapsed = float(elapsed_tensor.item())
+
+    images = args.steps * args.batch_size * context.world_size
+    utilisation = sampler.summary()
+    measurement = {
+        "world_size": context.world_size,
+        "backend": context.backend,
+        "batch_size_per_rank": args.batch_size,
+        "accum": args.accum,
+        "effective_batch": args.batch_size * args.accum * context.world_size,
+        "amp": amp.label,
+        "sdpa": bool(args.sdpa),
+        "compile": bool(args.compile),
+        "grad_checkpointing": bool(args.grad_checkpointing),
+        "ms_per_micro_batch": elapsed / args.steps * 1000.0,
+        "images_per_second": images / elapsed,
+        "views_per_second": images * num_crops / elapsed,
+        "peak_memory_gib": (
+            torch.cuda.max_memory_allocated() / 1024**3 if device.type == "cuda" else 0.0
+        ),
+        "gpu_utilization_mean": utilisation["gpu_utilization_mean"],
+        "gpu_utilization_peak": utilisation["gpu_utilization_peak"],
+        "runtime": {key: str(value) for key, value in runtime.items()},
+    }
+
+    if context.is_main:
+        print(
+            f"{measurement['ms_per_micro_batch']:.1f} ms/micro-batch | "
+            f"{measurement['images_per_second']:.1f} img/s | "
+            f"{measurement['views_per_second']:.1f} views/s"
+            + (
+                f" | peak_mem={measurement['peak_memory_gib']:.2f} GiB/rank"
+                if device.type == "cuda"
+                else ""
+            )
+            + (
+                f" | gpu={measurement['gpu_utilization_mean']:.0f}% mean, "
+                f"{measurement['gpu_utilization_peak']:.0f}% peak"
+                if measurement["gpu_utilization_mean"] is not None
+                else " | gpu utilisation: NVML unavailable"
+            )
         )
-    )
+        if args.json:
+            Path(args.json).write_text(json.dumps(measurement, indent=2), encoding="utf-8")
+
+    shutdown_distributed(context)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

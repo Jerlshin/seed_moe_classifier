@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -210,48 +212,148 @@ def run_variant(
     checkpoint: Path | None,
     extra_overrides: Sequence[str] = (),
     dry_run: bool = False,
+    gpu: int | None = None,
 ) -> VariantResult:
-    """Launch one variant and return its result. Never raises on a training failure."""
+    """Launch one variant and return its result. Never raises on a training failure.
+
+    ``gpu`` pins the subprocess to one device with ``CUDA_VISIBLE_DEVICES``,
+    which is how :func:`run_suite` spreads a suite across GPUs. The variant sees
+    exactly one device and needs no distributed code at all -- see that
+    function's docstring for why that is the *preferred* way to use a second GPU
+    on this stage.
+    """
     save_path = spec.save_path(root)
     command = build_command(spec, save_path, checkpoint, extra_overrides)
 
-    print(f"\n=== {spec.run_name}: {spec.description} ===", flush=True)
+    label = spec.run_name if gpu is None else f"{spec.run_name} [gpu {gpu}]"
+    print(f"\n=== {label}: {spec.description} ===", flush=True)
     print(f"$ {' '.join(command)}", flush=True)
     if dry_run:
         return VariantResult(spec.run_name, 0, 0.0, str(save_path), command)
 
+    environment = dict(os.environ)
+    if gpu is not None:
+        environment["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        # Hydra's `${now:...}` would otherwise give concurrent variants
+        # colliding-or-not run directories depending on the second they started
+        # in. The save path is already per-variant; this makes the Hydra tree
+        # match it.
+        environment["SEED_RUN_ID"] = f"{spec.group_directory}/{spec.name}"
+
     save_path.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
-    returncode = subprocess.call(command, cwd=str(PROJECT_ROOT))
+    returncode = subprocess.call(command, cwd=str(PROJECT_ROOT), env=environment)
     duration = time.perf_counter() - started
 
     status = "OK" if returncode == 0 else f"FAILED (exit {returncode})"
-    print(f"--- {spec.run_name}: {status} in {duration:.1f}s ---", flush=True)
+    print(f"--- {label}: {status} in {duration:.1f}s ---", flush=True)
     return VariantResult(spec.run_name, returncode, duration, str(save_path), command)
 
 
 def run_suite(
     specs: Sequence[VariantSpec],
     root: Path,
-    checkpoint: Path | None,
+    checkpoint: Path | None | Callable[[VariantSpec], Path | None],
     extra_overrides: Sequence[str] = (),
     dry_run: bool = False,
     stop_on_failure: bool = False,
+    gpus: Sequence[int] | None = None,
 ) -> list[VariantResult]:
-    """Run every variant in order and return their results.
+    """Run every variant and return their results, optionally one per GPU.
+
+    ``checkpoint`` may be a callable taking a spec, which is what the baseline
+    suite needs: an end-to-end baseline builds its own ImageNet backbone, and
+    handing it the SwinV2 DINO checkpoint would be meaningless at best and a
+    silent partial load at worst. Resolving per spec here rather than in the
+    caller's loop is what lets that suite be sharded across GPUs too.
 
     Continues past a failure by default: a long suite that aborts on variant two
     wastes the hours the remaining variants would have taken, and the failure is
     reported clearly either way.
+
+    ``gpus`` runs ``len(gpus)`` variants concurrently, each pinned to one device.
+    **This is the right way to use more than one GPU for stage 2**, and it beats
+    DDP-within-a-run on every axis that matters here:
+
+    * it is embarrassingly parallel -- 18 variants x 5 seeds are 90 independent
+      processes with no gradient traffic at all, where DDP would all-reduce a
+      head's gradients over PCIe every step;
+    * each variant keeps the exact numerics of a single-GPU run, which is the
+      whole point of a comparison table whose reported gaps are 0.5-2 pp;
+    * a variant that crashes takes one GPU-slot with it rather than the job.
+
+    Scheduling is a shared work queue rather than a static split, so a slow
+    variant does not leave a device idle while another worker finishes early.
+    Results come back in submission order regardless of completion order.
     """
-    results: list[VariantResult] = []
-    for spec in specs:
-        result = run_variant(spec, root, checkpoint, extra_overrides, dry_run)
-        results.append(result)
-        if stop_on_failure and not result.succeeded:
-            print(f"Stopping: {spec.run_name} failed and --stop-on-failure is set.", flush=True)
-            break
-    return results
+    resolve = checkpoint if callable(checkpoint) else (lambda _spec: checkpoint)
+
+    if not gpus or len(gpus) <= 1 or dry_run:
+        results: list[VariantResult] = []
+        single = gpus[0] if gpus else None
+        for spec in specs:
+            result = run_variant(spec, root, resolve(spec), extra_overrides, dry_run, gpu=single)
+            results.append(result)
+            if stop_on_failure and not result.succeeded:
+                print(f"Stopping: {spec.run_name} failed and --stop-on-failure is set.", flush=True)
+                break
+        return results
+
+    print(
+        f"Sharding {len(specs)} variants over GPUs {list(gpus)} "
+        f"({len(gpus)} concurrent, one variant per device).",
+        flush=True,
+    )
+    pending: queue.Queue[int] = queue.Queue()
+    for index in range(len(specs)):
+        pending.put(index)
+
+    results_by_index: dict[int, VariantResult] = {}
+    lock = threading.Lock()
+    halt = threading.Event()
+
+    def worker(device: int) -> None:
+        while not halt.is_set():
+            try:
+                index = pending.get_nowait()
+            except queue.Empty:
+                return
+            spec = specs[index]
+            result = run_variant(
+                spec, root, resolve(spec), extra_overrides, dry_run=False, gpu=device
+            )
+            with lock:
+                results_by_index[index] = result
+            if stop_on_failure and not result.succeeded:
+                print(
+                    f"Stopping: {specs[index].run_name} failed and --stop-on-failure is set. "
+                    "Variants already running will finish.",
+                    flush=True,
+                )
+                halt.set()
+
+    threads = [threading.Thread(target=worker, args=(device,), daemon=True) for device in gpus]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    return [results_by_index[index] for index in sorted(results_by_index)]
+
+
+def parse_gpu_list(value: str | None) -> list[int]:
+    """``"0,1"`` -> ``[0, 1]``; ``"auto"`` -> every visible device; ``None`` -> ``[]``."""
+    if not value:
+        return []
+    text = value.strip().lower()
+    if text == "auto":
+        try:
+            import torch
+
+            return list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        except Exception:  # pragma: no cover - torch is a hard dependency in practice
+            return []
+    return [int(item) for item in text.replace(" ", "").split(",") if item != ""]
 
 
 def write_suite_manifest(path: str | Path, specs: Sequence[VariantSpec], results: Sequence[VariantResult]) -> str:

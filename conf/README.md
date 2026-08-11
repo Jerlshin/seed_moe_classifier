@@ -148,6 +148,32 @@ its source. A failure there means the configs have drifted from the paper.
 them all with their reversing override. `model.head.top_k=4` reproduces the
 submitted configuration; see [`../REVISION_NOTES.md`](../REVISION_NOTES.md).
 
+## Execution settings vs. objective settings
+
+Everything under `experiment.training` that follows is about *how* a run
+executes, never *what* it computes. Three resolve themselves from the hardware,
+so one file runs on an A100, on Kaggle's T4x2, on Windows and on CPU:
+
+| Key | `auto` resolves to | Notes |
+| --- | --- | --- |
+| `amp` | bf16 on Ampere+, **fp16 + `GradScaler` on a T4**, off on CPU/MPS | An explicit `bf16` on `sm_75` is downgraded, not refused. Safe only because Sinkhorn, the prototype log-softmax and KoLeo are pinned to fp32. |
+| `compile.enabled` | on where inductor can emit a kernel (CUDA, `sm >= 7.0`, Triton) | The reason for staying eager is logged and written to the event stream. |
+| `data.num_workers` | affinity-aware cores per rank, capped at 8 | Per-process, so it must be divided by the local rank count. |
+
+The multi-GPU and resume keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `effective_batch_size` | 64 | **The authority.** `gradient_accumulation_steps` is derived from it and the world size, and a combination that does not divide exactly is refused. 1 GPU at `16 x 4` and 2 at `16 x 2` are the same run. |
+| `ddp.gradient_as_bucket_view` | true | Gradients alias DDP's buckets: one gradient's worth of memory back. |
+| `ddp.static_graph` | false | True in practice, but a wrong promise surfaces as a hang, not an error. |
+| `ddp.find_unused_parameters` | false (stage 1), true (stage 2) | Stage 2 needs it: under sparse dispatch an unrouted expert genuinely has no gradient. |
+| `resume` | false | `auto` continues from the newest **valid** checkpoint and starts fresh when there is none, so one command line serves every relaunch. |
+| `resume_every_minutes` | 30 | Wall-clock save trigger. `save_interval: 50` **epochs** can exceed a whole Kaggle session. |
+| `resume_check_every_steps` | 20 | How often ranks compare notes about saving and stopping. Both triggers are wall-clock and differ per rank. |
+| `max_runtime_minutes` | null | Stop cleanly with a checkpoint before a hard session limit. More reliable than being signalled. |
+| `model.loss.distributed_sinkhorn` | false | false reproduces the single-GPU numbers exactly; true normalises over the global batch, which is a *different objective*. |
+
 ## Run-directory layout
 
 ```yaml

@@ -64,7 +64,8 @@ The teacher gets the same treatment over its two global views, under
 from __future__ import annotations
 
 import copy
-from typing import Any
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any
 
 import timm
 import torch
@@ -74,6 +75,9 @@ from lightly.models.utils import deactivate_requires_grad
 from timm.layers import trunc_normal_
 
 from src.models.builder import validate_swinv2_name
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from src.utils.training.distributed import DistributedContext
 
 
 def _weight_norm(module: nn.Module) -> nn.Module:
@@ -195,6 +199,51 @@ class DINOHead(nn.Module):
             parameter.grad = None
 
 
+class _StudentPass(nn.Module):
+    """The student's whole forward as one module, so DDP has one thing to wrap.
+
+    ``DistributedDataParallel`` synchronises the parameters of the module it
+    wraps, on the backward of the forward *it* was called through. The student
+    pass here is two modules and a pooling step, and the teacher must stay
+    outside -- it takes no gradient, so wrapping :class:`DINO` itself would hand
+    DDP a set of parameters half of which never produce one.
+
+    This adapter registers the *same* module objects the owning :class:`DINO`
+    holds. Registering a module twice does not copy it: ``DINO.state_dict()`` is
+    byte-identical with or without this wrapper existing, which is the property
+    that matters, because ``student_backbone.state_dict()`` is the only handoff
+    to stage 2 and a renamed key there is a silent failure rather than a loud one.
+
+    ``resolve`` is the owner's :meth:`DINO._module`, called per forward rather
+    than captured once, so a ``torch.compile`` applied before *or* after this
+    wrapper is built is still the callable that runs. It is stored as a plain
+    attribute (a bound method is not an ``nn.Module``, so it registers nothing).
+    """
+
+    def __init__(self, backbone: nn.Module, head: nn.Module, resolve, pool):
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+        self._resolve = resolve
+        self._pool = pool
+
+    def forward(
+        self,
+        views: torch.Tensor,
+        return_bottleneck: bool = False,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        backbone = self._resolve("student_backbone")
+        head = self._resolve("student_head")
+        if not chunk_size or chunk_size >= views.shape[0]:
+            features = self._pool(backbone(views))
+        else:
+            features = torch.cat(
+                [self._pool(backbone(part)) for part in views.split(int(chunk_size))], dim=0
+            )
+        return head(features, return_bottleneck=return_bottleneck)
+
+
 class DINO(nn.Module):
     """Student/teacher pair sharing an architecture, joined by an EMA update.
 
@@ -278,6 +327,10 @@ class DINO(nn.Module):
         # random trunk, logged one line about missing keys and trained to
         # completion looking entirely healthy.
         self._compiled: dict[str, Any] = {}
+        # The DDP wrapper lives off the module tree for the same reason the
+        # compiled callables do: assigning it to an attribute would register it
+        # as a submodule and prefix every state-dict key with `module.`.
+        self._ddp: dict[str, Any] = {}
         self.grad_checkpointing = False
 
     # ------------------------------------------------------------- runtime
@@ -406,6 +459,125 @@ class DINO(nn.Module):
 
         return applied
 
+    def configure_distributed(
+        self,
+        context: "DistributedContext",
+        *,
+        gradient_as_bucket_view: bool = True,
+        static_graph: bool = False,
+        find_unused_parameters: bool = False,
+        bucket_cap_mb: int | None = None,
+        logger=None,
+    ) -> dict[str, Any]:
+        """Wrap the student in DDP and force the teacher to agree across ranks.
+
+        Returns what was applied, for the run's event stream. A no-op on a
+        single process, so the trainer needs no branch.
+
+        Three decisions here are load-bearing:
+
+        **Only the student is wrapped.** The teacher takes no gradient -- it is
+        advanced by the EMA -- so it has nothing for DDP to reduce, and handing
+        DDP a module whose parameters never receive gradients would force
+        ``find_unused_parameters=True`` and a full graph traversal every step to
+        discover that fact again.
+
+        **The teacher is broadcast instead.** DDP broadcasts the wrapped module's
+        state at construction, which makes the students identical; nothing does
+        that for the teacher. It starts as a deep copy of each rank's own
+        student, so identical seeding already makes them agree -- but "already
+        agrees" is not a property to leave implicit for the network that produces
+        the training *targets*, and after a resume at a different world size it
+        would not hold at all.
+
+        **Buffers are not broadcast per step.** SwinV2's buffers
+        (``relative_coords_table``, ``relative_position_index``) are constants,
+        and the projection head is LayerNorm by default precisely so no running
+        statistic needs carrying. ``broadcast_buffers=True`` would add a
+        collective over several megabytes to every forward to re-send constants.
+        Switching the head to ``use_batch_norm: "batch"`` reintroduces buffers
+        that this does not propagate -- the same coupling ``conf/model/head/\
+dino.yaml`` already documents for the EMA, now with a second reason.
+
+        Args:
+            gradient_as_bucket_view: Let gradients alias DDP's reduction buckets
+                instead of being copied into them. Saves a full gradient's worth
+                of memory, which on a 16 GB T4 is the difference between fitting
+                and not.
+            static_graph: Promise the autograd graph is identical every
+                iteration, which lets DDP reorder reductions and re-use its
+                bucket plan. True here in practice, but left off by default:
+                a wrong promise fails as a hang at the end of an epoch rather
+                than as an error.
+            find_unused_parameters: Leave ``False``. Every student parameter
+                receives a gradient on every step; ``True`` costs a graph
+                traversal per iteration to establish that.
+            bucket_cap_mb: Reduction bucket size. ``None`` keeps DDP's default
+                (25 MB), which is a reasonable fit for this parameter count.
+        """
+        from torch.nn.parallel import DistributedDataParallel
+        from src.utils.training.distributed import broadcast_module_state, buffer_sync_kwarg
+
+        if not context.enabled:
+            return {"distributed": False}
+
+        # Must happen before the wrapper is built: DDP broadcasts the wrapped
+        # module's state from rank 0, and the teacher is not in that module.
+        broadcast_module_state(self.teacher_backbone, context)
+        broadcast_module_state(self.teacher_head, context)
+
+        student = _StudentPass(
+            self.student_backbone, self.student_head, self._module, self._pool
+        )
+        kwargs: dict[str, Any] = {
+            **buffer_sync_kwarg(False),
+            "gradient_as_bucket_view": bool(gradient_as_bucket_view),
+            "find_unused_parameters": bool(find_unused_parameters),
+            "static_graph": bool(static_graph),
+        }
+        if context.device.type == "cuda":
+            kwargs["device_ids"] = [context.local_rank]
+            kwargs["output_device"] = context.local_rank
+        if bucket_cap_mb:
+            kwargs["bucket_cap_mb"] = int(bucket_cap_mb)
+
+        self._ddp["student"] = DistributedDataParallel(student, **kwargs)
+
+        applied = {
+            "distributed": True,
+            "world_size": context.world_size,
+            "backend": context.backend,
+            "gradient_as_bucket_view": bool(gradient_as_bucket_view),
+            "static_graph": bool(static_graph),
+            "find_unused_parameters": bool(find_unused_parameters),
+        }
+        if logger is not None:
+            logger.info(
+                "DDP | student wrapped across %s ranks (%s), teacher broadcast from rank 0, "
+                "buffers not re-broadcast per step.",
+                context.world_size, context.backend,
+            )
+        return applied
+
+    def no_sync(self):
+        """Suppress DDP's gradient all-reduce for one micro-batch.
+
+        Wraps every micro-batch that is **not** an accumulation boundary. Without
+        it, DDP reduces the full gradient once per micro-batch instead of once
+        per optimizer step -- ``gradient_accumulation_steps`` times the traffic
+        for an identical result, which on a two-T4 box without NVLink is paid
+        over PCIe and is the single easiest way to make a distributed run slower
+        than the single-GPU one it replaced.
+
+        A no-op context when the run is not distributed.
+        """
+        student = self._ddp.get("student")
+        return student.no_sync() if student is not None else nullcontext()
+
+    @property
+    def is_distributed(self) -> bool:
+        return "student" in self._ddp
+
     def _module(self, name: str) -> nn.Module:
         """The compiled callable for ``name`` when there is one, else the module."""
         return self._compiled.get(name, getattr(self, name))
@@ -482,7 +654,21 @@ class DINO(nn.Module):
         The blocks must be **view-major** -- all of view 0, then all of view 1 --
         because :class:`~src.losses.dino.CustomDINOLoss` chunks the output back
         into per-view groups. ``MultiCropCollate`` produces exactly that layout.
+
+        Under DDP this goes through the wrapper rather than the modules directly:
+        DDP arms its reducer inside ``forward``, so calling the inner modules
+        would leave the gradients unsynchronised and every rank would train its
+        own model while the loss curves looked identical.
+
+        Note what is *not* distributed here. All ``V`` views of one image stay on
+        the rank that owns that image -- ``DistributedSampler`` shards the
+        dataset, not the view axis -- because Eq. 1 pairs a student view against
+        the teacher's output for the *same image*. Sharding views instead would
+        make the cross-view pairing a collective.
         """
+        student = self._ddp.get("student")
+        if student is not None:
+            return student(views, return_bottleneck=return_bottleneck, chunk_size=chunk_size)
         features = self._backbone_features("student_backbone", views, chunk_size)
         return self._module("student_head")(features, return_bottleneck=return_bottleneck)
 

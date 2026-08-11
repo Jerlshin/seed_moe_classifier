@@ -50,7 +50,7 @@ from sklearn.model_selection import (
     StratifiedKFold,
     train_test_split,
 )
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset, WeightedRandomSampler
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if PROJECT_ROOT not in sys.path:
@@ -68,16 +68,37 @@ from src.utils.training import (
     AmpConfig,
     CheckpointManager,
     ExperimentTracker,
+    InterruptGuard,
+    PeriodicSaver,
+    TrainingProgress,
     autocast_context,
+    all_reduce_max,
+    barrier,
+    broadcast_object,
+    build_checkpoint_payload,
     build_grad_scaler,
     collect_device_stats,
+    collect_rng_states,
     configure_backend,
+    load_checkpoint_payload,
     resolve_amp,
-    select_device,
+    resolve_num_workers,
+    resolve_resume_path,
+    restore_components,
+    restore_rng_states,
+    setup_distributed,
     setup_experiment_logger,
+    shutdown_distributed,
     snapshot_run_configuration,
     to_cpu_state_dict,
 )
+
+#: Rolling resume checkpoints for this stage. Distinct from
+#: ``best_hierarchical_moe.pth`` and ``hierarchical_moe_final.pth``, which are
+#: inference artifacts: those carry weights, this carries the optimizer moments,
+#: the fold and epoch position and every rank's RNG state.
+RESUME_PREFIX = "finetune_resume"
+RESUME_KEEP_LAST = 2
 
 #: Evaluation is deliberately **not** autocast. Training in bf16 and scoring in
 #: fp32 costs one extra forward's worth of precision and buys comparability: the
@@ -570,6 +591,38 @@ class LossHistory:
         return {"train_loss": list(self.train), "validation_loss": list(self.validation)}
 
 
+class TrainStep(nn.Module):
+    """``encoder -> head -> loss`` as one module, so DDP has one forward to wrap.
+
+    DDP synchronises the parameters of the module it wraps, on the backward of a
+    forward called through *it*. Stage 2's trainable parameters are spread over
+    three objects -- the encoder's Eq. 4 projection, the hierarchical head, and
+    (under ``weighting_mode="uncertainty"``) the criterion's three learnable
+    ``log sigma^2`` scalars -- and anything left outside the wrapper receives no
+    all-reduce and drifts apart across ranks while every log looks identical.
+    Wrapping all three is the only arrangement in which that cannot happen.
+
+    Registering these modules here does not copy them: ``model.state_dict()`` is
+    unchanged, which is what keeps ``model_state_dict`` in the checkpoint free of
+    a ``module.`` prefix that ``checkpoint_strict: false`` would turn into a
+    silent zero-key load.
+    """
+
+    def __init__(self, encoder: nn.Module, model: nn.Module, criterion: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+        self.model = model
+        self.criterion = criterion
+
+    def forward(self, images: torch.Tensor, seed_labels: torch.Tensor, sub_labels: torch.Tensor, training: bool):
+        features = self.encoder(images)
+        # The ArcFace margin is only placed during training; at evaluation the
+        # margin logits equal the plain logits, so metrics stay comparable.
+        output = self.model(features, sub_variety_labels=sub_labels if training else None)
+        breakdown = self.criterion(output, seed_labels, sub_labels)
+        return output, breakdown
+
+
 def forward_batch(
     encoder: nn.Module,
     model: nn.Module,
@@ -578,19 +631,27 @@ def forward_batch(
     device: torch.device,
     amp: AmpConfig,
     training: bool,
+    step_module: nn.Module | None = None,
 ):
-    """Run encoder -> head -> loss for one batch."""
+    """Run encoder -> head -> loss for one batch.
+
+    ``step_module`` is the DDP-wrapped :class:`TrainStep` when the run is
+    distributed. Calling the raw modules instead would leave the gradients
+    unsynchronised, so every rank would train its own model with identical-looking
+    loss curves.
+    """
     images, seed_labels, sub_labels = batch[:3]
     images = images.to(device, non_blocking=True)
     seed_labels = seed_labels.to(device, non_blocking=True)
     sub_labels = sub_labels.to(device, non_blocking=True)
 
     with autocast_context(amp):
-        features = encoder(images)
-        # The ArcFace margin is only placed during training; at evaluation the
-        # margin logits equal the plain logits, so metrics stay comparable.
-        output = model(features, sub_variety_labels=sub_labels if training else None)
-        breakdown = criterion(output, seed_labels, sub_labels)
+        if step_module is not None:
+            output, breakdown = step_module(images, seed_labels, sub_labels, training)
+        else:
+            features = encoder(images)
+            output = model(features, sub_variety_labels=sub_labels if training else None)
+            breakdown = criterion(output, seed_labels, sub_labels)
 
     return output, breakdown, seed_labels, sub_labels
 
@@ -662,8 +723,17 @@ def run_epoch(
     scaler=None,
     num_experts: int = 6,
     max_tsne_samples: int = 2000,
+    step_module: nn.Module | None = None,
 ) -> tuple[dict[str, Any], HierarchicalEvaluation, EpochAccumulator, int]:
-    """Run one train or evaluation epoch and return its metrics."""
+    """Run one train or evaluation epoch and return its metrics.
+
+    ``step_module`` is the DDP-wrapped :class:`TrainStep`, used for training
+    only. Evaluation deliberately does **not** go through it: this trainer
+    produces the rows of the comparison table, and a metric assembled from
+    per-rank shards would depend on how many GPUs the variant happened to run
+    on. The caller runs evaluation on one rank against the raw modules, which are
+    parameter-identical across the job.
+    """
     is_train = optimizer is not None
     model.train(is_train)
     encoder.train(is_train)
@@ -700,6 +770,7 @@ def run_epoch(
                 device=device,
                 amp=amp if is_train else AMP_DISABLED,
                 training=is_train,
+                step_module=step_module if is_train else None,
             )
 
         term_gradients: dict[str, float] = {}
@@ -708,6 +779,11 @@ def run_epoch(
                 log_term_grads
                 and probe_every > 0
                 and (global_step + 1) % probe_every == 0
+                # Off under DDP. The probe runs one extra backward per loss term
+                # through the same graph the reducer is armed on, and a
+                # diagnostic is not worth any risk of desynchronising the
+                # collective. Run the variant on one GPU to collect it.
+                and step_module is None
             )
             if probe:
                 term_gradients = per_term_gradient_norms(
@@ -1064,26 +1140,50 @@ def save_checkpoint(
 
 @hydra.main(version_base=None, config_path="../../conf", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # A rank must own its device before the first tensor exists, and NCCL binds
+    # its communicator to whatever device is current when the group comes up.
+    context = setup_distributed(
+        str(cfg.device),
+        timeout_minutes=float(
+            OmegaConf.select(cfg, "experiment.training.ddp.timeout_minutes", default=30)
+        ),
+    )
+    # Hydra evaluates `${now:...}` per process, so ranks launched in the same
+    # second can still resolve different directories. Rank 0's is authoritative.
+    output_dir_str = broadcast_object(str(cfg.tracking.output_dir), context)
     logger = setup_experiment_logger(
-        log_dir=cfg.tracking.output_dir,
+        log_dir=output_dir_str,
         name="seed_moe.moe_finetune",
         level=cfg.tracking.log_level,
-        console=cfg.tracking.console,
+        console=bool(cfg.tracking.console) and context.is_main,
         structured_jsonl=cfg.tracking.structured_jsonl,
+        rank=context.rank,
+        world_size=context.world_size,
     )
-    tracker = ExperimentTracker(cfg, logger)
+    tracker = ExperimentTracker(cfg, logger, enabled=context.is_main)
     started = time.perf_counter()
+    # Bound before the try so the `finally` can restore the signal handlers even
+    # if construction below raises.
+    guard: InterruptGuard | None = None
 
     try:
         logger.info("========== Hierarchical MoE finetuning: %s ==========", cfg.experiment.name)
+        if context.enabled:
+            logger.info(
+                "Distributed run | %s ranks, backend=%s, this rank owns %s. Training is "
+                "sharded; evaluation runs on rank 0 against the same parameters, so every "
+                "reported metric is the single-process one.",
+                context.world_size, context.backend, context.device,
+            )
         seed_everything(int(cfg.seed))
-        snapshot_paths = snapshot_run_configuration(cfg, cfg.tracking.output_dir)
-        logger.info(
-            "Saved run configuration snapshots.",
-            extra={"snapshots": {key: str(value) for key, value in snapshot_paths.items()}},
-        )
+        if context.is_main:
+            snapshot_paths = snapshot_run_configuration(cfg, output_dir_str)
+            logger.info(
+                "Saved run configuration snapshots.",
+                extra={"snapshots": {key: str(value) for key, value in snapshot_paths.items()}},
+            )
 
-        device = select_device(cfg.device)
+        device = context.device
         # Determinism stays on here, unlike stage 1. This trainer produces the
         # rows of the comparison table, and every variant must see a byte-
         # identical split and the same kernels; cuDNN autotuning can pick a
@@ -1100,8 +1200,10 @@ def main(cfg: DictConfig) -> None:
             ),
             logger=logger,
         )
-        tracker.log_event("backend", backend)
-        amp = resolve_amp(device, OmegaConf.select(cfg, "experiment.training.amp", default="auto"))
+        tracker.log_event("backend", {**backend, "distributed": context.as_dict()})
+        amp = resolve_amp(
+            device, OmegaConf.select(cfg, "experiment.training.amp", default="auto"), logger=logger
+        )
         scaler = build_grad_scaler(amp)
         logger.info(
             "Selected training device: %s (amp=%s, grad scaler=%s). Evaluation always runs in fp32.",
@@ -1197,14 +1299,18 @@ def main(cfg: DictConfig) -> None:
             )
 
         output_dir = Path(cfg.experiment.training.save_path)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        split_manifest = save_split_manifest(
-            output_dir, splits, test_indices, dataset, protocol=split_protocol
-        )
-        tracker.log_event("split_manifest", {"path": split_manifest, **split_report})
+        if context.is_main:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            split_manifest = save_split_manifest(
+                output_dir, splits, test_indices, dataset, protocol=split_protocol
+            )
+            tracker.log_event("split_manifest", {"path": split_manifest, **split_report})
+        barrier(context)
 
         pin_memory = bool(cfg.data.pin_memory) and device.type == "cuda"
-        num_workers = int(cfg.data.num_workers)
+        num_workers = resolve_num_workers(
+            OmegaConf.select(cfg, "data.num_workers", default=4), context, logger=logger
+        )
         batch_size = int(cfg.data.batch_size)
         epochs = int(cfg.experiment.training.epochs)
         max_batches = OmegaConf.select(cfg, "experiment.training.max_batches", default=None)
@@ -1212,7 +1318,12 @@ def main(cfg: DictConfig) -> None:
         figure_every = int(OmegaConf.select(cfg, "tracking.intervals.figure_every_epochs", default=5))
 
         checkpoint_manager = CheckpointManager(
-            output_dir, keep_last_n=int(cfg.experiment.training.keep_last_n_checkpoints)
+            output_dir,
+            keep_last_n=int(cfg.experiment.training.keep_last_n_checkpoints),
+            enabled=context.is_main,
+        )
+        resume_manager = CheckpointManager(
+            output_dir, keep_last_n=RESUME_KEEP_LAST, enabled=context.is_main
         )
         include_optimizer = bool(cfg.experiment.training.save_optimizer_state)
 
@@ -1243,12 +1354,44 @@ def main(cfg: DictConfig) -> None:
             drop_last: bool = False,
             train: bool = False,
         ) -> DataLoader:
+            """Build one loader. Only the **training** loader is ever sharded.
+
+            Evaluation loaders stay whole on whichever rank runs them, because
+            this trainer's output is a row of the comparison table: a metric
+            stitched together from per-rank shards would carry a dependence on
+            how many GPUs that variant happened to get, and the gaps the table
+            reports are 0.5-2 pp.
+            """
             source = dataset if train else eval_dataset
             sampler = (
                 build_balanced_sampler(dataset, indices, loader_generator)
                 if train and use_balanced_sampler
                 else None
             )
+            if train and context.enabled:
+                if sampler is not None:
+                    # WeightedRandomSampler draws with replacement from a global
+                    # weight vector and has no per-rank partition; composing the
+                    # two would either duplicate samples across ranks or drop the
+                    # inverse-frequency weighting. Refusing is the honest option:
+                    # both features work, just not together.
+                    raise ValueError(
+                        "experiment.training.balanced_sampler=true is not supported under DDP: "
+                        "WeightedRandomSampler and DistributedSampler cannot be composed without "
+                        "changing the sampling distribution. Run this variant on one GPU, or "
+                        "shard the ablation suite across GPUs instead (scripts/run_ablations.py "
+                        "--gpus)."
+                    )
+                sampler = DistributedSampler(
+                    Subset(source, indices),
+                    num_replicas=context.world_size,
+                    rank=context.rank,
+                    shuffle=shuffle,
+                    seed=int(cfg.seed),
+                    # Equal batch counts per rank. An uneven tail means one rank
+                    # entering an all-reduce its peers have already left.
+                    drop_last=True,
+                )
             # `persistent_workers` matters more here than the epoch count
             # suggests: this trainer builds a *fresh* loader per fold and per
             # evaluation pass, and every short-lived pool pays full worker
@@ -1293,8 +1436,63 @@ def main(cfg: DictConfig) -> None:
         num_experts = 1
         fold_test_metrics: list[dict[str, float]] = []
 
+        # ------------------------------------------------------------- resume
+        #
+        # Stage 2 resumes at **epoch** granularity -- fold, epoch, global step,
+        # optimizer moments, best-so-far and every rank's RNG -- where stage 1
+        # resumes at micro-batch granularity. The asymmetry is deliberate and is
+        # about what an epoch costs: stage 1's is tens of minutes of
+        # self-distillation over six views per image, stage 2's is one pass of a
+        # ~9 M-parameter head over ~7.5 k images against a frozen encoder. Losing
+        # at most one stage-2 epoch to an interruption is not worth the cost of
+        # replaying its batches.
+        resume_path = resolve_resume_path(
+            OmegaConf.select(cfg, "experiment.training.resume", default=False),
+            output_dir,
+            patterns=(f"{RESUME_PREFIX}*.pth",),
+            logger=logger,
+        )
+        resume_path = broadcast_object(str(resume_path) if resume_path else None, context)
+        resume_payload = (
+            load_checkpoint_payload(resume_path, map_location=device, logger=logger)
+            if resume_path
+            else None
+        )
+        resume_progress = TrainingProgress.from_dict(
+            (resume_payload or {}).get("progress")
+        )
+        resume_fold = int((resume_payload or {}).get("fold", 1))
+        if resume_payload is not None:
+            global_step = resume_progress.global_step
+            best_val_loss = resume_progress.best_metric
+            history = LossHistory(
+                train=list((resume_payload.get("history") or {}).get("train_loss", [])),
+                validation=list((resume_payload.get("history") or {}).get("validation_loss", [])),
+            )
+            logger.info(
+                "Resume | continuing at fold %s, epoch %s, step %s (best val loss %.5f).",
+                resume_fold, resume_progress.epoch + 1, global_step, best_val_loss,
+            )
+            tracker.log_event(
+                "resume", {"path": resume_path, "fold": resume_fold, **resume_progress.as_dict()}
+            )
+
+        periodic = PeriodicSaver(
+            OmegaConf.select(cfg, "experiment.training.resume_every_minutes", default=None)
+        )
+        # Installed rather than entered as a context manager so the fold loop
+        # below keeps its indentation; restored in this function's `finally`.
+        guard = InterruptGuard(
+            OmegaConf.select(cfg, "experiment.training.max_runtime_minutes", default=None),
+            logger=logger,
+        ).install()
+        interrupted = False
+
         # ------------------------------------------------------------- folds
         for fold, (train_indices, val_indices) in enumerate(splits, start=1):
+            if fold < resume_fold:
+                logger.info("Fold %s already completed before the interruption; skipping.", fold)
+                continue
             logger.info("Fold %s/%s: %s train / %s val", fold, len(splits), len(train_indices), len(val_indices))
             encoder, model = build_model_and_encoder(cfg, device)
             num_experts = int(getattr(model, "num_experts", 1))
@@ -1327,6 +1525,58 @@ def main(cfg: DictConfig) -> None:
             optimizer = build_optimizer([encoder, model, criterion], cfg)
             scheduler = build_scheduler(optimizer, cfg)
 
+            # Restore into *this* fold's freshly built objects. Building first
+            # and restoring second is the only order that works, because each
+            # fold constructs its own encoder, head, criterion and optimizer.
+            fold_components = {
+                "model_state_dict": model,
+                "encoder_state_dict": encoder,
+                "criterion_state_dict": criterion,
+                "optimizer_state_dict": optimizer,
+                "scheduler_state_dict": scheduler,
+                "scaler_state_dict": scaler,
+            }
+            start_epoch = 1
+            if resume_payload is not None and fold == resume_fold:
+                restore_components(resume_payload, fold_components, strict=True, logger=logger)
+                restore_rng_states(resume_payload, context, loader_generator, logger=logger)
+                start_epoch = int(resume_progress.epoch) + 1
+                if start_epoch > epochs:
+                    logger.info("Fold %s was already complete at the interruption.", fold)
+                # Consumed: later folds start fresh, as they would have.
+                resume_payload = None
+
+            step_module = None
+            if context.enabled:
+                from torch.nn.parallel import DistributedDataParallel
+
+                from src.utils.training.distributed import buffer_sync_kwarg
+
+                step_module = DistributedDataParallel(
+                    TrainStep(encoder, model, criterion),
+                    device_ids=[context.local_rank] if device.type == "cuda" else None,
+                    output_device=context.local_rank if device.type == "cuda" else None,
+                    **buffer_sync_kwarg(False),
+                    gradient_as_bucket_view=True,
+                    # Required here, unlike stage 1, and for a reason that is
+                    # architectural rather than incidental: under sparse
+                    # dispatch an expert that no token routed to genuinely
+                    # receives no gradient that step, so DDP cannot assume every
+                    # parameter will be marked ready. The alternative -- dense
+                    # dispatch -- would change what the MoE ablation measures.
+                    #
+                    # The arithmetic still comes out right: DDP contributes a
+                    # zero for the unused parameter and averages over the world,
+                    # which is exactly the global per-sample mean when the tokens
+                    # that would have driven it live on another rank.
+                    find_unused_parameters=True,
+                )
+                logger.info(
+                    "DDP | encoder projection + head + criterion wrapped across %s ranks "
+                    "(find_unused_parameters=True for sparse expert dispatch).",
+                    context.world_size,
+                )
+
             if fold == 1:
                 flags = getattr(model, "component_flags", lambda: {})()
                 logger.info("Component flags: %s", flags or "n/a")
@@ -1346,8 +1596,15 @@ def main(cfg: DictConfig) -> None:
             )
             val_loader = make_loader(val_indices, shuffle=False)
 
-            for epoch in range(1, epochs + 1):
+            for epoch in range(start_epoch, epochs + 1):
                 epoch_started = time.perf_counter()
+                # The sampler's permutation is a function of `seed + epoch`.
+                # Without this call, every epoch replays the first one's order --
+                # no error, no change in loss magnitude, and the run silently
+                # becomes one epoch repeated.
+                if context.enabled and isinstance(train_loader.sampler, DistributedSampler):
+                    train_loader.sampler.set_epoch(epoch)
+
                 # Schedules that must move once per epoch, before the loop that
                 # reads them.
                 margin_scale = margin_schedule(epoch, epochs, margin_warmup)
@@ -1365,20 +1622,40 @@ def main(cfg: DictConfig) -> None:
                     optimizer=optimizer, max_batches=max_batches,
                     clip_grad=cfg.experiment.training.clip_grad, amp=amp, scaler=scaler,
                     num_experts=num_experts, max_tsne_samples=max_tsne,
+                    step_module=step_module,
                 )
-                val_metrics, val_evaluation, val_accumulator, global_step = run_epoch(
-                    encoder, model, criterion, val_loader, device, tracker, logger,
-                    epoch, global_step, phase=f"fold_{fold}/validation", dataset=dataset,
-                    max_batches=max_batches, amp=AMP_DISABLED,
-                    num_experts=num_experts, max_tsne_samples=max_tsne,
-                )
+                # Evaluation runs on one rank against the whole validation split.
+                # The parameters are identical across the job -- DDP guarantees
+                # it -- so this is the single-process metric by construction,
+                # rather than a reduction over shards that would carry a
+                # dependence on the GPU count into the comparison table.
+                if context.is_main:
+                    val_metrics, val_evaluation, val_accumulator, _ = run_epoch(
+                        encoder, model, criterion, val_loader, device, tracker, logger,
+                        epoch, global_step, phase=f"fold_{fold}/validation", dataset=dataset,
+                        max_batches=max_batches, amp=AMP_DISABLED,
+                        num_experts=num_experts, max_tsne_samples=max_tsne,
+                    )
+                else:
+                    val_metrics, val_evaluation, val_accumulator = None, None, None
+                # Every rank needs the loss to agree on the best-checkpoint
+                # decision below; the heavyweight evaluation objects stay where
+                # they were computed.
+                val_metrics = broadcast_object(val_metrics, context)
+
                 if scheduler is not None:
                     scheduler.step()
 
                 absolute_epoch = (fold - 1) * epochs + epoch
                 history.append(train_metrics["loss"], val_metrics["loss"])
 
-                if figure_every > 0 and (epoch % figure_every == 0 or epoch == epochs):
+                # `val_evaluation` exists only on the rank that ran the
+                # evaluation; the others hold None and have nothing to plot.
+                if (
+                    val_evaluation is not None
+                    and figure_every > 0
+                    and (epoch % figure_every == 0 or epoch == epochs)
+                ):
                     log_evaluation_artifacts(
                         tracker, val_evaluation, val_accumulator, dataset,
                         absolute_epoch, f"fold_{fold}/validation", logger,
@@ -1423,6 +1700,56 @@ def main(cfg: DictConfig) -> None:
                     )
                     tracker.log_event("checkpoint", {"type": "interval", "path": checkpoint_path})
 
+                # Resume state, written at the epoch boundary where every rank is
+                # in lockstep and the optimizer has just stepped. `stop` is
+                # latched locally but decided globally: the RNG gather inside the
+                # write is a collective, so one rank taking it alone would hang
+                # the job at the collective timeout.
+                stop = guard.should_stop()
+                due = periodic.due() or stop.requested or epoch == epochs
+                if context.enabled:
+                    flags = torch.tensor(
+                        [1.0 if due else 0.0, 1.0 if stop.requested else 0.0],
+                        device=device, dtype=torch.float32,
+                    )
+                    all_reduce_max(flags, context)
+                    due, stop_now = bool(flags[0] > 0), bool(flags[1] > 0)
+                else:
+                    stop_now = stop.requested
+
+                if due:
+                    resume_manager.save(
+                        f"{RESUME_PREFIX}_fold{fold}_epoch{epoch:04d}.pth",
+                        build_checkpoint_payload(
+                            components=fold_components,
+                            progress=TrainingProgress(
+                                epoch=epoch,
+                                global_step=global_step,
+                                micro_step=0,
+                                best_metric=best_val_loss,
+                                completed=(fold == len(splits) and epoch == epochs),
+                            ),
+                            context=context,
+                            config=cfg,
+                            rng_states=collect_rng_states(context, loader_generator),
+                            extra={"fold": fold, "history": history.as_series()},
+                        ),
+                        rolling_prefix=RESUME_PREFIX,
+                    )
+                    periodic.mark()
+
+                if stop_now:
+                    interrupted = True
+                    logger.warning(
+                        "Stopping after fold %s epoch %s (%s). Relaunch the identical command "
+                        "with experiment.training.resume=auto to continue.",
+                        fold, epoch, stop.reason or "peer request",
+                    )
+                    break
+
+            if interrupted:
+                break
+
             # Score *this* fold's final model on the held-out test split before
             # moving on. Reporting only the best fold's test metrics is a
             # selection over K folds, and the expected value of a maximum
@@ -1431,7 +1758,7 @@ def main(cfg: DictConfig) -> None:
             # and incomparable with the num_folds=1 numbers already collected.
             # The mean across folds is what the table uses; best-fold selection
             # survives only for the artifact that gets profiled and shipped.
-            if len(test_indices) > 0 and len(splits) > 1:
+            if len(test_indices) > 0 and len(splits) > 1 and context.is_main:
                 _, fold_test_evaluation, _, _ = run_epoch(
                     encoder, model, criterion, make_loader(test_indices, shuffle=False),
                     device, tracker, logger, epoch=fold, global_step=global_step,
@@ -1441,65 +1768,89 @@ def main(cfg: DictConfig) -> None:
                 fold_test_metrics.append(dict(fold_test_evaluation.scalar_metrics()))
 
             logger.info("Fold %s complete.", fold)
+            barrier(context)
+
+        if interrupted:
+            tracker.log_event(
+                "training_interrupted",
+                {"global_step": global_step, "duration_seconds": time.perf_counter() - started},
+            )
+            return
 
         # -------------------------------------------------------------- test
         if best_state is None:
             raise RuntimeError("Training finished without producing a best checkpoint.")
 
+        # Everything from here is evaluation and reporting against parameters
+        # every rank already holds identically, so it runs once. The barrier at
+        # the end keeps the other ranks from tearing down the process group --
+        # and, under NCCL, their share of the CUDA context -- while rank 0 is
+        # still profiling and writing.
         test_evaluation: HierarchicalEvaluation | None = None
         test_accumulator: EpochAccumulator | None = None
-        if len(test_indices) > 0:
-            logger.info("Evaluating best checkpoint (fold %s, epoch %s) on %s held-out samples.",
-                        best_state["fold"], best_state["epoch"], len(test_indices))
-            _, test_evaluation, test_accumulator, _ = run_epoch(
-                best_state["encoder"], best_state["model"], best_state["criterion"],
-                make_loader(test_indices, shuffle=False), device, tracker, logger,
-                epoch=1, global_step=global_step, phase="test", dataset=dataset,
-                max_batches=max_batches, amp=AMP_DISABLED,
-                num_experts=num_experts, max_tsne_samples=max_tsne,
-            )
-            log_evaluation_artifacts(
-                tracker, test_evaluation, test_accumulator, dataset, 1, "test", logger
-            )
-            logger.info(
-                "Test | seed_acc=%.4f sub_acc=%.4f kl_alignment=%.4f",
-                test_evaluation.seed_type.get("accuracy", float("nan")),
-                test_evaluation.sub_variety.get("accuracy", float("nan")),
-                test_evaluation.alignment.overall,
-            )
+        efficiency = None
+        final_path = str(output_dir / "hierarchical_moe_final.pth")
 
-        final_path = save_checkpoint(
-            checkpoint_manager, "hierarchical_moe_final.pth", best_state["encoder"],
-            best_state["model"], best_state["criterion"], best_state["optimizer"],
-            best_state["scheduler"], best_state["epoch"], best_state["fold"], dataset, include_optimizer,
-        )
-        tracker.log_artifact(final_path, name="hierarchical_moe_final", artifact_type="model")
+        if context.is_main:
+            if len(test_indices) > 0:
+                logger.info("Evaluating best checkpoint (fold %s, epoch %s) on %s held-out samples.",
+                            best_state["fold"], best_state["epoch"], len(test_indices))
+                _, test_evaluation, test_accumulator, _ = run_epoch(
+                    best_state["encoder"], best_state["model"], best_state["criterion"],
+                    make_loader(test_indices, shuffle=False), device, tracker, logger,
+                    epoch=1, global_step=global_step, phase="test", dataset=dataset,
+                    max_batches=max_batches, amp=AMP_DISABLED,
+                    num_experts=num_experts, max_tsne_samples=max_tsne,
+                )
+                log_evaluation_artifacts(
+                    tracker, test_evaluation, test_accumulator, dataset, 1, "test", logger
+                )
+                logger.info(
+                    "Test | seed_acc=%.4f sub_acc=%.4f kl_alignment=%.4f",
+                    test_evaluation.seed_type.get("accuracy", float("nan")),
+                    test_evaluation.sub_variety.get("accuracy", float("nan")),
+                    test_evaluation.alignment.overall,
+                )
 
-        # -------------------------------------------------------- efficiency
-        efficiency = profile_run(
-            best_state["encoder"], best_state["model"], eval_dataset, cfg, device, logger,
-            sample_indices=test_indices if len(test_indices) else None,
-        )
-        if efficiency is not None:
-            tracker.log_metrics(efficiency.as_metrics(), step=0)
+            final_path = save_checkpoint(
+                checkpoint_manager, "hierarchical_moe_final.pth", best_state["encoder"],
+                best_state["model"], best_state["criterion"], best_state["optimizer"],
+                best_state["scheduler"], best_state["epoch"], best_state["fold"], dataset,
+                include_optimizer,
+            )
+            tracker.log_artifact(final_path, name="hierarchical_moe_final", artifact_type="model")
 
-        # ------------------------------------------------------ run artifacts
-        summary_path = write_run_summary(
-            cfg=cfg,
-            output_dir=output_dir,
-            model=best_state["model"],
-            criterion=best_state["criterion"],
-            evaluation=test_evaluation,
-            accumulator=test_accumulator,
-            dataset=dataset,
-            efficiency=efficiency,
-            history=history,
-            checkpoint_path=final_path,
-            split_report=split_report,
-            fold_metrics=aggregate_fold_metrics(fold_test_metrics),
-            logger=logger,
-        )
-        tracker.log_event("run_summary", {"path": summary_path})
+            # ---------------------------------------------------- efficiency
+            # Latency and throughput are reported for the deployed single-device
+            # path, so this is measured on one rank whatever the training
+            # topology was -- a "latency" that depended on the GPU count of the
+            # training job would not be a number anyone could act on.
+            efficiency = profile_run(
+                best_state["encoder"], best_state["model"], eval_dataset, cfg, device, logger,
+                sample_indices=test_indices if len(test_indices) else None,
+            )
+            if efficiency is not None:
+                tracker.log_metrics(efficiency.as_metrics(), step=0)
+
+            # -------------------------------------------------- run artifacts
+            summary_path = write_run_summary(
+                cfg=cfg,
+                output_dir=output_dir,
+                model=best_state["model"],
+                criterion=best_state["criterion"],
+                evaluation=test_evaluation,
+                accumulator=test_accumulator,
+                dataset=dataset,
+                efficiency=efficiency,
+                history=history,
+                checkpoint_path=final_path,
+                split_report=split_report,
+                fold_metrics=aggregate_fold_metrics(fold_test_metrics),
+                logger=logger,
+                distributed=context.as_dict(),
+            )
+            tracker.log_event("run_summary", {"path": summary_path})
+        barrier(context)
 
         total_seconds = time.perf_counter() - started
         tracker.log_event("training_complete", {"duration_seconds": total_seconds, "checkpoint": final_path})
@@ -1507,11 +1858,16 @@ def main(cfg: DictConfig) -> None:
 
     except Exception:
         logger.exception("Hierarchical MoE finetuning failed.")
-        tracker.log_event("exception", {"stage": "moe_finetuning"})
+        tracker.log_event("exception", {"stage": "moe_finetuning", "rank": context.rank})
         raise
     finally:
+        if guard is not None:
+            guard.restore()
         tracker.log_event("training_end", {"duration_seconds": time.perf_counter() - started})
         tracker.close()
+        # No barrier: this also runs when one rank has raised, and a barrier
+        # there would replace the traceback with a collective timeout.
+        shutdown_distributed(context)
 
 
 def aggregate_fold_metrics(fold_metrics: list[dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -1553,6 +1909,7 @@ def write_run_summary(
     criterion: CombinedHierarchicalLoss | None = None,
     split_report: dict[str, Any] | None = None,
     fold_metrics: dict[str, dict[str, float]] | None = None,
+    distributed: dict[str, Any] | None = None,
 ) -> str:
     """Persist ``summary.json`` and ``test_predictions.npz`` for cross-run reporting.
 
@@ -1598,6 +1955,14 @@ def write_run_summary(
         loss_flags=criterion.loss_flags() if criterion is not None else {},
         split=dict(split_report or {}),
         fold_metrics=dict(fold_metrics or {}),
+        runtime={
+            "distributed": dict(distributed or {}),
+            "amp": str(OmegaConf.select(cfg, "experiment.training.amp", default="auto")),
+            "compile": OmegaConf.select(cfg, "experiment.training.compile.enabled", default=None),
+            "deterministic": OmegaConf.select(
+                cfg, "experiment.training.deterministic", default=None
+            ),
+        },
         config={
             "backbone": str(OmegaConf.select(cfg, "model.backbone.name", default="")),
             "head": str(OmegaConf.select(cfg, "model.head.name", default="")),

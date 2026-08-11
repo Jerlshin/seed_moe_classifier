@@ -68,9 +68,24 @@ def setup_experiment_logger(
     level: str = "INFO",
     console: bool = True,
     structured_jsonl: bool = True,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> logging.Logger:
+    """Configure the run's logger, with one file per rank.
+
+    Args:
+        rank / world_size: When ``world_size > 1`` every file gains a
+            ``.rank{n}`` suffix and every line a ``rank n`` tag. Ranks are
+            separate processes writing at the same instants, so a single shared
+            file interleaves partial lines under load -- and the one time these
+            logs matter most is a hang, where the question is precisely *which*
+            rank stopped and where. Non-zero ranks default to file-only output so
+            the console stays readable; pass ``console=True`` explicitly to see
+            all of them.
+    """
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
+    suffix = f".rank{rank}" if world_size > 1 else ""
 
     logger = logging.getLogger(name)
     logger.setLevel(getattr(logging, level.upper(), logging.INFO))
@@ -80,12 +95,15 @@ def setup_experiment_logger(
         logger.removeHandler(handler)
         handler.close()
 
+    rank_tag = f" | rank {rank}" if world_size > 1 else ""
     formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        fmt=f"%(asctime)s | %(levelname)s | %(name)s{rank_tag} | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    file_handler = logging.FileHandler(log_path / "training.log", mode="a", encoding="utf-8")
+    file_handler = logging.FileHandler(
+        log_path / f"training{suffix}.log", mode="a", encoding="utf-8"
+    )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
@@ -95,7 +113,7 @@ def setup_experiment_logger(
         logger.addHandler(console_handler)
 
     if structured_jsonl:
-        jsonl_handler = JsonlLogHandler(log_path / "training.log.jsonl")
+        jsonl_handler = JsonlLogHandler(log_path / f"training{suffix}.log.jsonl")
         logger.addHandler(jsonl_handler)
 
     return logger

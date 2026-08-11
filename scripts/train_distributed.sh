@@ -1,20 +1,37 @@
 #!/usr/bin/env bash
 #
-# Launch a training stage or a full experiment suite with vast.ai path defaults.
+# Launch a training stage or a full experiment suite, single- or multi-GPU,
+# with server path defaults.
 #
 #   scripts/train_distributed.sh pretrain
+#   GPUS=2 scripts/train_distributed.sh pretrain           # DDP over 2 GPUs
+#   GPUS=auto scripts/train_distributed.sh pretrain        # every visible GPU
 #   scripts/train_distributed.sh finetune data.batch_size=32
-#   scripts/train_distributed.sh ablations
+#   GPUS=0,1 scripts/train_distributed.sh ablations        # one variant per GPU
 #   scripts/train_distributed.sh baselines
+#   scripts/train_distributed.sh verify                    # numerical checks
 #   scripts/train_distributed.sh report
 #
-# Despite the name this is a single-process launcher; distributed training is not
-# implemented. Extra arguments pass through as Hydra overrides.
+# Extra arguments pass through as Hydra overrides.
+#
+# GPUS means two different things, deliberately, because the two stages want
+# different kinds of parallelism:
+#
+#   * for `pretrain` / `finetune` / `ablation` it is a COUNT, and the stage runs
+#     as one DDP job across that many ranks;
+#   * for `ablations` / `baselines` it is a DEVICE LIST, and the suite runs one
+#     variant per device concurrently. That is the better use of a second GPU
+#     for stage 2: 18 variants x 5 seeds are already independent processes, so
+#     there is no gradient traffic and each variant keeps the exact numerics of
+#     a single-GPU run.
+#
+# On Windows, or anywhere without bash, use scripts/launch.py directly -- it is
+# the same launcher and takes the same arguments.
 set -euo pipefail
 
 STAGE="${1:-}"
 if [[ -z "${STAGE}" ]]; then
-  echo "Usage: scripts/train_distributed.sh pretrain|finetune|ablation|ablations|baselines|report [overrides...]"
+  echo "Usage: [GPUS=n] scripts/train_distributed.sh pretrain|finetune|ablation|ablations|baselines|verify|report [overrides...]"
   exit 2
 fi
 shift || true
@@ -28,21 +45,31 @@ mkdir -p "${SEED_OUTPUT_DIR}"
 # to the same file without any manual path plumbing.
 export SEED_PRETRAIN_BACKBONE="${SEED_PRETRAIN_BACKBONE:-${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth}"
 
+GPUS="${GPUS:-1}"
+
 case "${STAGE}" in
-  pretrain)
-    python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino "$@"
-    ;;
-  finetune)
-    python -m src.trainers.moe_finetune experiment=finetune_hierarchical_moe "$@"
-    ;;
-  ablation)
-    python -m src.trainers.moe_finetune experiment=ablation_flat_classifier "$@"
+  pretrain|finetune|ablation)
+    # scripts/launch.py pins one $SEED_RUN_ID so every rank composes the same
+    # Hydra output directory, and runs the module directly (no process group)
+    # when GPUS is 1.
+    python scripts/launch.py "${STAGE}" --gpus "${GPUS}" "$@"
     ;;
   ablations)
-    python scripts/run_ablations.py -- "$@"
+    if [[ "${GPUS}" == "1" ]]; then
+      python scripts/run_ablations.py -- "$@"
+    else
+      python scripts/run_ablations.py --gpus "${GPUS}" -- "$@"
+    fi
     ;;
   baselines)
-    python scripts/run_baselines.py -- "$@"
+    if [[ "${GPUS}" == "1" ]]; then
+      python scripts/run_baselines.py -- "$@"
+    else
+      python scripts/run_baselines.py --gpus "${GPUS}" -- "$@"
+    fi
+    ;;
+  verify)
+    python scripts/verify_runtime.py "$@"
     ;;
   report)
     python scripts/generate_plots.py "$@"

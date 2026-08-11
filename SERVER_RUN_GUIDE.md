@@ -103,7 +103,14 @@ export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
 ```bash
 python -m pytest tests/ -q
 python scripts/dry_run.py --device cuda      # or leave --device out for auto
+python scripts/verify_runtime.py --gpus 2    # drop --gpus on a single-GPU box
 ```
+
+`verify_runtime.py` is the one that answers *"do the optimisations still compute
+the intended function on this hardware?"* — capability probe, SDPA parity per
+module in fp64, AMP dtype selection and fp32 pinning, exact resume, and DDP
+gradient equality over the real NCCL backend. Run it after provisioning and after
+any driver or torch upgrade.
 
 ### 3.2 Environment variables (set once per shell / put in the launch script)
 
@@ -114,9 +121,9 @@ export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pret
 mkdir -p "${SEED_OUTPUT_DIR}"
 ```
 
-`scripts/train_distributed.sh` sets these three with the same vast.ai-shaped
-defaults (`/workspace/...`) if you don't export them yourself — despite the
-name it is a single-process launcher, not a distributed one.
+`scripts/train_distributed.sh` sets these three with the same server-shaped
+defaults (`/workspace/...`) if you don't export them yourself, and dispatches
+single- or multi-GPU depending on `GPUS`.
 
 ### 3.3 Stage 1 — DINO self-supervised pretraining (run once)
 
@@ -134,7 +141,74 @@ self-supervised initialisation noise instead of the architecture change under
 test.
 
 300 epochs at the paper's schedule. Budget for a multi-hour run on a single
-modern GPU; checkpoint every `save_interval` (50) epochs so it can resume.
+modern GPU.
+
+**On two GPUs**, and on any platform that ends the session before the run does:
+
+```bash
+python main.py pretrain --gpus 2 \
+    experiment.training.resume=auto \
+    experiment.training.resume_every_minutes=20
+```
+
+Three things to understand about that command.
+
+`--gpus 2` pins one `$SEED_RUN_ID` so both ranks share an output directory, then
+launches under `torch.distributed.run`. `DistributedSampler` shards the *images*;
+all six views of a sample stay on the rank that owns it, because the loss pairs a
+student view against the teacher's output for that same image.
+
+The **effective batch does not change**. `data.batch_size` is per-rank, and
+`experiment.training.effective_batch_size` (64) derives the accumulation count
+from it and the world size — 1 GPU at `16 x 4` and 2 at `16 x 2` are the same 64
+images per optimizer step. A mismatch that does not divide exactly is refused
+rather than rounded. Holding the per-rank micro-batch fixed is also what keeps
+Sinkhorn and KoLeo computing the same function they compute on one GPU.
+
+`resume=auto` continues from the newest valid checkpoint and starts fresh when
+there is none, so the **identical command line** works for the first launch and
+every relaunch. The resume checkpoint carries the teacher, optimizer moments,
+scheduler, `GradScaler`, epoch, global step, micro-batch within the epoch and
+every rank's RNG — a relaunch continues rather than restarting warm.
+
+### 3.3a Kaggle T4 x 2
+
+Two Turing cards, 16 GB each, ~4 vCPUs, and a session limit. Everything adapts
+automatically except the two flags that tell the run about the limit:
+
+```bash
+!cd /kaggle/working/seed-moe-classifier && \
+  SEED_DATA_ROOT=/kaggle/input/<dataset>/Cropped_Samples \
+  SEED_OUTPUT_DIR=/kaggle/working/outputs \
+  python scripts/launch.py pretrain --gpus 2 \
+      experiment.training.resume=auto \
+      experiment.training.max_runtime_minutes=520 \
+      experiment.training.resume_every_minutes=15 \
+      experiment.training.keep_last_n_checkpoints=2
+```
+
+What adapts by itself:
+
+| Resolved | To | Why |
+| --- | --- | --- |
+| `amp: auto` | **fp16 + `GradScaler`** | `sm_75` has no hardware bf16. The Sinkhorn normaliser, the 8,192-way log-softmax and the KoLeo distances are pinned to fp32 inside the autocast region, which is what makes fp16 safe here. |
+| `compile.enabled: auto` | on (Triton supports `sm_75`) | Costs a few minutes of graph capture on the first step. Set `false` if a short session cannot amortise it. |
+| `data.num_workers: auto` | 2 per rank | Per-process setting; the literal 8 would put 16 augmentation workers on 4 vCPUs. |
+| SDPA backend | memory-efficient (no flash below `sm_80`) | Still avoids materialising the `[B*nW, heads, N, N]` matrices, which is the whole point of the rewrite. |
+
+What does not adapt, and why these two flags matter: `max_runtime_minutes` stops
+the run *cleanly with a complete checkpoint* before the platform kills it — more
+reliable than being signalled, since not every platform signals first — and
+`resume_every_minutes` bounds the worst case to minutes rather than to
+`save_interval: 50` **epochs**, which on a 300-epoch run is longer than the whole
+session.
+
+Measure the batch geometry before committing:
+
+```bash
+python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 16 --accum 2
+python scripts/bench_pretrain_step.py --batch-size 8 --accum 4    # if 16 OOMs
+```
 
 ### 3.4 Stage 2 — single finetune run (smoke-test the head before the full suite)
 

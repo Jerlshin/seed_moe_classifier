@@ -119,6 +119,13 @@ class RunSummary:
     expected value exceeds a single fold's, so the mean is what the table uses;
     the best fold is kept only for the artifact that gets shipped."""
 
+    runtime: dict[str, Any] = field(default_factory=dict)
+    """How the run was executed: world size, backend, autocast dtype, whether it
+    compiled. None of it changes the objective, and all of it changes what a
+    throughput or latency number in ``efficiency`` means -- so a reader comparing
+    two rows can tell whether they were produced on the same footing without
+    having to find the logs."""
+
     config: dict[str, Any] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)
 

@@ -1,7 +1,7 @@
 # `tests/` — pytest suite
 
 ```bash
-python -m pytest tests/ -q             # all 280, ~7s
+python -m pytest tests/ -q             # all 419, ~30s
 python -m pytest tests/ -k arcface     # one topic
 python -m pytest tests/test_models.py  # one file
 ```
@@ -22,6 +22,10 @@ No network access, no weight downloads, no dependency on the real dataset.
 | `test_datasets.py` | Label hierarchy, global sub-variety indices, multi-crop pipeline |
 | `test_configs.py` | Hydra composition and agreement with Table 1 / Section 5 |
 | `test_integration.py` | Splits, epoch loop, checkpoint round-trip, tracker artifacts |
+| `test_throughput.py` | Value-preserving speedups: SDPA parity (fp64/bf16/fp16), fused views, EMA, collate order |
+| `test_distributed.py` | DDP gradient equality, distributed Sinkhorn, shared EMA centre, wrapper prefixes |
+| `test_checkpointing.py` | Exact resume, atomic writes, RNG round-trip, latest-valid discovery |
+| `test_precision.py` | AMP dtype selection, fp32 pinning, capability probing, reproducibility |
 
 ## Paper constants are the fixtures
 
@@ -116,6 +120,43 @@ still leaves at least two members of every class in every partition.
 `DummyEncoder` stands in for `DinoV2SwinV2Encoder`, mapping images to
 `[batch, 384]` — the same contract the real encoder guarantees. Integration tests
 exercise the trainer's real epoch loop without ever constructing SwinV2.
+
+## The multi-process tests run real processes
+
+`test_distributed.py` spawns real ranks over a real **Gloo** process group on
+CPU, which is what makes it both meaningful and runnable anywhere — no GPU, no
+NCCL, no launcher. The arithmetic under test is backend-independent: an
+all-reduce is an all-reduce.
+
+Each of its four claims has a failure mode that produces no error at all:
+
+1. **DDP's averaged gradient equals the single-process gradient** on the batch
+   the ranks jointly hold, including across `no_sync` accumulation. Get the
+   divisor wrong and you train a different model at a loss curve that looks
+   right.
+2. **Distributed Sinkhorn equals single-process Sinkhorn** on the concatenated
+   batch. The implementation everyone reaches for first — reduce the local
+   `logsumexp` results — is off by a per-rank shift and yields an assignment that
+   is *nearly* doubly stochastic, which nothing downstream notices. The test
+   carries its own control: the naive per-rank concatenation must differ
+   materially from the reference, so the agreement is not an accident of small
+   numbers.
+3. **Per-rank Sinkhorn is untouched by the presence of a process group**, which
+   is what makes the default setting reproduce the single-GPU numbers.
+4. **No wrapper prefix reaches a state dict.**
+
+`test_checkpointing.py`'s headline test trains `n` steps in one process and
+compares, parameter by parameter, against training `k`, saving, restoring into
+**freshly constructed** objects, and training `n - k`. Fresh objects matter:
+reusing them would let state survive through Python rather than through the file.
+It also carries a control — `test_a_weights_only_checkpoint_is_detectably_not_enough`
+— so a suite that could not distinguish a complete checkpoint from an incomplete
+one would fail rather than pass quietly.
+
+The real backend is checked separately, on the machine that will use it:
+`python scripts/verify_runtime.py --gpus 2` re-runs the gradient-equality claim
+over NCCL, prints the per-module SDPA parity report, and reports what the
+hardware actually supports.
 
 ## Beyond the unit suite
 

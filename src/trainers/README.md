@@ -73,6 +73,43 @@ is visible in the run), gradient norms, and a loss curve figure (paper Fig. 6).
 copy is already safely on disk, and discarding a completed 300-epoch pretraining
 run over a file-copy failure would be indefensible.
 
+### Running it on more than one GPU
+
+    torchrun --standalone --nproc_per_node=2 -m src.trainers.contrastive_pretrain \
+        experiment=pretrain_swinv2_dino
+    python main.py pretrain --gpus 2          # the same, run id pinned
+
+`DistributedSampler` shards **images**; all six views of a sample stay on the
+rank that owns it, because Eq. 1 pairs a student view against the teacher's
+output for that same image. `set_epoch` is called every epoch — the permutation
+is a function of `seed + epoch`, and skipping the call replays epoch 0 forever
+without an error.
+
+The effective batch is held fixed rather than multiplied:
+`resolve_accumulation()` derives `gradient_accumulation_steps` from
+`effective_batch_size` and the world size and refuses a combination that does not
+divide exactly. Holding the per-rank micro-batch fixed is also what keeps
+Sinkhorn and KoLeo computing the same function they compute on one GPU — both
+are already per-micro-batch statistics.
+
+Only the student is wrapped in DDP (the teacher takes no gradient and is
+broadcast from rank 0 once), the wrapper lives in `DINO._ddp` off the module tree
+so no state-dict key gains a `module.` prefix, and `model.no_sync()` wraps every
+micro-batch that is not an accumulation boundary.
+
+### Surviving an interrupted session
+
+`experiment.training.resume=auto` continues from the newest valid checkpoint and
+starts fresh when there is none, so the same command line serves the first launch
+and every relaunch. Resume checkpoints carry the teacher, optimizer moments,
+scheduler, `GradScaler`, epoch, global step, **micro-batch within the epoch** and
+one RNG snapshot per rank; the loop replays the already-consumed micro-batches so
+the resume lands where it stopped rather than at the start of the epoch.
+
+Two triggers write one: `resume_every_minutes` and a SIGTERM/SIGINT handler that
+finishes the current micro-batch first. `max_runtime_minutes` stops the run
+cleanly before a hard session limit rather than relying on being signalled.
+
 ## `moe_finetune.py`
 
 ### Splits

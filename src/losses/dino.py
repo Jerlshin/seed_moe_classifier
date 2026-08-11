@@ -75,11 +75,15 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from src.utils.training.distributed import DistributedContext
 
 CENTERING_MODES = ("ema", "sinkhorn")
 
@@ -142,6 +146,7 @@ def sinkhorn_knopp(
     logits: torch.Tensor,
     temperature: float = 0.05,
     iterations: int = 3,
+    context: "DistributedContext | None" = None,
 ) -> torch.Tensor:
     """Doubly-stochastic assignment over a batch (SwaV/DINOv2 centering).
 
@@ -158,9 +163,30 @@ def sinkhorn_knopp(
     result is detached and only shows up later as a ``nan`` loss.
 
     Args:
-        logits: Teacher outputs, ``[batch, out_dim]``.
+        logits: Teacher outputs, ``[batch, out_dim]``. Under DDP this is the
+            **local** shard.
         temperature: Sharpening temperature applied before normalisation.
         iterations: Sinkhorn iterations (3 is the reference value).
+        context: Pass an enabled :class:`~src.utils.training.distributed.\
+DistributedContext` to normalise over the batch **concatenated across ranks**
+            instead of the local shard.
+
+            Which one is wanted is a real choice, not an implementation detail.
+            The two axes of the normaliser behave differently under sharding: the
+            *sample* marginal (``dim=0``, over prototypes) is per-column and
+            therefore already local, while the *prototype* marginal (``dim=1``,
+            over the batch) reduces along the axis that was split, so it needs
+            :func:`~src.utils.training.distributed.logsumexp_across_ranks` to
+            mean what it means on one GPU. With ``context`` supplied, the result
+            is equal to running this function on one process over the
+            concatenated batch, up to floating-point reduction order --
+            ``tests/test_distributed.py`` pins that.
+
+            Left ``None`` (the default), each rank normalises its own shard, and
+            *that* is what reproduces the single-GPU numbers: this function is
+            already applied per micro-batch under gradient accumulation, so a
+            per-rank shard of the same size computes the identical function to
+            the one a single-GPU run computes on its micro-batch.
 
     Returns:
         ``[batch, out_dim]`` in **fp32**, whatever dtype came in. Under bf16
@@ -169,18 +195,39 @@ def sinkhorn_knopp(
         in that precision is not something to do to a training target, and the
         cast is free next to the backbone forward that produced them.
     """
+    from src.utils.training.distributed import (
+        all_reduce_sum,
+        logsumexp_across_ranks,
+    )
+
+    distributed = context is not None and context.enabled
     log_assignments = (_at_least_float32(logits) / float(temperature)).t()  # [out_dim, batch]
-    num_prototypes, num_samples = log_assignments.shape
-    log_assignments = log_assignments - torch.logsumexp(log_assignments.reshape(-1), dim=0)
+    num_prototypes, local_samples = log_assignments.shape
+
+    if distributed:
+        # Counted rather than assumed to be `local * world_size`: the marginal
+        # this divides by is what makes the assignment doubly stochastic, and an
+        # uneven final batch would otherwise scale it wrongly on every rank.
+        counter = torch.tensor([float(local_samples)], device=log_assignments.device, dtype=torch.float64)
+        num_samples = int(all_reduce_sum(counter, context).item())
+        total = logsumexp_across_ranks(log_assignments.reshape(-1), context, dim=0)
+    else:
+        num_samples = local_samples
+        total = torch.logsumexp(log_assignments.reshape(-1), dim=0)
+
+    log_assignments = log_assignments - total
 
     for _ in range(max(int(iterations), 1)):
-        # Prototype marginals -> 1 / num_prototypes.
-        log_assignments = (
-            log_assignments
-            - torch.logsumexp(log_assignments, dim=1, keepdim=True)
-            - math.log(num_prototypes)
+        # Prototype marginals -> 1 / num_prototypes. Reduces along the batch
+        # axis, which is the sharded one.
+        prototype_marginal = (
+            logsumexp_across_ranks(log_assignments, context, dim=1, keepdim=True)
+            if distributed
+            else torch.logsumexp(log_assignments, dim=1, keepdim=True)
         )
-        # Sample marginals -> 1 / num_samples.
+        log_assignments = log_assignments - prototype_marginal - math.log(num_prototypes)
+        # Sample marginals -> 1 / num_samples. Reduces along the prototype axis,
+        # which every rank holds in full, so this stays local either way.
         log_assignments = (
             log_assignments
             - torch.logsumexp(log_assignments, dim=0, keepdim=True)
@@ -209,6 +256,30 @@ class CustomDINOLoss(nn.Module):
             docstring.
         sinkhorn_iterations: Iterations for the Sinkhorn variant.
         lambda_koleo: Weight on the KoLeo regulariser. ``0`` disables it.
+        context: This rank's place in a distributed job, or ``None`` for a
+            single process. Used for two things and no others:
+
+            * ``centering="ema"`` -- the centre is a **shared** running buffer
+              that the teacher's targets subtract, so :meth:`update_center`
+              all-reduces unconditionally. Per-rank centres would leave the
+              ranks training against different targets, and the checkpoint's
+              contents would depend on which rank wrote it.
+            * ``distributed_sinkhorn`` -- see below.
+        distributed_sinkhorn: Normalise the Sinkhorn assignment over the batch
+            concatenated across ranks rather than over each rank's own shard.
+
+            Default ``False``, which is the setting that **preserves the
+            single-GPU numbers**: Sinkhorn is already applied per micro-batch
+            under gradient accumulation, so a per-rank shard of the same size is
+            the same function of the same amount of data. Turning it on makes
+            the assignment doubly stochastic over the whole global step batch --
+            defensible, arguably better, and a different objective, which is why
+            it is opt-in rather than implied by launching on two GPUs.
+
+            KoLeo is deliberately **not** given the same switch. It is a
+            nearest-neighbour statistic over the local view block, applied
+            per-rank in the reference DINOv2 implementation for the same reason:
+            per-rank matches what a single GPU computes per micro-batch.
     """
 
     def __init__(
@@ -225,6 +296,8 @@ class CustomDINOLoss(nn.Module):
         centering: str = "sinkhorn",
         sinkhorn_iterations: int = 3,
         lambda_koleo: float = 0.1,
+        context: "DistributedContext | None" = None,
+        distributed_sinkhorn: bool = False,
     ):
         super().__init__()
         if num_crops < 2:
@@ -242,6 +315,12 @@ class CustomDINOLoss(nn.Module):
         self.sinkhorn_iterations = int(sinkhorn_iterations)
         self.lambda_koleo = float(lambda_koleo)
         self.register_buffer("center", torch.zeros(1, out_dim))
+
+        #: Plain attributes, not buffers: the process group is not model state
+        #: and must never reach a checkpoint, where it would pin a run to the
+        #: topology that produced it.
+        self.context = context
+        self.distributed_sinkhorn = bool(distributed_sinkhorn)
 
         #: Device-resident diagnostics from the most recent :meth:`forward`.
         #: Read through :attr:`last_metrics`, which is what actually pays the
@@ -362,6 +441,7 @@ class CustomDINOLoss(nn.Module):
                 teacher_output,
                 temperature=teacher_temp,
                 iterations=self.sinkhorn_iterations,
+                context=self.context if self.distributed_sinkhorn else None,
             )
         center = self.center.to(device=teacher_output.device, dtype=teacher_output.dtype)
         return F.softmax((teacher_output - center) / teacher_temp, dim=-1)
@@ -469,8 +549,20 @@ class CustomDINOLoss(nn.Module):
 
     @torch.no_grad()
     def update_center(self, teacher_output: torch.Tensor) -> None:
-        """Eq. 3: EMA update of the centering vector (``centering="ema"`` only)."""
+        """Eq. 3: EMA update of the centering vector (``centering="ema"`` only).
+
+        The batch mean is all-reduced before it enters the EMA, so the buffer is
+        one statistic over the global batch rather than ``world_size`` statistics
+        drifting apart. Unlike the Sinkhorn choice this is not configurable:
+        ``center`` is *state* the teacher's targets read and the checkpoint
+        stores, so ranks disagreeing about it means ranks optimising different
+        objectives, and a checkpoint whose contents depend on which rank wrote it.
+        """
+        from src.utils.training.distributed import all_reduce_mean
+
         batch_center = torch.mean(teacher_output, dim=0, keepdim=True)
+        if self.context is not None and self.context.enabled:
+            batch_center = all_reduce_mean(batch_center.contiguous(), self.context)
         self.center = (
             self.center.to(batch_center.device) * self.center_momentum
             + batch_center * (1.0 - self.center_momentum)

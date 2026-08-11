@@ -28,20 +28,35 @@ from omegaconf import DictConfig, OmegaConf
 
 
 class ExperimentTracker:
-    """Fan-out logger for scalars, histograms, figures, tables and artifacts."""
+    """Fan-out logger for scalars, histograms, figures, tables and artifacts.
 
-    def __init__(self, cfg: DictConfig, logger: logging.Logger):
+    Args:
+        enabled: ``False`` turns every method into a no-op and opens no files or
+            backends. Pass ``context.is_main`` under DDP: the ranks hold
+            identical parameters and compute identical metrics, so a second
+            writer produces a W&B run per GPU, interleaved TensorBoard events
+            for the same steps, and two processes appending to one
+            ``events.jsonl``. The non-main ranks still get their Python logger,
+            so a crash on rank 1 is still visible.
+    """
+
+    def __init__(self, cfg: DictConfig, logger: logging.Logger, enabled: bool = True):
         self.cfg = cfg
         self.logger = logger
+        self.enabled = bool(enabled)
         self.output_dir = Path(OmegaConf.select(cfg, "tracking.output_dir", default="outputs/run"))
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.figure_dir = self.output_dir / "figures"
         self.events_path = self.output_dir / "events.jsonl"
-        self._events_file = self.events_path.open("a", encoding="utf-8")
+        self._events_file = None
         self.writer = None
         self.wandb = None
         self.wandb_run = None
 
+        if not self.enabled:
+            return
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._events_file = self.events_path.open("a", encoding="utf-8")
         self._init_tensorboard()
         self._init_wandb()
 
@@ -109,7 +124,7 @@ class ExperimentTracker:
         if self.wandb_run is not None:
             self.wandb.finish()
             self.wandb_run = None
-        if not self._events_file.closed:
+        if self._events_file is not None and not self._events_file.closed:
             self._events_file.close()
 
     def __enter__(self) -> "ExperimentTracker":
@@ -122,6 +137,8 @@ class ExperimentTracker:
 
     def log_event(self, event_type: str, payload: dict[str, Any]) -> None:
         """Append a structured record to ``events.jsonl``."""
+        if not self.enabled or self._events_file is None:
+            return
         event = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": event_type,
@@ -149,6 +166,8 @@ class ExperimentTracker:
 
     def log_hyperparameters(self, params: Mapping[str, Any], metrics: Mapping[str, float]) -> None:
         """Record the hyperparameter/metric pairing TensorBoard's HParams tab uses."""
+        if not self.enabled:
+            return
         self.log_event("hyperparameters", {"params": dict(params), "metrics": dict(metrics)})
         if self.writer is None:
             return
@@ -166,7 +185,7 @@ class ExperimentTracker:
 
     def log_model_watch(self, model: torch.nn.Module) -> None:
         """Ask W&B to track parameter and gradient distributions."""
-        if self.wandb_run is None:
+        if not self.enabled or self.wandb_run is None:
             return
         try:
             self.wandb.watch(
@@ -178,6 +197,8 @@ class ExperimentTracker:
             self.logger.warning("Unable to watch model with W&B: %s", exc)
 
     def log_parameter_histograms(self, model: torch.nn.Module, step: int, prefix: str = "parameters") -> None:
+        if not self.enabled:
+            return
         if not OmegaConf.select(self.cfg, "tracking.artifacts.log_parameter_histograms", default=False):
             return
         for name, parameter in model.named_parameters():
@@ -186,6 +207,8 @@ class ExperimentTracker:
             self.log_histogram(f"{prefix}/{self._clean_name(name)}", parameter.detach(), step)
 
     def log_gradient_histograms(self, model: torch.nn.Module, step: int, prefix: str = "gradients") -> None:
+        if not self.enabled:
+            return
         if not OmegaConf.select(self.cfg, "tracking.artifacts.log_gradient_histograms", default=False):
             return
         for name, parameter in model.named_parameters():
@@ -194,7 +217,15 @@ class ExperimentTracker:
             self.log_histogram(f"{prefix}/{self._clean_name(name)}", parameter.grad.detach(), step)
 
     def log_gradient_norms(self, model: torch.nn.Module, step: int, prefix: str = "grad_norm") -> float:
-        """Log the per-parameter and total L2 gradient norms; return the total."""
+        """Log the per-parameter and total L2 gradient norms; return the total.
+
+        Costs one host synchronisation **per parameter tensor**, so the rank
+        guard here is a throughput decision as much as a tidiness one: without
+        it every rank of a DDP job would stall ~440 times per logged step to
+        produce numbers only rank 0 would write.
+        """
+        if not self.enabled:
+            return 0.0
         total_sq = 0.0
         norms: dict[str, float] = {}
         for name, parameter in model.named_parameters():
@@ -212,6 +243,8 @@ class ExperimentTracker:
 
     def log_histogram(self, tag: str, values: Any, step: int) -> None:
         """Log a distribution to whichever sinks accept histograms."""
+        if not self.enabled:
+            return
         tensor = values.detach().float().cpu() if isinstance(values, torch.Tensor) else torch.as_tensor(values).float()
         if tensor.numel() == 0:
             return
@@ -221,6 +254,8 @@ class ExperimentTracker:
             self.wandb.log({tag: self.wandb.Histogram(tensor.numpy())}, step=step)
 
     def log_images(self, tag: str, images: torch.Tensor, step: int) -> None:
+        if not self.enabled:
+            return
         images = images.detach().cpu()
         if self.writer is not None:
             self.writer.add_images(tag, images, step)
@@ -233,6 +268,8 @@ class ExperimentTracker:
         Returns the saved path, or ``None`` when ``save`` is off. The figure is
         always closed afterwards so long runs do not leak canvases.
         """
+        if not self.enabled:
+            return None
         import matplotlib.pyplot as plt
 
         saved_path: str | None = None
@@ -254,6 +291,8 @@ class ExperimentTracker:
 
     def log_table(self, tag: str, columns: Sequence[str], rows: Sequence[Sequence[Any]], step: int) -> None:
         """Log a tabular artifact (per-class metrics, alignment breakdowns)."""
+        if not self.enabled:
+            return
         payload = [dict(zip(columns, row)) for row in rows]
         self.log_event("table", {"tag": tag, "step": step, "rows": payload})
         if self.wandb_run is not None:
@@ -270,6 +309,8 @@ class ExperimentTracker:
         metadata: Sequence[str] | None = None,
     ) -> None:
         """Log an embedding set to TensorBoard's projector and a W&B table."""
+        if not self.enabled:
+            return
         if not OmegaConf.select(self.cfg, "tracking.artifacts.log_embeddings", default=False):
             return
         max_samples = int(OmegaConf.select(self.cfg, "tracking.artifacts.max_embedding_samples", default=256))
@@ -292,7 +333,7 @@ class ExperimentTracker:
 
     def log_artifact(self, path: str | Path, name: str, artifact_type: str = "model") -> None:
         """Upload a file to W&B as a versioned artifact when enabled."""
-        if self.wandb_run is None or not OmegaConf.select(
+        if not self.enabled or self.wandb_run is None or not OmegaConf.select(
             self.cfg, "tracking.wandb.log_model", default=False
         ):
             return

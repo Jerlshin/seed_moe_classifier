@@ -37,6 +37,23 @@ student_temp: 0.1
 centering: "sinkhorn"
 sinkhorn_iterations: 3
 
+# Multi-GPU only. false (default) normalises the assignment over each rank's own
+# micro-batch, which is what REPRODUCES the single-GPU numbers: Sinkhorn is
+# already applied per micro-batch under gradient accumulation, so a rank holding
+# the same 16 images computes the identical function.
+#
+# true makes the assignment doubly stochastic over the batch concatenated across
+# ranks -- exact (the log-space marginals are reduced across ranks, and
+# tests/test_distributed.py pins it against the single-process result on the
+# concatenated batch) and arguably better, but it is a DIFFERENT objective from
+# the one a single-GPU run optimises, which is why launching on two GPUs does
+# not turn it on by itself.
+#
+# KoLeo has no equivalent switch on purpose: it is a nearest-neighbour statistic
+# over the local view block, applied per-rank in the reference DINOv2
+# implementation for the same reason.
+distributed_sinkhorn: false
+
 # Only consulted by centering: "ema". Raised from 0.9 (a ~10-step window) to a
 # ~100-step one, which is the least that makes the estimate meaningful.
 center_momentum: 0.99

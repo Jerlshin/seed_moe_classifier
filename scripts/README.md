@@ -3,23 +3,70 @@
 | File | Purpose |
 | --- | --- |
 | `dry_run.py` | End-to-end pipeline smoke test on synthetic tensors |
-| `bench_pretrain_step.py` | A/B micro-benchmark of the stage-1 training step (sdpa / compile / batch geometry), no dataset |
+| `launch.py` | Cross-platform launcher: 1 process, or N ranks under `torch.distributed.run` |
+| `verify_runtime.py` | Does *this* machine still make the fast paths exact? Capabilities, parity, AMP, DDP |
+| `bench_pretrain_step.py` | A/B micro-benchmark of the stage-1 training step (sdpa / compile / batch geometry / rank count), no dataset |
 | `diagnose_sdpa_parity.py` | Per-module SwinV2→SDPA parity report (errors at fp32/TF32/fp64, gradients, shapes, guard verdicts) |
-| `run_ablations.py` | The six component-wise ablation variants |
+| `run_ablations.py` | The six component-wise ablation variants, optionally one per GPU |
 | `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |
 | `extract_features.py` | Dump frozen-backbone embeddings to an `.npz` |
-| `train_distributed.sh` | Launch any stage or suite with vast.ai environment defaults |
+| `train_distributed.sh` | Launch any stage or suite with server environment defaults, single- or multi-GPU |
 
 The intended order for a full experimental campaign:
 
 ```bash
-python scripts/dry_run.py          # verify the pipeline runs at all
-python main.py pretrain            # produce the shared encoder, once
-python scripts/run_ablations.py    # 18 variants x 5 seeds
-python scripts/run_baselines.py    # five baselines
-python scripts/generate_plots.py   # collect everything into outputs/reports/
+python scripts/dry_run.py             # verify the pipeline runs at all
+python scripts/verify_runtime.py      # verify the fast paths are exact HERE
+python scripts/bench_pretrain_step.py --scaling 1,2   # pick the launch geometry
+python main.py pretrain --gpus 2      # produce the shared encoder, once
+python scripts/run_ablations.py --gpus 0,1   # 18 variants x 5 seeds
+python scripts/run_baselines.py --gpus 0,1   # five baselines
+python scripts/generate_plots.py      # collect everything into outputs/reports/
 ```
+
+## `launch.py`
+
+```bash
+python scripts/launch.py pretrain --gpus 2 experiment.training.resume=auto
+```
+
+What it adds over calling `torchrun` yourself:
+
+* **one output directory for the whole job** — Hydra resolves `${now:...}` inside
+  each process, so two ranks starting in the same second can land in different
+  run directories; this pins `$SEED_RUN_ID` before the processes exist;
+* **no process group when there is nothing to distribute** — `--gpus 1` runs the
+  module directly, because a one-member group buys nothing and adds a failure
+  mode (a stale `MASTER_PORT`);
+* **an `OMP_NUM_THREADS` budget split across ranks**, so N ranks do not each
+  claim one thread per core;
+* **it works on Windows** — `torch.distributed.run` is invoked as a module rather
+  than relying on a `torchrun` console script being on `PATH`.
+
+## `verify_runtime.py`
+
+Answers the question the test suite cannot answer from a laptop: *does this
+hardware, this driver and this torch build still make the optimisations exact?*
+
+```bash
+python scripts/verify_runtime.py --gpus 2
+```
+
+1. **Capabilities** — compute capability, bf16, TF32, SDPA backends, Triton.
+2. **The portable contracts**, via pytest: SDPA parity at fp64/bf16/fp16, AMP
+   dtype selection and fp32 pinning, DDP gradient equality over Gloo, exact
+   resume.
+3. **SDPA parity on the real trunk**, per module, in fp64 on a copy — the same
+   probe the trainer runs at conversion time, printed rather than silently acted
+   on. A drifted timm shows up here.
+4. **DDP gradient equality over the real backend** (NCCL), which the Gloo tests
+   cannot cover — a bad interconnect or mismatched NCCL build produces a *wrong
+   reduction* rather than an error.
+
+A failure in 3 or 4 does not mean the run will be wrong — both paths refuse or
+fall back rather than proceeding — but it does mean the run will be slow, and
+knowing that before committing 300 epochs is the point.
 
 ## `dry_run.py`
 
@@ -167,21 +214,61 @@ run's `test_predictions.npz`.
 Defaults for `--data-root`, `--checkpoint` and `--output` come from
 `SEED_DATA_ROOT`, `SEED_PRETRAIN_BACKBONE` and `SEED_OUTPUT_DIR`.
 
+## `bench_pretrain_step.py`
+
+Reproduces one micro-batch of the stage-1 loop on synthetic data — the same
+pinned `uint8` view-major layout, `ViewBatcher`, fused teacher and student
+forwards, DINO loss with Sinkhorn and KoLeo, backward, and on accumulation
+boundaries the clip, fused AdamW and foreach EMA. Under `torchrun` it also
+reproduces the DDP wrapper and the `no_sync` pattern, so the measured gradient
+traffic is the traffic a real run pays.
+
+Reports milliseconds per micro-batch, images/s and views/s (**job-wide**, so the
+DDP number is directly comparable to the single-GPU one), peak VRAM per rank, and
+mean/peak SM utilisation where NVML is available.
+
+```bash
+python scripts/bench_pretrain_step.py                    # the configured geometry
+python scripts/bench_pretrain_step.py --no-sdpa          # what the rewrite buys
+python scripts/bench_pretrain_step.py --batch-size 64 --accum 1
+python scripts/bench_pretrain_step.py --scaling 1,2      # single-GPU vs DDP table
+```
+
+`--scaling` re-invokes the script at each rank count in a **fresh process
+group** — a cached allocator, a warmed autotuner and an already-negotiated NCCL
+communicator would all leak from one measurement into the next — and prints the
+comparison with a speedup column.
+
+Note what `--scaling` holds fixed: the *per-rank* micro-batch, so the effective
+batch grows with the rank count. That is what a scaling measurement means, and it
+is **not** what a real run should do — there, set
+`experiment.training.effective_batch_size` and let the accumulation be derived.
+
 ## `train_distributed.sh`
 
-Sets the vast.ai path defaults, creates the output directory, exports
-`SEED_PRETRAIN_BACKBONE`, and dispatches to the right trainer or suite. Despite
-the name it is a single-process launcher; distributed training is not
-implemented.
+Sets the server path defaults, creates the output directory, exports
+`SEED_PRETRAIN_BACKBONE`, and dispatches to the right trainer or suite —
+single-process by default, multi-GPU when `GPUS` is set.
 
 ```bash
 scripts/train_distributed.sh pretrain
+GPUS=2 scripts/train_distributed.sh pretrain          # DDP over 2 GPUs
+GPUS=auto scripts/train_distributed.sh pretrain       # every visible GPU
 scripts/train_distributed.sh finetune data.batch_size=32
-scripts/train_distributed.sh ablations
-scripts/train_distributed.sh baselines
+GPUS=0,1 scripts/train_distributed.sh ablations       # one variant per GPU
+scripts/train_distributed.sh verify
 scripts/train_distributed.sh report
 ```
 
+`GPUS` means two different things, deliberately, because the two stages want
+different kinds of parallelism. For `pretrain` / `finetune` / `ablation` it is a
+**count** and the stage runs as one DDP job. For `ablations` / `baselines` it is
+a **device list** and the suite runs one variant per device concurrently — which
+is the better use of a second GPU for stage 2, since 18 variants × 5 seeds are
+already independent processes with no gradient traffic and each keeps the exact
+numerics of a single-GPU run.
+
 Exporting `SEED_PRETRAIN_BACKBONE` up front is what makes every stage resolve to
 the same encoder file without any manual path plumbing. Extra arguments pass
-through as Hydra overrides.
+through as Hydra overrides. On Windows, use `scripts/launch.py` directly — it is
+the same launcher and takes the same arguments.

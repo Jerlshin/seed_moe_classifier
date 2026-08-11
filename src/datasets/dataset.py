@@ -15,7 +15,7 @@ from typing import NamedTuple
 import numpy as np
 from PIL import Image
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torchvision.datasets import ImageFolder
 
 LOGGER = logging.getLogger(__name__)
@@ -462,6 +462,8 @@ def get_pretrain_dataloader(
     cache_limit_mb: float = 4096.0,
     generator: torch.Generator | None = None,
     logger: logging.Logger | None = None,
+    world_size: int = 1,
+    rank: int = 0,
 ):
     """Build the stage-1 multi-crop loader.
 
@@ -482,11 +484,23 @@ def get_pretrain_dataloader(
             :class:`PretrainImageFolderDataset`. Silently ignored when workers
             would not share it (see below).
         generator: Seeds the shuffling order.
+        world_size / rank: Shard the dataset with a ``DistributedSampler`` when
+            ``world_size > 1``. **Images** are sharded, never views: every view
+            of one image is built by the rank that owns it, because the loss
+            pairs a student view against the teacher's output for the same
+            image.
 
     The cache is disabled automatically when ``num_workers > 0`` and the start
     method is not ``fork``: under ``spawn`` (macOS default, Windows always) the
     dataset is pickled into each worker, so a "shared" cache becomes one full
     copy per worker plus the pickling time, which is worse than decoding.
+
+    Under DDP the sampler is returned as ``loader.sampler`` and the trainer
+    **must** call ``set_epoch`` on it once per epoch. A ``DistributedSampler``
+    derives its permutation from ``seed + epoch``, so skipping that call gives
+    every epoch the identical sample order -- which does not error, does not
+    change the loss magnitude, and quietly turns a 300-epoch run into one epoch
+    repeated 300 times.
     """
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Dataset path not found: {data_dir}")
@@ -522,10 +536,32 @@ def get_pretrain_dataloader(
         loader_kwargs["persistent_workers"] = bool(persistent_workers)
         loader_kwargs["prefetch_factor"] = max(int(prefetch_factor), 1)
 
+    sampler = None
+    if int(world_size) > 1:
+        seed = int(generator.initial_seed() % (2**31)) if generator is not None else 0
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=int(world_size),
+            rank=int(rank),
+            shuffle=True,
+            seed=seed,
+            # Equal batch counts on every rank. An uneven tail is not a rounding
+            # error under DDP: the rank with the extra batch enters an all-reduce
+            # its peers have already left, and the job hangs at the collective
+            # timeout rather than failing.
+            drop_last=True,
+        )
+        log.info(
+            "Distributed sampler | %s images sharded over %s ranks -> %s per rank, "
+            "%s batches of %s.",
+            len(dataset), world_size, len(sampler), len(sampler) // max(batch_size, 1), batch_size,
+        )
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         drop_last=drop_last,
         num_workers=num_workers,
         pin_memory=pin_memory,

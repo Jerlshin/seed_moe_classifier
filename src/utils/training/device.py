@@ -54,6 +54,163 @@ def select_device(requested: str = "auto") -> torch.device:
     return torch.device("cpu")
 
 
+# ------------------------------------------------------------ capability probing
+
+
+#: Compute capability at which each hardware feature this repository depends on
+#: first appears. Named rather than inlined because the *reason* a T4 takes a
+#: different path is one of these numbers, and a bare ``>= 8`` in three places is
+#: how the three drift apart.
+SM_BF16 = (8, 0)          # Ampere: hardware bfloat16, hence no GradScaler
+SM_TF32 = (8, 0)          # Ampere: TF32 tensor cores for fp32 matmuls
+SM_FLASH_SDPA = (8, 0)    # PyTorch's FlashAttention backend; Turing gets mem-efficient
+SM_TRITON = (7, 0)        # Volta and later, which is inductor's floor
+
+
+@dataclass(frozen=True)
+class AcceleratorReport:
+    """What this machine can actually do, resolved once and logged.
+
+    Every downstream decision -- which autocast dtype, whether a ``GradScaler``
+    is needed, whether ``torch.compile`` can run, which SDPA backend the window
+    attention will land on -- follows from these fields, so they are gathered in
+    one place and recorded in ``summary.json``. A run whose numbers look wrong is
+    then diagnosable from its own artifacts rather than by re-probing the machine
+    it ran on.
+
+    The T4 case is the one worth naming: ``sm_75`` has no bf16, no TF32 and no
+    FlashAttention backend, so the same ``amp: auto`` config that yields bf16 on
+    an A100 yields fp16 plus loss scaling here, and SDPA lands on the
+    memory-efficient kernel rather than flash. All three are automatic; this
+    report is how a reader confirms which one happened.
+    """
+
+    device_type: str
+    device_count: int = 0
+    name: str = ""
+    capability: tuple[int, int] | None = None
+    total_memory_gb: float = 0.0
+    supports_bf16: bool = False
+    supports_tf32: bool = False
+    supports_flash_sdpa: bool = False
+    supports_mem_efficient_sdpa: bool = False
+    compile_available: bool = False
+    compile_reason: str = ""
+    torch_version: str = ""
+    platform: str = ""
+
+    @property
+    def capability_str(self) -> str:
+        return f"{self.capability[0]}.{self.capability[1]}" if self.capability else "n/a"
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = {
+            "device_type": self.device_type,
+            "device_count": self.device_count,
+            "name": self.name,
+            "compute_capability": self.capability_str,
+            "total_memory_gb": round(self.total_memory_gb, 2),
+            "supports_bf16": self.supports_bf16,
+            "supports_tf32": self.supports_tf32,
+            "supports_flash_sdpa": self.supports_flash_sdpa,
+            "supports_mem_efficient_sdpa": self.supports_mem_efficient_sdpa,
+            "compile_available": self.compile_available,
+            "torch_version": self.torch_version,
+            "platform": self.platform,
+        }
+        if self.compile_reason:
+            payload["compile_reason"] = self.compile_reason
+        return payload
+
+    def summary_line(self) -> str:
+        if self.device_type != "cuda":
+            return (
+                f"{self.device_type} | torch {self.torch_version} | "
+                f"compile={'yes' if self.compile_available else 'no'}"
+            )
+        return (
+            f"{self.device_count}x {self.name} (sm_{self.capability_str.replace('.', '')}, "
+            f"{self.total_memory_gb:.1f} GB) | bf16={'yes' if self.supports_bf16 else 'no'} "
+            f"tf32={'yes' if self.supports_tf32 else 'no'} "
+            f"flash_sdpa={'yes' if self.supports_flash_sdpa else 'no'} "
+            f"compile={'yes' if self.compile_available else 'no'}"
+        )
+
+
+def compile_available() -> tuple[bool, str]:
+    """Whether ``torch.compile`` can produce a compiled kernel here, and why not.
+
+    Three independent things have to hold, and each fails on a platform this
+    repository is asked to run on:
+
+    * ``torch.compile`` exists (torch >= 2.0);
+    * inductor's GPU backend needs **Triton**, which ships with the Linux CUDA
+      wheels and does not ship with the Windows or macOS ones;
+    * the GPU must be Volta or later. A T4 (``sm_75``) qualifies; anything
+      older does not.
+
+    Returning the reason rather than a bare boolean matters because the
+    interesting case is a run that quietly stayed eager: the reason is logged and
+    written into ``summary.json``, so "why is Windows slower" has an answer in
+    the run's own artifacts.
+    """
+    if not hasattr(torch, "compile"):
+        return False, f"torch {torch.__version__} has no torch.compile"
+
+    if torch.cuda.is_available():
+        capability = torch.cuda.get_device_capability()
+        if capability < SM_TRITON:
+            return False, f"compute capability {capability[0]}.{capability[1]} is below Triton's floor 7.0"
+        try:
+            import triton  # noqa: F401
+        except Exception as exc:
+            return False, f"Triton is unavailable ({type(exc).__name__}); inductor cannot emit GPU kernels"
+        return True, ""
+
+    # CPU inductor compiles through the C++ backend and needs a working
+    # compiler. It is legal but rarely worth it, so it is reported as available
+    # and left to the caller's config.
+    return True, "CPU inductor backend"
+
+
+def describe_accelerator(device: torch.device | None = None) -> AcceleratorReport:
+    """Probe the machine once and return everything the run's decisions need."""
+    compile_ok, compile_reason = compile_available()
+    base = {
+        "compile_available": compile_ok,
+        "compile_reason": compile_reason,
+        "torch_version": torch.__version__,
+        "platform": platform.platform(),
+    }
+
+    if device is not None and device.type != "cuda":
+        return AcceleratorReport(device_type=device.type, **base)
+    if not torch.cuda.is_available():
+        return AcceleratorReport(
+            device_type=device.type if device is not None else "cpu", **base
+        )
+
+    index = device.index if device is not None and device.index is not None else torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability(index)
+    properties = torch.cuda.get_device_properties(index)
+    return AcceleratorReport(
+        device_type="cuda",
+        device_count=torch.cuda.device_count(),
+        name=torch.cuda.get_device_name(index),
+        capability=capability,
+        total_memory_gb=properties.total_memory / 1024**3,
+        supports_bf16=supports_bf16(),
+        supports_tf32=capability >= SM_TF32,
+        supports_flash_sdpa=capability >= SM_FLASH_SDPA,
+        # The memory-efficient kernel covers everything back to Maxwell, which is
+        # what keeps the SDPA rewrite worth doing on a T4: the N^2 attention
+        # matrices stop being materialised there too, just through a different
+        # kernel than an A100 would pick.
+        supports_mem_efficient_sdpa=capability >= (5, 0),
+        **base,
+    )
+
+
 # --------------------------------------------------------------- backend tuning
 
 
@@ -177,7 +334,11 @@ def configure_backend(
         applied["compute_capability"] = f"{capability[0]}.{capability[1]}"
         applied["bf16_supported"] = supports_bf16()
 
+    report = describe_accelerator(device)
+    applied["accelerator"] = report.as_dict()
+
     if logger is not None:
+        logger.info("Accelerator | %s", report.summary_line())
         logger.info(
             "Backend | tf32=%s cudnn.benchmark=%s deterministic=%s matmul=%s "
             "expandable_segments=%s",
@@ -187,6 +348,13 @@ def configure_backend(
             applied.get("float32_matmul_precision"),
             applied.get("expandable_segments"),
         )
+        if device.type == "cuda" and not report.supports_flash_sdpa:
+            logger.info(
+                "No FlashAttention SDPA backend on %s (needs sm_80+); the converted window "
+                "attention will use the memory-efficient kernel, which still avoids "
+                "materialising the [B*nW, heads, N, N] matrices.",
+                report.name or "this GPU",
+            )
     return applied
 
 
@@ -227,7 +395,7 @@ class AmpConfig:
         return "bf16" if self.dtype is torch.bfloat16 else "fp16"
 
 
-def resolve_amp(device: torch.device, requested: Any = "auto") -> AmpConfig:
+def resolve_amp(device: torch.device, requested: Any = "auto", logger=None) -> AmpConfig:
     """Decide the autocast dtype for ``device``.
 
     Args:
@@ -238,6 +406,15 @@ def resolve_amp(device: torch.device, requested: Any = "auto") -> AmpConfig:
     ``"auto"`` gives bf16 on Ampere and later, fp16 with a ``GradScaler``
     elsewhere on CUDA, and off on CPU/MPS -- autocast on MPS exists but silently
     changes numerics on a path nothing in this repository has validated.
+
+    An explicit ``bf16`` on hardware without it (a T4, ``sm_75``) is **downgraded
+    to fp16 with a scaler**, not honoured. Emulated bf16 there is neither fast
+    nor accurate, and the alternative -- refusing to start -- would mean a config
+    that runs on the development box cannot run on Kaggle at all. The downgrade
+    is logged, and it is safe here for a reason specific to this objective: the
+    three pieces fp16 genuinely cannot hold (the Sinkhorn log-space normaliser,
+    the 8,192-way prototype log-softmax, the KoLeo pairwise distances) are pinned
+    to fp32 *inside* the autocast region by ``src/losses/dino.py``.
     """
     if isinstance(requested, bool):
         requested = "auto" if requested else "off"
@@ -248,6 +425,16 @@ def resolve_amp(device: torch.device, requested: Any = "auto") -> AmpConfig:
 
     if mode in {"bf16", "bfloat16"}:
         dtype = torch.bfloat16
+        if not supports_bf16():
+            dtype = torch.float16
+            if logger is not None:
+                capability = torch.cuda.get_device_capability()
+                logger.warning(
+                    "amp=bf16 requested but %s (sm_%s%s) has no hardware bfloat16; using fp16 "
+                    "with a GradScaler instead. The loss terms that fp16 cannot hold are "
+                    "pinned to fp32 inside the autocast region.",
+                    torch.cuda.get_device_name(), capability[0], capability[1],
+                )
     elif mode in {"fp16", "float16", "half"}:
         dtype = torch.float16
     elif mode in {"auto", "true", "yes", "on"}:
@@ -261,6 +448,43 @@ def resolve_amp(device: torch.device, requested: Any = "auto") -> AmpConfig:
         device_type="cuda",
         needs_scaler=dtype is torch.float16,
     )
+
+
+def resolve_compile(requested: Any, device: torch.device, logger=None) -> bool:
+    """Decide whether to compile, honouring ``"auto"`` and the platform's limits.
+
+    ``"auto"`` compiles wherever :func:`compile_available` says a kernel can
+    actually be produced, and stays eager otherwise -- which is what lets one
+    config file run unchanged on a Linux CUDA box, on Kaggle's T4s, on Windows
+    (no Triton) and on CPU. An explicit ``true`` on a machine that cannot compile
+    is downgraded with a warning rather than left to fail inside the first step,
+    where the traceback names inductor rather than the config.
+    """
+    if isinstance(requested, str):
+        mode = requested.strip().lower()
+        if mode in {"auto", ""}:
+            available, reason = compile_available()
+            enabled = available and device.type == "cuda"
+            if logger is not None:
+                if enabled:
+                    logger.info("compile=auto -> enabled.")
+                else:
+                    logger.info(
+                        "compile=auto -> disabled (%s).",
+                        reason or f"device is {device.type}, not cuda",
+                    )
+            return enabled
+        requested = mode not in {"false", "no", "off", "0"}
+
+    if not bool(requested):
+        return False
+
+    available, reason = compile_available()
+    if not available:
+        if logger is not None:
+            logger.warning("torch.compile was requested but is unavailable: %s. Staying eager.", reason)
+        return False
+    return True
 
 
 def autocast_context(amp: AmpConfig):
@@ -354,3 +578,95 @@ def collect_device_stats(device: torch.device) -> dict[str, Any]:
         )
 
     return stats
+
+
+def _nvml():
+    """The NVML binding, under either of its two package names, or ``None``.
+
+    ``pynvml`` was renamed ``nvidia-ml-py``; both install a module named
+    ``pynvml``, but recent NVIDIA wheels also expose ``pynvml`` as a deprecation
+    shim that warns on import. Both are optional extras here -- a machine without
+    either loses the utilisation number and nothing else.
+    """
+    try:
+        import pynvml
+
+        return pynvml
+    except Exception:  # pragma: no cover - depends on the extras installed
+        return None
+
+
+class GpuUtilizationSampler:
+    """Background sampler for SM and memory utilisation over a timed region.
+
+    Peak memory and throughput answer "did it fit" and "how fast"; neither
+    answers "was the GPU busy". A step that is 60 % utilised is not compute
+    bound, and the fix for it is in the dataloader or the launch overhead rather
+    than in the model -- which is precisely the distinction
+    ``data_wait_fraction`` is trying to make, from the other side.
+
+    Sampling runs on a daemon thread at a fixed interval and never touches the
+    CUDA context, so it cannot perturb what it measures (NVML reads the driver,
+    not the process). Degrades to empty results without NVML rather than failing.
+    """
+
+    def __init__(self, device_index: int = 0, interval_seconds: float = 0.05):
+        self.device_index = int(device_index)
+        self.interval = float(interval_seconds)
+        self.gpu_samples: list[float] = []
+        self.memory_samples: list[float] = []
+        self._thread = None
+        self._stop = None
+        self._nvml = _nvml()
+
+    @property
+    def available(self) -> bool:
+        return self._nvml is not None and torch.cuda.is_available()
+
+    def __enter__(self) -> "GpuUtilizationSampler":
+        if not self.available:
+            return self
+        import threading
+
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self._thread = None
+
+    def _run(self) -> None:  # pragma: no cover - timing dependent
+        import time as _time
+
+        try:
+            self._nvml.nvmlInit()
+            handle = self._nvml.nvmlDeviceGetHandleByIndex(self.device_index)
+        except Exception:
+            return
+        while not self._stop.is_set():
+            try:
+                rates = self._nvml.nvmlDeviceGetUtilizationRates(handle)
+                self.gpu_samples.append(float(rates.gpu))
+                self.memory_samples.append(float(rates.memory))
+            except Exception:
+                break
+            _time.sleep(self.interval)
+
+    def summary(self) -> dict[str, float | None]:
+        """Mean and peak utilisation over the sampled region."""
+        if not self.gpu_samples:
+            return {"gpu_utilization_mean": None, "gpu_utilization_peak": None,
+                    "memory_bandwidth_utilization_mean": None, "samples": 0}
+        return {
+            "gpu_utilization_mean": sum(self.gpu_samples) / len(self.gpu_samples),
+            "gpu_utilization_peak": max(self.gpu_samples),
+            "memory_bandwidth_utilization_mean": (
+                sum(self.memory_samples) / len(self.memory_samples) if self.memory_samples else None
+            ),
+            "samples": len(self.gpu_samples),
+        }

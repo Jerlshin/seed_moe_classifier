@@ -51,6 +51,8 @@ python main.py pretrain      # stage 1: DINO self-supervised pretraining
 python main.py finetune      # stage 2: hierarchical MoE finetuning
 python main.py ablation      # flat-classifier ablation
 python main.py smoke         # 2-batch dry run of both stages
+
+python main.py pretrain --gpus 2    # the same, as a 2-rank DDP job
 ```
 
 Anything after the stage name is forwarded as a Hydra override:
@@ -66,10 +68,21 @@ python main.py finetune model.backbone.freeze=false        # fine-tune end to en
 
 ```bash
 python scripts/dry_run.py         # synthetic end-to-end smoke test, no dataset needed
+python scripts/verify_runtime.py  # are the fast paths exact on THIS machine?
 python main.py pretrain           # produces the shared encoder, run once
 python scripts/run_ablations.py   # six component-wise variants
 python scripts/run_baselines.py   # linear probe, SwinV2-supervised, ResNet-50, Swin-T, hierarchical CCE
 python scripts/generate_plots.py  # figures + outputs/reports/summary_metrics.csv
+```
+
+With more than one GPU, prefer sharding the *suite* over the devices rather than
+running one variant across them: 18 variants x 5 seeds are already independent
+processes, so there is no gradient traffic and each variant keeps the exact
+numerics of a single-GPU run.
+
+```bash
+python scripts/run_ablations.py --gpus 0,1
+python scripts/run_baselines.py --gpus 0,1
 ```
 
 `run_ablations.py` and `run_baselines.py` launch one subprocess per variant, all
@@ -114,16 +127,27 @@ All paths resolve through `oc.env`, so these are the real knobs on a rented GPU 
 | `SEED_DATA_ROOT` | Dataset root | `data/Hierarchical_SeedData/Cropped_Samples` |
 | `SEED_OUTPUT_DIR` | Root for run dirs, checkpoints, metadata | `outputs` |
 | `SEED_PRETRAIN_BACKBONE` | Encoder every downstream run loads | `$SEED_OUTPUT_DIR/checkpoints/dinov2_swinv2_pretrained.pth` |
+| `SEED_RUN_ID` | Shared Hydra run-directory suffix; the launcher pins it so every rank agrees | timestamp |
 
-On vast.ai:
+On a rented server:
 
 ```bash
 export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
-scripts/train_distributed.sh pretrain
-scripts/train_distributed.sh ablations
-scripts/train_distributed.sh baselines
+GPUS=2   scripts/train_distributed.sh pretrain      # DDP over 2 GPUs
+GPUS=0,1 scripts/train_distributed.sh ablations     # one variant per GPU
+GPUS=0,1 scripts/train_distributed.sh baselines
 scripts/train_distributed.sh report
+```
+
+On a platform that ends the session before the run does (Kaggle, Colab, a
+preemptible instance), add the two flags that tell the run about the limit — the
+same command line then works for the first launch and every relaunch:
+
+```bash
+python main.py pretrain --gpus 2 \
+    experiment.training.resume=auto \
+    experiment.training.max_runtime_minutes=520
 ```
 
 ## Data layout
@@ -239,7 +263,7 @@ no teacher weights. Turning these on for a 300-epoch run is how the disk fills.
 ## Testing
 
 ```bash
-python -m pytest tests/ -q          # 341 tests, no network access, ~8s
+python -m pytest tests/ -q          # 419 tests, no network access, ~30s
 python scripts/dry_run.py           # real encoder, synthetic data, full pipeline
 ```
 

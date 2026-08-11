@@ -97,6 +97,36 @@ experiment:
     # Fraction over which router gating noise anneals to exactly zero.
     router_noise_fraction: 0.3
 
+    # -----------------------------------------------------------------------
+    # Multi-GPU. Read only under `torchrun`; a single process ignores all of it.
+    #
+    # Stage 2 trains a ~9 M-parameter head against a FROZEN encoder over ~7.5 k
+    # images, so DDP inside one run buys much less here than in stage 1 -- and
+    # the suites run 18 variants x 5 seeds as independent processes, which
+    # parallelises perfectly with no communication at all. Prefer:
+    #
+    #     python scripts/run_ablations.py --gpus 0,1     # one variant per GPU
+    #
+    # over torchrun on a single variant. DDP is implemented and correct here
+    # (training is sharded; evaluation runs on rank 0 against the same
+    # parameters, so every reported metric is the single-process one), but it is
+    # the second-best use of a second GPU for this stage.
+    # -----------------------------------------------------------------------
+    ddp:
+      timeout_minutes: 30
+
+    # `auto` continues from the newest valid resume checkpoint under save_path,
+    # `false` always starts fresh, an explicit path fails loudly if missing.
+    #
+    # Stage 2 resumes at EPOCH granularity -- fold, epoch, global step, optimizer
+    # moments, best-so-far, RNG -- where stage 1 resumes mid-epoch. That is a
+    # judgement about what an epoch costs: stage 1's is tens of minutes, stage
+    # 2's is one pass of a small head over 7.5 k images against a frozen trunk.
+    resume: false
+    resume_every_minutes: 30
+    # Stop cleanly with a checkpoint before a hard session limit. null disables.
+    max_runtime_minutes: null
+
     save_interval: 50
     keep_last_n_checkpoints: 1
     save_optimizer_state: false

@@ -467,15 +467,22 @@ def test_sdpa_conversion_is_immune_to_module_precision():
 
 
 @pytest.mark.parametrize("with_mask", [False, True])
-def test_sdpa_bf16_stays_inside_the_stock_paths_own_error_envelope(with_mask):
-    """In bf16 the rewrite must track the exact function as well as eager does.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sdpa_half_precision_stays_inside_the_stock_paths_own_error_envelope(dtype, with_mask):
+    """In half precision the rewrite must track the exact function as well as eager does.
 
-    Neither bf16 path can match an equality gate — bf16 reassociation alone is
-    ~1e-2 — so the honest contract is relative: measured against an fp64
-    reference of the same module, the SDPA path's error may not exceed twice
-    the stock path's (measured ratio is ~0.6-0.8: the fused softmax accumulates
-    in higher precision, so the rewrite is typically *closer* to the exact
-    function than eager bf16 is).
+    Neither half-precision path can match an equality gate — bf16
+    reassociation alone is ~1e-2 — so the honest contract is relative: measured
+    against an fp64 reference of the same module, the SDPA path's error may not
+    exceed twice the stock path's (measured ratio is ~0.6-0.8: the fused softmax
+    accumulates in higher precision, so the rewrite is typically *closer* to the
+    exact function than eager half precision is).
+
+    fp16 is covered as well as bf16 because fp16 is not a fallback on the
+    hardware this has to run on — it is the automatic choice on a T4, which has
+    no hardware bfloat16 at all. The cosine-attention rewrite folds a clamped
+    per-head logit scale (up to 100x) into the normalised q, and fp16's narrower
+    exponent is exactly where that would be expected to go wrong if anywhere.
     """
     from timm.models.swin_transformer_v2 import WindowAttention
 
@@ -486,18 +493,18 @@ def test_sdpa_bf16_stays_inside_the_stock_paths_own_error_envelope(with_mask):
     mask = torch.randn(2, n, n) if with_mask else None
 
     reference_module = copy.deepcopy(module).double()
-    stock_bf16 = copy.deepcopy(module).to(torch.bfloat16)
-    sdpa_bf16 = copy.deepcopy(stock_bf16)
-    assert convert_swinv2_attention_to_sdpa(sdpa_bf16) == 1
+    stock_half = copy.deepcopy(module).to(dtype)
+    sdpa_half = copy.deepcopy(stock_half)
+    assert convert_swinv2_attention_to_sdpa(sdpa_half) == 1
 
     with torch.no_grad():
         mask64 = mask.double() if mask is not None else None
-        mask16 = mask.to(torch.bfloat16) if mask is not None else None
+        mask_half = mask.to(dtype) if mask is not None else None
         reference = reference_module(x.double(), mask=mask64)
-        stock_error = (stock_bf16(x.to(torch.bfloat16), mask=mask16).double() - reference).abs().max()
-        sdpa_error = (sdpa_bf16(x.to(torch.bfloat16), mask=mask16).double() - reference).abs().max()
+        stock_error = (stock_half(x.to(dtype), mask=mask_half).double() - reference).abs().max()
+        sdpa_error = (sdpa_half(x.to(dtype), mask=mask_half).double() - reference).abs().max()
 
-    assert float(stock_error) < 0.1, "eager bf16 itself is broken; the comparison is meaningless"
+    assert float(stock_error) < 0.1, "eager half precision itself is broken; the comparison is meaningless"
     assert float(sdpa_error) <= 2.0 * float(stock_error) + 1e-3
 
 

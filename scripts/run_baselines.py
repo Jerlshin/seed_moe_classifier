@@ -61,6 +61,7 @@ from src.trainers.runner import (
     expand_seeds,
     output_root,
     print_summary,
+    parse_gpu_list,
     run_suite,
     write_suite_manifest,
 )
@@ -146,6 +147,17 @@ def parse_args() -> argparse.Namespace:
         help="Also sweep {1e-5, 3e-5, 1e-4} for resnet50 and swin_tiny, reporting each one's best. "
         "Removes the under-tuned-baseline objection.",
     )
+    parser.add_argument(
+        "--gpus",
+        default=None,
+        help=(
+            "Run variants concurrently, one per device: '0,1' or 'auto'. This is the "
+            "preferred way to use more than one GPU for stage 2 -- the runs are already "
+            "independent processes, so there is no gradient traffic and each variant keeps "
+            "the exact numerics of a single-GPU run. Default: one variant at a time on the "
+            "default device."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the commands without running them.")
     parser.add_argument("--stop-on-failure", action="store_true", help="Abort at the first failure.")
     parser.add_argument(
@@ -204,28 +216,28 @@ def main() -> int:
     if extra:
         print(f"Extra overrides: {' '.join(extra)}")
 
-    results = []
-    for spec in specs:
-        # An end-to-end baseline builds its own ImageNet backbone. Passing it a
-        # SwinV2 DINO checkpoint would be meaningless at best and a silent
-        # partial load at worst.
-        spec_checkpoint = (
-            None
-            if any(spec.name.startswith(name) for name in END_TO_END_BASELINES)
-            else checkpoint
-        )
-        results.extend(
-            run_suite(
-                [spec],
-                root=root,
-                checkpoint=spec_checkpoint,
-                extra_overrides=extra,
-                dry_run=args.dry_run,
-                stop_on_failure=args.stop_on_failure,
-            )
-        )
-        if args.stop_on_failure and results and not results[-1].succeeded:
-            break
+    def checkpoint_for(spec) -> Path | None:
+        """Which encoder checkpoint this baseline should start from, if any.
+
+        An end-to-end baseline builds its own ImageNet backbone, so passing it
+        the SwinV2 DINO checkpoint would be meaningless at best and a silent
+        partial load at worst. Resolving this per spec -- rather than looping in
+        the caller and calling ``run_suite`` once per variant -- is what lets the
+        baseline suite be sharded across GPUs like the ablation suite.
+        """
+        if any(spec.name.startswith(name) for name in END_TO_END_BASELINES):
+            return None
+        return checkpoint
+
+    results = run_suite(
+        specs,
+        root=root,
+        checkpoint=checkpoint_for,
+        extra_overrides=extra,
+        dry_run=args.dry_run,
+        stop_on_failure=args.stop_on_failure,
+        gpus=parse_gpu_list(args.gpus),
+    )
 
     if not args.dry_run:
         manifest = write_suite_manifest(root / "baselines" / "suite_manifest.json", specs, results)

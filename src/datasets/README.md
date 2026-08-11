@@ -61,6 +61,23 @@ local/global distinction is carried by the crop *scale*, not the tensor size.
 The teacher sees only the 2 global crops; the student sees all 6. That
 asymmetry is enforced in the trainer, not here.
 
+## Sharding across GPUs
+
+`get_pretrain_dataloader(..., world_size=N, rank=r)` attaches a
+`DistributedSampler`. It splits **images**, never the view axis: the DINO loss
+pairs a student view against the teacher's output for *that same image*, so all
+`2 + local_crops_number` views of a sample have to be resident on one device.
+Sharding views instead would turn the cross-view pairing into a collective, and
+the loss curve of a run that got that wrong looks entirely normal.
+
+`drop_last=True` on the sampler is not a rounding convenience: an uneven tail
+means one rank enters an all-reduce its peers have already left, and the job
+hangs at the collective timeout rather than failing.
+
+The trainer must call `sampler.set_epoch(epoch)` every epoch. The permutation is
+a function of `seed + epoch`, so skipping it gives every epoch the identical
+order — no error, no change in the loss magnitude, and 300 epochs of one epoch.
+
 ## Other datasets
 
 `PretrainImageFolderDataset` — a `torchvision` `ImageFolder` that also returns

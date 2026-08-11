@@ -25,9 +25,19 @@ defaults:
 seed: 42
 device: "auto"
 
+# Identifier for one run's output directory.
+#
+# `${now:...}` is evaluated per process, so under `torchrun` two ranks launched
+# in the same second can still land in different directories -- and a rank that
+# did would write its share of the run's artifacts somewhere nobody looks.
+# $SEED_RUN_ID pins it; scripts/launch.py and main.py --gpus set it, and the
+# trainers additionally broadcast rank 0's resolved directory so the invariant
+# holds even under a bare `torchrun` that did not.
+run_id: "${now:%Y-%m-%d}/${now:%H-%M-%S}"
+
 hydra:
   run:
-    dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+    dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/hydra/${oc.env:SEED_RUN_ID,${run_id}}"
   sweep:
     dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/multirun"
     subdir: "${hydra.job.num}"

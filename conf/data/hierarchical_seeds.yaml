@@ -38,8 +38,16 @@ save_csv_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/metadata/seed_dataset.csv"
 #
 # prefetch_factor is the per-worker read-ahead depth. The default of 2 is thin
 # cover for a pipeline whose per-batch CPU cost is this bursty.
+#
+# num_workers is PER PROCESS, so under DDP the configured value is spawned once
+# per rank. "auto" resolves to the affinity-aware usable core count divided by
+# the number of local ranks, capped at 8 -- which is the configured 8 on a
+# server and 2 per rank on a Kaggle T4x2 instance (4 vCPUs, 2 ranks), where the
+# literal 8 would put 16 augmentation workers on 4 cores and spend the epoch
+# context-switching. An explicit integer is divided by the local rank count with
+# a log line saying so.
 # ---------------------------------------------------------------------------
-num_workers: 8
+num_workers: "auto"
 persistent_workers: true
 prefetch_factor: 4
 
