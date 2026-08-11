@@ -4,6 +4,7 @@
 | --- | --- |
 | `dry_run.py` | End-to-end pipeline smoke test on synthetic tensors |
 | `bench_pretrain_step.py` | A/B micro-benchmark of the stage-1 training step (sdpa / compile / batch geometry), no dataset |
+| `diagnose_sdpa_parity.py` | Per-module SwinV2→SDPA parity report (errors at fp32/TF32/fp64, gradients, shapes, guard verdicts) |
 | `run_ablations.py` | The six component-wise ablation variants |
 | `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |

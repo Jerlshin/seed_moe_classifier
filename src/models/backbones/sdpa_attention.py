@@ -69,6 +69,31 @@ the eager path with a warning. A converted trunk is one whose every attention
 module has just proven, on this machine and this timm, that the two paths
 agree; a drifted timm degrades to current performance, not to a wrong model.
 
+Why the probe runs in fp64, on a copy
+-------------------------------------
+
+The probe is a check of **algebra**, so it must not be contaminated by kernel
+precision selection — and in the module's own dtype on a CUDA device, it is.
+The trainer enables TF32 before the model is built, and cuBLAS then chooses
+TF32 tensor-core kernels for the *stock* path's eager matmuls shape-by-shape,
+while the SDPA path dispatches to a different backend entirely. Measured across
+the four SwinV2-Base stage shapes: the two paths agree to ~4e-7 when both run
+exact fp32, but a TF32-contaminated stock path lands ~5e-4 from the rewrite —
+past any gate tight enough to catch real drift. Which stages trip it depends on
+cuBLAS heuristics; on a 12 GB Ada card that was every ``heads >= 16`` module
+(``layers.2`` and ``layers.3``, 40 of 48), refused for kernel rounding that the
+run's own bf16 autocast dwarfs anyway.
+
+The probe therefore runs on an **fp64 deep copy** of the module (device-local;
+CPU when the accelerator cannot do fp64, e.g. MPS). fp64 has no TF32 path and
+no fused SDPA backend — the math fallback is the same composition in fp64 — so
+both sides are pure algebra: measured agreement ~1e-15, semantic drift O(1),
+and the gate sits at 1e-10, six orders of magnitude *stricter* than the old
+fp32 gate. The live training module is never cast, never re-moded and never
+mutated; on refusal the warning now carries the measured error or the
+exception, so a refusal is diagnosable from the log alone
+(``scripts/diagnose_sdpa_parity.py`` produces the full per-module report).
+
 Modules with ``attn_drop.p > 0`` are also refused: SDPA's internal dropout
 matches the stock path in distribution but not in RNG draws, and this
 repository does not use attention dropout, so refusing keeps the conversion
@@ -83,6 +108,7 @@ run **before** ``torch.compile`` so the compiled graph traces the SDPA path.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import types
@@ -93,12 +119,16 @@ import torch.nn.functional as F
 
 LOGGER = logging.getLogger(__name__)
 
-#: Tolerance for the conversion-time parity check, in fp32. The two paths
-#: reassociate the same sums, so they disagree at float epsilon (~1e-6 on unit
-#: logits); 1e-4 is far above that and far below any real semantic drift, which
-#: shows up at O(1) (a missing 16x bias gain, a doubled temperature, ...).
-PARITY_ATOL = 1e-4
-PARITY_RTOL = 1e-4
+#: Gate for the conversion-time parity probe, which runs in **fp64 on a copy**
+#: of the module (see the module docstring). In fp64 both paths are the same
+#: algebra to ~1e-15 measured, and semantic drift shows up at O(1) (a missing
+#: 16x bias gain, a doubled temperature, ...), so 1e-10 separates the two by
+#: five orders of magnitude on either side. The probe must NOT run in the
+#: module's own dtype: an fp32 probe on a TF32-capable card measures cuBLAS
+#: kernel selection (~5e-4 cross-path), not algebra, and refuses correct
+#: modules stage-by-stage.
+PARITY_ATOL = 1e-10
+PARITY_RTOL = 1e-10
 
 
 def sdpa_window_attention_forward(
@@ -173,57 +203,73 @@ def sdpa_window_attention_forward(
     return x
 
 
-def _parity_check(module) -> bool:
-    """Stock forward vs. SDPA rewrite on this very module, in fp32, both paths.
+def _probe_parity(probe) -> tuple[bool, str]:
+    """Stock forward vs. SDPA rewrite on an fp64 probe copy, both mask cases.
 
-    Runs in eval mode under ``no_grad`` (restoring the training flag), once
-    without a mask and once with a synthetic two-window shift mask, on inputs
-    shaped from the module's own ``window_size`` and ``dim``. Any exception —
-    an old torch without SDPA's ``scale`` kwarg, an attribute a future timm
-    renamed — counts as failure, and failure means the module keeps its stock
-    forward.
+    Returns ``(ok, detail)`` where ``detail`` carries the measured maximum
+    absolute errors, so a refusal in a training log states *how far apart* the
+    paths were rather than only that they disagreed.
     """
-    was_training = module.training
-    try:
-        module.eval()
-        with torch.no_grad():
-            n_tokens = int(module.window_size[0]) * int(module.window_size[1])
-            dim = int(module.dim)
-            # The trainer converts after `.to(device)`, so the probe inputs must
-            # live where the parameters live -- a CPU probe against a CUDA
-            # module would raise, be caught below, and silently refuse every
-            # conversion. A device-local generator keeps the probe off the
-            # global RNG stream, so enabling the conversion cannot shift any
-            # randomness the run consumes afterwards.
-            reference = next(module.parameters())
-            generator = torch.Generator(device=reference.device).manual_seed(0)
+    with torch.no_grad():
+        n_tokens = int(probe.window_size[0]) * int(probe.window_size[1])
+        dim = int(probe.dim)
+        # A device-local generator keeps the probe off the global RNG stream,
+        # so enabling the conversion cannot shift any randomness the run
+        # consumes afterwards.
+        reference = next(probe.parameters())
+        generator = torch.Generator(device=reference.device).manual_seed(0)
 
-            def _randn(*shape: int) -> torch.Tensor:
-                return torch.randn(
-                    *shape, generator=generator, device=reference.device, dtype=reference.dtype
-                )
-
-            x = _randn(2, n_tokens, dim)
-            if not torch.allclose(
-                module.forward(x),
-                sdpa_window_attention_forward(module, x),
-                atol=PARITY_ATOL,
-                rtol=PARITY_RTOL,
-            ):
-                return False
-
-            x = _randn(4, n_tokens, dim)
-            shift_mask = _randn(2, n_tokens, n_tokens)
-            return torch.allclose(
-                module.forward(x, mask=shift_mask),
-                sdpa_window_attention_forward(module, x, mask=shift_mask),
-                atol=PARITY_ATOL,
-                rtol=PARITY_RTOL,
+        def _randn(*shape: int) -> torch.Tensor:
+            return torch.randn(
+                *shape, generator=generator, device=reference.device, dtype=reference.dtype
             )
-    except Exception:
-        return False
-    finally:
-        module.train(was_training)
+
+        x = _randn(2, n_tokens, dim)
+        stock = probe.forward(x)
+        rewrite = sdpa_window_attention_forward(probe, x)
+        plain_ok = torch.allclose(stock, rewrite, atol=PARITY_ATOL, rtol=PARITY_RTOL)
+        plain_err = float((stock - rewrite).abs().max())
+
+        x = _randn(4, n_tokens, dim)
+        shift_mask = _randn(2, n_tokens, n_tokens)
+        stock = probe.forward(x, mask=shift_mask)
+        rewrite = sdpa_window_attention_forward(probe, x, mask=shift_mask)
+        masked_ok = torch.allclose(stock, rewrite, atol=PARITY_ATOL, rtol=PARITY_RTOL)
+        masked_err = float((stock - rewrite).abs().max())
+
+        detail = (
+            f"fp64 max|delta|: {plain_err:.3e} unmasked, {masked_err:.3e} masked "
+            f"(gate {PARITY_ATOL:g})"
+        )
+        return plain_ok and masked_ok, detail
+
+
+def _parity_check(module) -> tuple[bool, str]:
+    """Semantic parity of the rewrite against this module's own stock forward.
+
+    Probes an **fp64 deep copy** in eval mode under ``no_grad`` — never the live
+    module, whose dtype, mode and parameters are left untouched. fp64 removes
+    the TF32 and SDPA-backend kernel differences that made an in-dtype probe
+    refuse correct modules on CUDA (see the module docstring), which is also
+    what lets the gate sit at 1e-10 instead of 1e-4.
+
+    Runs on the module's device; if that device cannot execute fp64 (MPS), the
+    probe retries on CPU — the check is about algebra, and CPU is an equally
+    valid venue for it. Any exception — an old torch without SDPA's ``scale``
+    kwarg, an attribute a future timm renamed — counts as failure, and failure
+    means the module keeps its stock forward.
+    """
+    try:
+        probe = copy.deepcopy(module).double().eval()
+    except Exception as exc:
+        return False, f"could not build the fp64 probe copy: {exc!r}"
+    try:
+        return _probe_parity(probe)
+    except Exception as device_exc:
+        try:
+            return _probe_parity(probe.cpu())
+        except Exception as cpu_exc:
+            return False, f"probe raised on device ({device_exc!r}) and on CPU ({cpu_exc!r})"
 
 
 def convert_swinv2_attention_to_sdpa(model: torch.nn.Module, logger=None) -> int:
@@ -244,6 +290,7 @@ def convert_swinv2_attention_to_sdpa(model: torch.nn.Module, logger=None) -> int
         return 0
 
     converted = 0
+    refused = 0
     for name, module in model.named_modules():
         if not isinstance(module, WindowAttention):
             continue
@@ -259,14 +306,32 @@ def convert_swinv2_attention_to_sdpa(model: torch.nn.Module, logger=None) -> int
                 name,
                 float(module.attn_drop.p),
             )
+            refused += 1
             continue
-        if not _parity_check(module):
+        parity_ok, parity_detail = _parity_check(module)
+        if not parity_ok:
             log.warning(
                 "Not converting %s to SDPA: its stock forward does not match the rewrite "
-                "on this timm/torch install. It stays on the eager path.",
+                "on this timm/torch install (%s). It stays on the eager path.",
                 name,
+                parity_detail,
             )
+            refused += 1
             continue
         module.forward = types.MethodType(sdpa_window_attention_forward, module)
         converted += 1
+
+    if refused:
+        # A partial conversion is the expensive outcome: every refused module
+        # keeps saving its N^2 attention matrices for backward, and one refused
+        # 18-block stage is enough to change what batch size fits. Say so once,
+        # loudly, next to the per-module reasons above.
+        log.warning(
+            "SDPA conversion: %s of %s candidate attention modules converted, %s refused. "
+            "Refused modules stay on the eager path and keep their O(N^2) attention "
+            "activations; run scripts/diagnose_sdpa_parity.py for the per-module report.",
+            converted,
+            converted + refused,
+            refused,
+        )
     return converted

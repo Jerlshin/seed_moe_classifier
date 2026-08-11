@@ -367,13 +367,20 @@ def test_sdpa_window_attention_matches_stock_values_and_gradients(dtype, with_ma
         x = torch.randn(3, n, 32, dtype=dtype)
         mask = None
 
-    stock_out = stock(x, mask=mask)
-    converted_out = converted(x, mask=mask)
+    stock_x = x.clone().requires_grad_(True)
+    converted_x = x.clone().requires_grad_(True)
+    stock_out = stock(stock_x, mask=mask)
+    converted_out = converted(converted_x, mask=mask)
     tolerance = {"rtol": 1e-12, "atol": 1e-12} if dtype is torch.float64 else {"atol": 1e-5}
     assert torch.allclose(stock_out, converted_out, **tolerance)
 
     stock_out.square().sum().backward()
     converted_out.square().sum().backward()
+    # The gradient into the *input* is what the surrounding SwinV2 block trains
+    # on; the parameter gradients are what the module itself trains on. Both
+    # must match for the rewrite to be a drop-in.
+    assert stock_x.grad is not None
+    assert torch.allclose(stock_x.grad, converted_x.grad, **tolerance), "input gradient diverged"
     for (name, stock_param), (_, converted_param) in zip(
         stock.named_parameters(), converted.named_parameters()
     ):
@@ -381,6 +388,117 @@ def test_sdpa_window_attention_matches_stock_values_and_gradients(dtype, with_ma
         assert torch.allclose(
             stock_param.grad, converted_param.grad, **tolerance
         ), f"gradient diverged on {name}"
+
+
+SWINV2_BASE_STAGE_GEOMETRIES = [
+    # (dim, heads, window): the four attention shapes of swinv2_base_window16_256
+    # at 256 px. The 12 GB-card incident refused every heads >= 16 module while
+    # converting heads 4/8, so the parity contract is pinned per real stage
+    # shape, not only on a toy geometry.
+    (128, 4, (16, 16)),
+    (256, 8, (16, 16)),
+    (512, 16, (16, 16)),
+    (1024, 32, (8, 8)),
+]
+
+
+@pytest.mark.parametrize("dim,heads,window", SWINV2_BASE_STAGE_GEOMETRIES)
+def test_sdpa_parity_holds_at_every_base_stage_geometry(dim, heads, window):
+    """fp64 parity — values, input grads, parameter grads — at production shapes.
+
+    fp64 is where the parity guard itself now operates, so this test is the
+    guard's contract restated per stage: at 1e-10 the only thing that can fail
+    it is semantic drift, never kernel rounding.
+    """
+    from timm.models.swin_transformer_v2 import WindowAttention
+
+    torch.manual_seed(7)
+    stock = WindowAttention(dim=dim, window_size=window, num_heads=heads).double()
+    converted = copy.deepcopy(stock)
+    assert convert_swinv2_attention_to_sdpa(converted) == 1
+
+    n = window[0] * window[1]
+    for num_windows in (1, 2):  # non-shifted probe, then a shifted-style mask
+        x = torch.randn(2 * num_windows, n, dim, dtype=torch.float64)
+        mask = (
+            torch.randn(num_windows, n, n, dtype=torch.float64) if num_windows > 1 else None
+        )
+        stock_x = x.clone().requires_grad_(True)
+        converted_x = x.clone().requires_grad_(True)
+        stock_out = stock(stock_x, mask=mask)
+        converted_out = converted(converted_x, mask=mask)
+        assert torch.allclose(stock_out, converted_out, atol=1e-10, rtol=1e-10)
+
+        stock.zero_grad(set_to_none=True)
+        converted.zero_grad(set_to_none=True)
+        stock_out.square().sum().backward()
+        converted_out.square().sum().backward()
+        assert torch.allclose(stock_x.grad, converted_x.grad, atol=1e-10, rtol=1e-10)
+        for (name, stock_param), (_, converted_param) in zip(
+            stock.named_parameters(), converted.named_parameters()
+        ):
+            assert torch.allclose(
+                stock_param.grad, converted_param.grad, atol=1e-10, rtol=1e-10
+            ), f"gradient diverged on {name} (num_windows={num_windows})"
+
+
+def test_sdpa_conversion_is_immune_to_module_precision():
+    """The parity probe runs in fp64 on a copy, whatever the module runs in.
+
+    Regression for the 12 GB-card incident: probing in the module's own compute
+    precision measures kernel rounding (TF32 selection on CUDA, bf16
+    reassociation here) instead of algebra, and refuses correct modules. A bf16
+    module reassociates at ~1e-2 — far past any honest gate — so it converts
+    if and only if the probe is precision-independent. The live module must
+    come back untouched: same dtype, same training flag, parameters unmoved.
+    """
+    from timm.models.swin_transformer_v2 import WindowAttention
+
+    torch.manual_seed(11)
+    module = WindowAttention(dim=64, window_size=(8, 8), num_heads=4).to(torch.bfloat16)
+    module.train()
+    before = {name: param.clone() for name, param in module.named_parameters()}
+
+    assert convert_swinv2_attention_to_sdpa(module) == 1
+    assert module.training, "the probe flipped the live module's mode"
+    for name, param in module.named_parameters():
+        assert param.dtype is torch.bfloat16, name
+        assert torch.equal(param, before[name]), f"the probe moved parameter {name}"
+
+
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_sdpa_bf16_stays_inside_the_stock_paths_own_error_envelope(with_mask):
+    """In bf16 the rewrite must track the exact function as well as eager does.
+
+    Neither bf16 path can match an equality gate — bf16 reassociation alone is
+    ~1e-2 — so the honest contract is relative: measured against an fp64
+    reference of the same module, the SDPA path's error may not exceed twice
+    the stock path's (measured ratio is ~0.6-0.8: the fused softmax accumulates
+    in higher precision, so the rewrite is typically *closer* to the exact
+    function than eager bf16 is).
+    """
+    from timm.models.swin_transformer_v2 import WindowAttention
+
+    torch.manual_seed(13)
+    module = WindowAttention(dim=128, window_size=(8, 8), num_heads=4).eval()
+    n = 64
+    x = torch.randn(4 if with_mask else 2, n, 128)
+    mask = torch.randn(2, n, n) if with_mask else None
+
+    reference_module = copy.deepcopy(module).double()
+    stock_bf16 = copy.deepcopy(module).to(torch.bfloat16)
+    sdpa_bf16 = copy.deepcopy(stock_bf16)
+    assert convert_swinv2_attention_to_sdpa(sdpa_bf16) == 1
+
+    with torch.no_grad():
+        mask64 = mask.double() if mask is not None else None
+        mask16 = mask.to(torch.bfloat16) if mask is not None else None
+        reference = reference_module(x.double(), mask=mask64)
+        stock_error = (stock_bf16(x.to(torch.bfloat16), mask=mask16).double() - reference).abs().max()
+        sdpa_error = (sdpa_bf16(x.to(torch.bfloat16), mask=mask16).double() - reference).abs().max()
+
+    assert float(stock_error) < 0.1, "eager bf16 itself is broken; the comparison is meaningless"
+    assert float(sdpa_error) <= 2.0 * float(stock_error) + 1e-3
 
 
 def test_sdpa_conversion_leaves_state_dict_and_module_tree_alone():
