@@ -1,17 +1,24 @@
+from __future__ import annotations
+
 import bisect
 import csv
 import glob
+import logging
+import multiprocessing
 import os
 import pickle
 import re
 from collections import Counter
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
+
+LOGGER = logging.getLogger(__name__)
 
 #: Filenames under ``Cropped_Samples`` look like ``IMG_0502_bbox137.png``: many
 #: crops cut from one source photograph of a tray of seeds. The stem before
@@ -43,14 +50,159 @@ def source_image_id(image_path: str | os.PathLike[str]) -> str:
 
 
 class PretrainImageFolderDataset(ImageFolder):
+    """``ImageFolder`` that returns ``(original, crops, target, path)``.
+
+    Optionally holds every decoded image in one shared RAM buffer. That is worth
+    doing here for a reason specific to this dataset: the crops under
+    ``Cropped_Samples`` have a median size of 52 x 51 px, so all 9,357 of them
+    decode to roughly **75 MB** of raw RGB. Without the cache, a 300-epoch run
+    pays 2.8 million PNG decodes for a working set that fits in a rounding error
+    of system memory -- and those decodes are on the dataloader workers, which
+    are the processes currently failing to keep the GPU fed.
+
+    The cache is a single contiguous ``uint8`` array plus an offset table rather
+    than a list of arrays. Under ``fork`` the pages are shared copy-on-write
+    across every worker, and one array means the reference counts the workers
+    touch live in the parent's few metadata pages instead of being scattered
+    through 9,357 object headers.
+    """
+
+    def __init__(
+        self,
+        root,
+        transform=None,
+        cache_images: bool = False,
+        cache_limit_mb: float = 4096.0,
+        logger: logging.Logger | None = None,
+        **kwargs,
+    ):
+        super().__init__(root=root, transform=transform, **kwargs)
+        self._cache_buffer: np.ndarray | None = None
+        self._cache_meta: list[tuple[int, int, int]] | None = None
+        self.cache_bytes = 0
+        if cache_images:
+            self._build_cache(float(cache_limit_mb), logger or LOGGER)
+
+    def _build_cache(self, limit_mb: float, logger: logging.Logger) -> None:
+        limit_bytes = int(limit_mb * 1024 * 1024)
+        arrays: list[np.ndarray] = []
+        meta: list[tuple[int, int, int]] = []
+        offset = 0
+
+        for path, _ in self.samples:
+            with Image.open(path) as handle:
+                array = np.asarray(handle.convert("RGB"), dtype=np.uint8)
+            if array.ndim != 3 or array.shape[2] != 3:
+                logger.warning("Skipping the image cache: %s is not HxWx3 RGB.", path)
+                return
+            if offset + array.nbytes > limit_bytes:
+                logger.warning(
+                    "Image cache disabled: the dataset exceeds data.cache_limit_mb=%s MB "
+                    "after %s of %s images. Raise the limit or set data.cache_images=false.",
+                    limit_mb, len(meta), len(self.samples),
+                )
+                return
+            arrays.append(array)
+            meta.append((offset, array.shape[0], array.shape[1]))
+            offset += array.nbytes
+
+        buffer = np.empty(offset, dtype=np.uint8)
+        for array, (start, _, _) in zip(arrays, meta):
+            buffer[start : start + array.nbytes] = array.reshape(-1)
+        del arrays
+
+        self._cache_buffer = buffer
+        self._cache_meta = meta
+        self.cache_bytes = offset
+        logger.info(
+            "Cached %s decoded images in %.1f MB of shared memory; workers will not touch disk.",
+            len(meta), offset / 1024**2,
+        )
+
+    def _decode(self, index: int, path: str) -> Image.Image:
+        if self._cache_buffer is None or self._cache_meta is None:
+            return self.loader(path).convert("RGB")
+        offset, height, width = self._cache_meta[index]
+        view = self._cache_buffer[offset : offset + height * width * 3].reshape(height, width, 3)
+        return Image.fromarray(view)
+
     def __getitem__(self, index):
         path, target = self.samples[index]
-        image = self.loader(path).convert("RGB")
+        image = self._decode(index, path)
         if self.transform is None:
             original, crops = image, []
         else:
             original, crops = self.transform(image)
         return original, crops, target, path
+
+
+class MultiCropBatch(NamedTuple):
+    """One collated multi-crop batch, kept **view-major**.
+
+    ``global_views`` is ``[G, B, C, H, W]`` and ``local_views`` ``[L, B, C, h, w]``
+    -- views on the outside, batch on the inside. That is not cosmetic:
+    ``CustomDINOLoss`` chunks the student output into per-view blocks, so the
+    model input must be ``cat([g0, g1, l0, l1, l2, l3])`` with each block holding
+    the whole batch for one view. Flattening a batch-major layout instead would
+    interleave views and silently score every cross-view pair against the wrong
+    partner -- with a loss curve that looks entirely normal.
+
+    ``local_views`` is ``None`` when ``local_crops_number == 0``; ``originals``
+    is ``None`` whenever the augmentation was built with
+    ``return_original=False``.
+    """
+
+    global_views: torch.Tensor
+    local_views: torch.Tensor | None
+    targets: torch.Tensor
+    paths: tuple[str, ...]
+    originals: torch.Tensor | None
+
+
+class MultiCropCollate:
+    """Collate ``(original, crops, target, path)`` samples into a :class:`MultiCropBatch`.
+
+    Args:
+        num_global_crops: How many leading views the teacher sees (paper: 2).
+            The split matters because the two groups can have different spatial
+            sizes when the local upsample is deferred to the GPU, and a single
+            stacked tensor could not then hold both.
+    """
+
+    def __init__(self, num_global_crops: int = 2):
+        self.num_global_crops = int(num_global_crops)
+
+    def __call__(self, batch) -> MultiCropBatch:
+        originals, crops, targets, paths = zip(*batch)
+        num_views = len(crops[0])
+        if num_views < self.num_global_crops:
+            raise ValueError(
+                f"Each sample must carry at least {self.num_global_crops} global views, got {num_views}."
+            )
+        if any(len(sample) != num_views for sample in crops):
+            raise ValueError("Every sample must produce the same number of views.")
+
+        def stack_views(view_indices: range) -> torch.Tensor:
+            return torch.stack(
+                [torch.stack([sample[view] for sample in crops]) for view in view_indices]
+            )
+
+        global_views = stack_views(range(self.num_global_crops))
+        local_views = (
+            stack_views(range(self.num_global_crops, num_views))
+            if num_views > self.num_global_crops
+            else None
+        )
+        stacked_originals = (
+            torch.stack(originals) if all(item is not None for item in originals) else None
+        )
+        return MultiCropBatch(
+            global_views=global_views,
+            local_views=local_views,
+            targets=torch.as_tensor(targets, dtype=torch.long),
+            paths=tuple(str(item) for item in paths),
+            originals=stacked_originals,
+        )
 
 
 class PickleBatchSeedDataset:
@@ -302,16 +454,73 @@ def get_pretrain_dataloader(
     image_size: int = 256,
     pin_memory: bool = True,
     drop_last: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    num_global_crops: int = 2,
+    multicrop_collate: bool = True,
+    cache_images: bool = False,
+    cache_limit_mb: float = 4096.0,
+    generator: torch.Generator | None = None,
+    logger: logging.Logger | None = None,
 ):
+    """Build the stage-1 multi-crop loader.
+
+    Args:
+        persistent_workers: Keep worker processes alive between epochs. With 584
+            batches per epoch and 300+ epochs, respawning workers every epoch
+            re-imports torch and re-forks the dataset several hundred times, and
+            each respawn also throws away the prefetch queue -- so every epoch
+            starts with the GPU idle.
+        prefetch_factor: Batches each worker runs ahead. The default of 2 is not
+            enough cover here: one sample costs six independent PIL pipelines
+            (crop, jitter, grayscale, blur, solarize), so per-batch CPU time is
+            high and bursty, and a shallow queue drains during any hiccup.
+        multicrop_collate: Emit :class:`MultiCropBatch` instead of the generic
+            nested list ``default_collate`` produces. Required by the fused
+            single-pass forward in the trainer.
+        cache_images: Hold every decoded image in RAM; see
+            :class:`PretrainImageFolderDataset`. Silently ignored when workers
+            would not share it (see below).
+        generator: Seeds the shuffling order.
+
+    The cache is disabled automatically when ``num_workers > 0`` and the start
+    method is not ``fork``: under ``spawn`` (macOS default, Windows always) the
+    dataset is pickled into each worker, so a "shared" cache becomes one full
+    copy per worker plus the pickling time, which is worse than decoding.
+    """
     if not os.path.exists(data_dir):
         raise FileNotFoundError(f"Dataset path not found: {data_dir}")
 
+    log = logger or LOGGER
+    num_workers = max(int(num_workers), 0)
+
+    if cache_images and num_workers > 0:
+        start_method = multiprocessing.get_start_method(allow_none=True) or "fork"
+        if start_method != "fork":
+            log.warning(
+                "Disabling the image cache: the %r start method copies the dataset into every "
+                "worker instead of sharing it. Set data.num_workers=0 to cache anyway.",
+                start_method,
+            )
+            cache_images = False
+
     if dataset_format == "image_folder":
-        dataset = PretrainImageFolderDataset(root=data_dir, transform=transform)
+        dataset = PretrainImageFolderDataset(
+            root=data_dir,
+            transform=transform,
+            cache_images=cache_images,
+            cache_limit_mb=cache_limit_mb,
+            logger=log,
+        )
     elif dataset_format == "pickle_batches":
         dataset = PickleBatchSeedDataset(root_dir=data_dir, image_size=image_size, transform=transform)
     else:
         raise ValueError(f"Unsupported pretraining dataset format: {dataset_format}")
+
+    loader_kwargs = {}
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(persistent_workers)
+        loader_kwargs["prefetch_factor"] = max(int(prefetch_factor), 1)
 
     return DataLoader(
         dataset,
@@ -320,6 +529,9 @@ def get_pretrain_dataloader(
         drop_last=drop_last,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        collate_fn=MultiCropCollate(num_global_crops) if multicrop_collate else None,
+        generator=generator,
+        **loader_kwargs,
     )
 
 

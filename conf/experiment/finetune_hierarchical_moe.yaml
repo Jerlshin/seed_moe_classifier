@@ -52,7 +52,24 @@ experiment:
     learning_rate: 0.0001
     weight_decay: 0.0001
     clip_grad: 3.0
-    amp: false                     # only honoured on CUDA
+
+    # "auto" | "bf16" | "fp16" | "off"; only honoured on CUDA. "auto" resolves to
+    # bf16 on Ampere and later, fp16 with a GradScaler on older cards.
+    #
+    # TRAINING ONLY. Validation, per-fold test and the final held-out evaluation
+    # always run in fp32 (see AMP_DISABLED in src/trainers/moe_finetune.py):
+    # this trainer produces the rows of the comparison table, and a metric that
+    # shifted with the autocast dtype would make the gaps between variants
+    # partly an artefact of the card they ran on.
+    amp: "auto"
+
+    # cuDNN determinism stays on here, unlike stage 1 -- every variant must see
+    # the same kernels as well as the same split. TF32 is a separate axis and is
+    # deterministic: the same algorithm every run, accumulated at lower
+    # precision. Set allow_tf32: false to reproduce full-fp32 accumulation.
+    deterministic: true
+    allow_tf32: true
+    matmul_precision: "high"
 
     # -----------------------------------------------------------------------
     # Stage-2 augmentation. The submitted default was flip p=0.0 and nothing

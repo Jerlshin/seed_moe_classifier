@@ -43,6 +43,13 @@ wandb:
 intervals:
   log_every_steps: 10
   device_every_steps: 50
+
+  # Per-parameter gradient norms cost one host synchronisation PER TENSOR --
+  # about 440 of them for a SwinV2-Base student plus its head, each one stalling
+  # the CPU until the queued backward drains. The clipped total norm is logged
+  # every step for free (the clip computes it anyway), so this breakdown runs on
+  # its own, much rarer, interval. 0 disables it.
+  gradient_norm_every_steps: 200
   histogram_every_epochs: 5
   gradient_histogram_every_epochs: 5
   embedding_every_epochs: 5

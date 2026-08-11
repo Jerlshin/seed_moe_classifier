@@ -65,14 +65,26 @@ from src.utils.efficiency import EfficiencyReport, profile_model
 from src.utils.evaluation import RunSummary, save_test_predictions
 from src.utils.metrics import HierarchicalEvaluation, evaluate_hierarchical, tsne_projection
 from src.utils.training import (
+    AmpConfig,
     CheckpointManager,
     ExperimentTracker,
+    autocast_context,
+    build_grad_scaler,
     collect_device_stats,
+    configure_backend,
+    resolve_amp,
     select_device,
     setup_experiment_logger,
     snapshot_run_configuration,
     to_cpu_state_dict,
 )
+
+#: Evaluation is deliberately **not** autocast. Training in bf16 and scoring in
+#: fp32 costs one extra forward's worth of precision and buys comparability: the
+#: ablation table compares eighteen variants against each other and against
+#: baselines, and a metric that moved with the autocast dtype would make those
+#: differences partly an artefact of which card the variant happened to run on.
+AMP_DISABLED = AmpConfig(enabled=False, dtype=None, device_type="cpu", needs_scaler=False)
 from src.utils.visualization import (
     plot_confusion_matrix,
     plot_expert_utilization,
@@ -104,16 +116,31 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def make_worker_init_fn(seed: int):
-    """Per-worker seeding so the augmentation stream is reproducible."""
+class WorkerSeeder:
+    """Per-worker seeding so the augmentation stream is reproducible.
 
-    def worker_init_fn(worker_id: int) -> None:
-        worker_seed = seed + worker_id
+    A class rather than a closure because ``worker_init_fn`` is **pickled** into
+    each worker under the ``spawn`` start method (the default on macOS, and the
+    only option on Windows), and a locally-defined function cannot be pickled.
+    As a closure this raised ``Can't get local object
+    'make_worker_init_fn.<locals>.worker_init_fn'`` the moment ``num_workers > 0``
+    on anything but Linux, which is why the smoke instructions specify
+    ``data.num_workers=0``. Nothing changes under ``fork``.
+    """
+
+    def __init__(self, seed: int):
+        self.seed = int(seed)
+
+    def __call__(self, worker_id: int) -> None:
+        worker_seed = self.seed + worker_id
         random.seed(worker_seed)
         np.random.seed(worker_seed % (2**32))
         torch.manual_seed(worker_seed)
 
-    return worker_init_fn
+
+def make_worker_init_fn(seed: int) -> WorkerSeeder:
+    """Picklable per-worker seeder for ``seed``."""
+    return WorkerSeeder(seed)
 
 
 # --------------------------------------------------------------------- splits
@@ -549,7 +576,7 @@ def forward_batch(
     criterion: CombinedHierarchicalLoss,
     batch,
     device: torch.device,
-    use_amp: bool,
+    amp: AmpConfig,
     training: bool,
 ):
     """Run encoder -> head -> loss for one batch."""
@@ -558,8 +585,7 @@ def forward_batch(
     seed_labels = seed_labels.to(device, non_blocking=True)
     sub_labels = sub_labels.to(device, non_blocking=True)
 
-    amp_context = torch.autocast(device_type=device.type) if use_amp else nullcontext()
-    with amp_context:
+    with autocast_context(amp):
         features = encoder(images)
         # The ArcFace margin is only placed during training; at evaluation the
         # margin logits equal the plain logits, so metrics stay comparable.
@@ -632,7 +658,8 @@ def run_epoch(
     optimizer: optim.Optimizer | None = None,
     max_batches: int | None = None,
     clip_grad: float | None = None,
-    use_amp: bool = False,
+    amp: AmpConfig = AMP_DISABLED,
+    scaler=None,
     num_experts: int = 6,
     max_tsne_samples: int = 2000,
 ) -> tuple[dict[str, Any], HierarchicalEvaluation, EpochAccumulator, int]:
@@ -671,7 +698,7 @@ def run_epoch(
                 criterion=criterion,
                 batch=batch,
                 device=device,
-                use_amp=use_amp,
+                amp=amp if is_train else AMP_DISABLED,
                 training=is_train,
             )
 
@@ -686,7 +713,10 @@ def run_epoch(
                 term_gradients = per_term_gradient_norms(
                     model, criterion, output, seed_labels, sub_labels
                 )
-            breakdown.total.backward()
+            if scaler is not None:
+                scaler.scale(breakdown.total).backward()
+            else:
+                breakdown.total.backward()
 
             # Optimizer parity. Under sparse dispatch an expert no token reached
             # has `grad is None`, and AdamW skips such parameters entirely --
@@ -694,15 +724,30 @@ def run_epoch(
             # gives them a zero gradient, so without this the two dispatch modes
             # train measurably different models and the "debug-only" dense path
             # could not be used to validate a sparse run.
+            #
+            # Runs before `unscale_`, which is the only correct order: an expert
+            # that was routed to has a real, still-scaled gradient here, and
+            # zeros are invariant to the scale either way.
             if materialize_grads is not None:
                 materialize_grads()
+
+            if scaler is not None:
+                # Gradients must be back on their true scale before anything
+                # clips them -- clipping scaled gradients at 3.0 would clip
+                # essentially every step to essentially nothing.
+                scaler.unscale_(optimizer)
 
             if clip_grad is not None and clip_grad > 0:
                 torch.nn.utils.clip_grad_norm_(
                     [group_param for group in optimizer.param_groups for group_param in group["params"]],
                     max_norm=float(clip_grad),
                 )
-            optimizer.step()
+
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
         dead_expert_total += int(breakdown.dead_experts)
         accumulator.update(
@@ -1039,8 +1084,29 @@ def main(cfg: DictConfig) -> None:
         )
 
         device = select_device(cfg.device)
-        use_amp = bool(OmegaConf.select(cfg, "experiment.training.amp", default=False)) and device.type == "cuda"
-        logger.info("Selected training device: %s (amp=%s)", device, use_amp)
+        # Determinism stays on here, unlike stage 1. This trainer produces the
+        # rows of the comparison table, and every variant must see a byte-
+        # identical split and the same kernels; cuDNN autotuning can pick a
+        # different algorithm per process. TF32 is separate and safe: it is the
+        # same algorithm every run, just accumulated at lower precision.
+        backend = configure_backend(
+            device,
+            allow_tf32=bool(OmegaConf.select(cfg, "experiment.training.allow_tf32", default=True)),
+            deterministic=bool(
+                OmegaConf.select(cfg, "experiment.training.deterministic", default=True)
+            ),
+            matmul_precision=str(
+                OmegaConf.select(cfg, "experiment.training.matmul_precision", default="high")
+            ),
+            logger=logger,
+        )
+        tracker.log_event("backend", backend)
+        amp = resolve_amp(device, OmegaConf.select(cfg, "experiment.training.amp", default="auto"))
+        scaler = build_grad_scaler(amp)
+        logger.info(
+            "Selected training device: %s (amp=%s, grad scaler=%s). Evaluation always runs in fp32.",
+            device, amp.label, "on" if scaler is not None else "off",
+        )
         tracker.log_metrics(collect_device_stats(device), step=0)
 
         # ---------------------------------------------------------- dataset
@@ -1183,6 +1249,22 @@ def main(cfg: DictConfig) -> None:
                 if train and use_balanced_sampler
                 else None
             )
+            # `persistent_workers` matters more here than the epoch count
+            # suggests: this trainer builds a *fresh* loader per fold and per
+            # evaluation pass, and every short-lived pool pays full worker
+            # startup for a handful of batches.
+            worker_kwargs = (
+                {
+                    "persistent_workers": bool(
+                        OmegaConf.select(cfg, "data.persistent_workers", default=True)
+                    ),
+                    "prefetch_factor": int(
+                        OmegaConf.select(cfg, "data.prefetch_factor", default=4)
+                    ),
+                }
+                if num_workers > 0
+                else {}
+            )
             return DataLoader(
                 Subset(source, indices),
                 batch_size=batch_size,
@@ -1193,6 +1275,7 @@ def main(cfg: DictConfig) -> None:
                 drop_last=drop_last,
                 generator=loader_generator,
                 worker_init_fn=worker_init_fn,
+                **worker_kwargs,
             )
 
         margin_warmup = float(
@@ -1280,13 +1363,13 @@ def main(cfg: DictConfig) -> None:
                     encoder, model, criterion, train_loader, device, tracker, logger,
                     epoch, global_step, phase=f"fold_{fold}/train", dataset=dataset,
                     optimizer=optimizer, max_batches=max_batches,
-                    clip_grad=cfg.experiment.training.clip_grad, use_amp=use_amp,
+                    clip_grad=cfg.experiment.training.clip_grad, amp=amp, scaler=scaler,
                     num_experts=num_experts, max_tsne_samples=max_tsne,
                 )
                 val_metrics, val_evaluation, val_accumulator, global_step = run_epoch(
                     encoder, model, criterion, val_loader, device, tracker, logger,
                     epoch, global_step, phase=f"fold_{fold}/validation", dataset=dataset,
-                    max_batches=max_batches, use_amp=False,
+                    max_batches=max_batches, amp=AMP_DISABLED,
                     num_experts=num_experts, max_tsne_samples=max_tsne,
                 )
                 if scheduler is not None:
@@ -1353,7 +1436,7 @@ def main(cfg: DictConfig) -> None:
                     encoder, model, criterion, make_loader(test_indices, shuffle=False),
                     device, tracker, logger, epoch=fold, global_step=global_step,
                     phase=f"fold_{fold}/test", dataset=dataset, max_batches=max_batches,
-                    use_amp=False, num_experts=num_experts, max_tsne_samples=max_tsne,
+                    amp=AMP_DISABLED, num_experts=num_experts, max_tsne_samples=max_tsne,
                 )
                 fold_test_metrics.append(dict(fold_test_evaluation.scalar_metrics()))
 
@@ -1372,7 +1455,7 @@ def main(cfg: DictConfig) -> None:
                 best_state["encoder"], best_state["model"], best_state["criterion"],
                 make_loader(test_indices, shuffle=False), device, tracker, logger,
                 epoch=1, global_step=global_step, phase="test", dataset=dataset,
-                max_batches=max_batches, use_amp=False,
+                max_batches=max_batches, amp=AMP_DISABLED,
                 num_experts=num_experts, max_tsne_samples=max_tsne,
             )
             log_evaluation_artifacts(

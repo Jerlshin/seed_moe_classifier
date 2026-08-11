@@ -2,6 +2,8 @@
 
 from src.datasets.dataset import (
     HierarchicalSeedDataset,
+    MultiCropBatch,
+    MultiCropCollate,
     PickleBatchSeedDataset,
     PretrainImageFolderDataset,
     get_finetune_dataset,
@@ -19,6 +21,8 @@ __all__ = [
     "DataAugmentationDINO",
     "GaussianBlur",
     "HierarchicalSeedDataset",
+    "MultiCropBatch",
+    "MultiCropCollate",
     "PickleBatchSeedDataset",
     "PretrainImageFolderDataset",
     "Solarization",

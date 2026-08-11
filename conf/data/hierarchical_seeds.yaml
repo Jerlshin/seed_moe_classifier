@@ -16,10 +16,43 @@ image_size: 256
 local_crop_size: 101
 
 batch_size: 16                   # Table 1
-num_workers: 2
 pin_memory: true
 drop_last: true
 save_csv_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/metadata/seed_dataset.csv"
+
+# ---------------------------------------------------------------------------
+# Loader throughput.
+#
+# Stage 1 builds SIX independent PIL pipelines per sample (random resized crop,
+# colour jitter, grayscale, Gaussian blur, solarization, normalize). At
+# batch_size 16 that is 96 augmentation chains per batch, against a single
+# backbone forward the GPU finishes in well under a second. Two workers cannot
+# keep up, and the symptom is exactly the one this pipeline showed: a GPU at
+# ~40 % power draw. The trainer logs `data_wait_fraction` every logging step --
+# the share of wall clock spent blocked waiting for a batch. Raise num_workers
+# until it stops falling; the useful ceiling is roughly the physical core count.
+#
+# persistent_workers keeps the pool alive between epochs. With 584 batches per
+# epoch and 300 epochs, respawning costs several hundred pool restarts, and each
+# one also empties the prefetch queue so every epoch begins with an idle GPU.
+#
+# prefetch_factor is the per-worker read-ahead depth. The default of 2 is thin
+# cover for a pipeline whose per-batch CPU cost is this bursty.
+# ---------------------------------------------------------------------------
+num_workers: 8
+persistent_workers: true
+prefetch_factor: 4
+
+# Hold every decoded image in one shared RAM buffer.
+#
+# The 9,357 crops have a median size of 52 x 51 px, so the whole dataset decodes
+# to roughly 75 MB -- for which a 300-epoch run would otherwise pay 2.8 million
+# PNG decodes, on the very workers that are failing to keep the GPU fed. Under
+# `fork` the buffer is shared copy-on-write across workers; the loader disables
+# the cache automatically under `spawn`, where "sharing" would mean one full
+# copy per worker.
+cache_images: true
+cache_limit_mb: 4096
 
 # Paper Section 3: 4 seed types, 27 sub-varieties (13 rice, 8 millet, 3 + 3).
 num_seed_types: 4
@@ -60,3 +93,24 @@ augmentation:
 
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]
+
+  # -------------------------------------------------------------------------
+  # Where the last two steps of each view's pipeline run. Neither changes the
+  # tensor the backbone sees; both change who computes it.
+  #
+  # output_uint8: stop at PILToTensor and do `/255 -> normalize` on the GPU.
+  #   The tensors that get collated, pinned and pushed over PCIe are then 1 byte
+  #   per channel instead of 4.
+  #
+  # defer_local_upsample: emit local crops at local_crop_size (101) and let the
+  #   GPU resize them to image_size (256). A 101 px crop is 6.4x fewer pixels
+  #   than the 256 px tensor it becomes, so this is the larger saving of the two
+  #   -- four of the six views per sample stop being inflated before transfer.
+  #   Implied by output_uint8: the CPU recipe resizes *after* normalisation, on
+  #   unclamped floats, and there is no way to apply that resize to a uint8
+  #   tensor without clamping and requantising it. See src/datasets/transforms.py.
+  #
+  # Set both false to put every step back on the dataloader workers.
+  # -------------------------------------------------------------------------
+  output_uint8: true
+  defer_local_upsample: true

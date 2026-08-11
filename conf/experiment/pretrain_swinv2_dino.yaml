@@ -40,7 +40,73 @@ experiment:
     # Every collapse guard in DINO is a batch statistic, and batch 16 is far
     # below the regime they were designed for. Accumulate to an effective batch
     # of >= 64 before stepping.
+    #
+    # `data.batch_size` x this must stay >= 64. If autocast frees enough memory
+    # to raise the physical batch, HALVE this at the same time:
+    #     python main.py pretrain data.batch_size=32 \
+    #         experiment.training.gradient_accumulation_steps=2
+    # Raising the physical batch without lowering the accumulation changes the
+    # effective batch, hence the learning-rate/momentum regime, hence the run.
     gradient_accumulation_steps: 4
+
+    # -----------------------------------------------------------------------
+    # Execution. None of this changes the objective; all of it changes the
+    # wall clock. See the module docstring of
+    # src/trainers/contrastive_pretrain.py for what each one buys.
+    # -----------------------------------------------------------------------
+
+    # "auto" | "bf16" | "fp16" | "off". "auto" resolves to bf16 on Ampere and
+    # later, fp16 with a GradScaler on older CUDA cards, off on CPU/MPS.
+    #
+    # This is the single largest speedup available and the objective survives it
+    # intact, because the three pieces that fp16 genuinely cannot hold are
+    # pinned to fp32 inside the autocast region by src/losses/dino.py: the
+    # Sinkhorn log-space normaliser (unit logits at tau=0.04 reach exp(25)), the
+    # prototype log-softmax over 8,192 classes, and the KoLeo pairwise distances
+    # (near-duplicate crops underflow to zero distance in half precision).
+    amp: "auto"
+
+    # torch.compile. Costs a few minutes of graph capture on the first step and
+    # then fuses the pointwise chains around SwinV2's attention and MLP blocks.
+    #
+    # mode: "default" is what is recommended here. "reduce-overhead" adds CUDA
+    # graphs, which capture parameter pointers -- harmless for the student, but
+    # the teacher's parameters are rewritten in place by the EMA every step, and
+    # there is nothing to gain by taking that risk on a trunk that already runs
+    # under no_grad. "max-autotune" spends much longer searching and rarely wins
+    # on a fixed-shape transformer.
+    compile:
+      enabled: true
+      mode: "default"
+
+    # Recompute student activations in backward instead of storing them: roughly
+    # half the activation memory for roughly a third more compute. This is a way
+    # to AFFORD a larger physical batch, not a speedup by itself -- enable it
+    # together with a raised data.batch_size, or leave it off. It also tends to
+    # fight torch.compile (graph breaks at every checkpoint boundary).
+    grad_checkpointing: false
+
+    # NHWC. Only the patch-embed convolution benefits; SwinV2's blocks are
+    # already channel-last internally. Measure before enabling.
+    channels_last: false
+
+    # Multi-tensor AdamW. Falls back automatically if the build lacks it.
+    fused_optimizer: true
+
+    # OOM valve: split the stacked view tensor into chunks of this many images
+    # before the backbone. Lowers the peak of any single forward; does nothing
+    # for the accumulated autograd graph. null = one forward for all 6B views.
+    forward_chunk_size: null
+
+    # cuDNN autotuning is on because every batch has an identical shape here
+    # (drop_last plus a fixed 256 px window), which is exactly the case it wins.
+    # Stage 1 emits one checkpoint rather than a row in a comparison table, so it
+    # does not need bitwise determinism; stage 2, where variants must be
+    # comparable, keeps it. Set deterministic: true to trade throughput for it.
+    deterministic: false
+    cudnn_benchmark: true
+    allow_tf32: true
+    matmul_precision: "high"
 
     save_interval: 50
     keep_last_n_checkpoints: 1

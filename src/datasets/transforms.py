@@ -42,6 +42,33 @@ by putting the *global* crops through the same downsample-then-upsample cycle, s
 the artefact carries no discriminative signal; it is off by default because it
 changes the submitted recipe, and it is the honest fix if the shortcut turns out
 to matter.
+
+Where the per-view work happens
+-------------------------------
+
+Two flags move work off the dataloader workers without changing the arithmetic,
+because at batch 16 x 6 views the CPU pipeline is what starves the GPU:
+
+``output_uint8``
+    Stop the per-view pipeline at ``PILToTensor`` and let the trainer do
+    ``/255 -> normalize`` on the GPU. The tensors that get collated, pinned and
+    copied over PCIe are then 1 byte per channel instead of 4 -- a 4x cut in
+    every one of those three costs, for arithmetic that is identical up to
+    float association.
+
+``defer_local_upsample``
+    Emit local crops at ``local_crop_size`` and let the trainer resize them to
+    ``image_size`` on the GPU. A 101 px crop is **6.4x fewer pixels** than the
+    256 px one it becomes, so this is the larger of the two savings.
+
+The ordering is load-bearing and is preserved exactly. The CPU recipe is
+``crop -> jitter -> blur -> ToTensor -> Normalize -> Resize``: the upsample
+happens *after* normalisation, on unclamped floats. The GPU path therefore also
+normalises first and interpolates second. Doing it the other way -- resizing
+uint8 and normalising after -- would clamp the bicubic overshoot into [0, 255]
+and quantise it, which is a different transform. That is why ``output_uint8``
+forces ``defer_local_upsample``: there is no correct way to apply the existing
+resize to a uint8 tensor.
 """
 
 from __future__ import annotations
@@ -111,6 +138,18 @@ class DataAugmentationDINO:
             undergo, so the resolution artefact stops being a local/global cue.
             See the module docstring.
         normalize_mean / normalize_std: Channel normalisation statistics.
+        output_uint8: Emit ``uint8`` CHW tensors and leave ``/255 -> normalize``
+            to the GPU. Forces ``defer_local_upsample``; see the module
+            docstring for why.
+        defer_local_upsample: Emit local crops at ``local_crop_size`` and leave
+            the upsample to ``image_size`` to the GPU. Only meaningful with
+            ``resize_local_to_global``.
+        return_original: Also build the un-augmented full-frame view. Stage 1
+            never reads it -- the trainer discards it and the attention overlay
+            uses ``views[0]`` -- so producing it costs a resize, a collate and a
+            256x256x3 float per sample per epoch for nothing. Left ``True`` by
+            default so the ``(original, crops)`` contract holds for callers that
+            do want it; the pretraining config turns it off.
     """
 
     def __init__(
@@ -135,9 +174,24 @@ class DataAugmentationDINO:
         match_view_lowpass: bool = False,
         normalize_mean: Sequence[float] = (0.485, 0.456, 0.406),
         normalize_std: Sequence[float] = (0.229, 0.224, 0.225),
+        output_uint8: bool = False,
+        defer_local_upsample: bool = False,
+        return_original: bool = True,
     ):
         if local_crops_number < 0:
             raise ValueError(f"local_crops_number must be >= 0, got {local_crops_number}")
+
+        # A uint8 view cannot carry the post-normalisation resize, so asking for
+        # one implies deferring that resize to the GPU. Recorded rather than
+        # silently assumed: `defer_local_upsample` is public and the trainer logs
+        # it alongside the view geometry.
+        self.output_uint8 = bool(output_uint8)
+        self.defer_local_upsample = bool(defer_local_upsample) or self.output_uint8
+        self.return_original = bool(return_original)
+        self.image_size = int(image_size)
+        self.local_crop_size = int(local_crop_size)
+        self.normalize_mean = tuple(float(value) for value in normalize_mean)
+        self.normalize_std = tuple(float(value) for value in normalize_std)
 
         interpolation = T.InterpolationMode.BICUBIC
         # Applied to the *global* views, reproducing the resolution artefact the
@@ -167,11 +221,18 @@ class DataAugmentationDINO:
                 T.RandomGrayscale(p=grayscale_prob),
             ]
         )
-        normalize = T.Compose(
-            [
-                T.ToTensor(),
-                T.Normalize(tuple(normalize_mean), tuple(normalize_std)),
-            ]
+        # `PILToTensor` is the uint8 half of `ToTensor`: same HWC -> CHW
+        # permutation, no division, no float allocation. The trainer applies the
+        # remaining `/255 -> (x - mean) / std` on the GPU.
+        normalize = (
+            T.PILToTensor()
+            if self.output_uint8
+            else T.Compose(
+                [
+                    T.ToTensor(),
+                    T.Normalize(self.normalize_mean, self.normalize_std),
+                ]
+            )
         )
 
         # Un-augmented view, kept for visualisation and attention overlays.
@@ -207,9 +268,13 @@ class DataAugmentationDINO:
             GaussianBlur(local_blur_prob),
             normalize,
         ]
-        if resize_local_to_global:
-            # SwinV2 needs a fixed input resolution; the local/global distinction
-            # is carried by the crop scale, not by the final tensor size.
+        # SwinV2 needs a fixed input resolution; the local/global distinction is
+        # carried by the crop scale, not by the final tensor size. The upsample
+        # happens here, or on the GPU when it is deferred -- in both cases
+        # *after* normalisation, so the two paths are the same function.
+        self.resize_local_to_global = bool(resize_local_to_global)
+        self.upsample_locals_on_device = self.resize_local_to_global and self.defer_local_upsample
+        if self.resize_local_to_global and not self.defer_local_upsample:
             local_steps.append(T.Resize((image_size, image_size), interpolation=interpolation))
 
         self.local_crops_number = int(local_crops_number)
@@ -219,6 +284,23 @@ class DataAugmentationDINO:
     def num_crops(self) -> int:
         """Total views per image: 2 global + ``local_crops_number`` local."""
         return 2 + self.local_crops_number
+
+    @property
+    def local_view_size(self) -> int:
+        """Spatial size the local views are emitted at.
+
+        Equal to ``image_size`` unless the upsample is deferred to the GPU, in
+        which case the tensors that cross the dataloader boundary are
+        ``local_crop_size`` and the trainer finishes the job.
+        """
+        if self.resize_local_to_global and not self.defer_local_upsample:
+            return self.image_size
+        return self.local_crop_size
+
+    @property
+    def view_sizes(self) -> list[int]:
+        """Emitted spatial size of each view, in ``view_ids`` order."""
+        return [self.image_size, self.image_size] + [self.local_view_size] * self.local_crops_number
 
     @property
     def view_ids(self) -> list[int]:
@@ -239,18 +321,34 @@ class DataAugmentationDINO:
         return [0, 1]
 
     def __call__(self, image: Image.Image):
-        """Return ``(original_tensor, [global_1, global_2, *locals])``."""
+        """Return ``(original_tensor, [global_1, global_2, *locals])``.
+
+        ``original_tensor`` is ``None`` when ``return_original=False``; the
+        multi-crop collate drops it in that case rather than trying to batch it.
+        """
         image = image.convert("RGB")
         crops = [self.global_transform_1(image), self.global_transform_2(image)]
         crops.extend(self.local_transform(image) for _ in range(self.local_crops_number))
-        return self.original_transform(image), crops
+        original = self.original_transform(image) if self.return_original else None
+        return original, crops
 
 
-def get_dino_transforms(image_size: int, local_crop_size: int, augmentation_cfg: Any | None = None):
-    """Build :class:`DataAugmentationDINO` from a ``data.augmentation`` config node."""
+def get_dino_transforms(
+    image_size: int,
+    local_crop_size: int,
+    augmentation_cfg: Any | None = None,
+    **overrides: Any,
+):
+    """Build :class:`DataAugmentationDINO` from a ``data.augmentation`` config node.
+
+    ``overrides`` take precedence over the config node, which is how the trainer
+    switches off ``return_original`` without that being an augmentation *policy*
+    recorded in ``conf/data/``.
+    """
     params = dict(augmentation_cfg or {})
     # `local_crop_size` lives on the data node, not inside `augmentation`.
     params.pop("local_crop_size", None)
+    params.update({key: value for key, value in overrides.items() if value is not None})
     return DataAugmentationDINO(image_size=image_size, local_crop_size=local_crop_size, **params)
 
 

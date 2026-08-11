@@ -39,6 +39,26 @@ collapsing run collapses first.
 :meth:`DINOHead.forward` can return the pre-prototype bottleneck alongside the
 logits, which is what the KoLeo regulariser consumes -- applying it to the
 65k-wide prototype output would measure the wrong space.
+
+One forward per step, not six
+-----------------------------
+
+:meth:`DINO.forward_student_views` takes **all** the student's views as one
+stacked tensor and issues a single backbone call. The obvious loop --
+``[model.forward_student(view) for view in views]`` -- is six separate SwinV2-Base
+forwards at batch 16, and a Swin block at batch 16 is nowhere near large enough
+to saturate a GPU: each of its ~200 kernels spends more time being launched than
+running, and that launch overhead is paid six times over. Stacking makes it one
+forward at batch 96, which is the same arithmetic on tensors large enough to
+matter, with a sixth of the launches.
+
+It also costs almost nothing in memory. The loop already holds all six autograd
+graphs simultaneously -- backward runs after the last view -- so peak activation
+memory is unchanged; the only new allocation is the stacked *input*, and
+``chunk_size`` splits even that back up if a smaller card needs it.
+
+The teacher gets the same treatment over its two global views, under
+``no_grad``.
 """
 
 from __future__ import annotations
@@ -247,17 +267,136 @@ class DINO(nn.Module):
         deactivate_requires_grad(self.teacher_backbone)
         deactivate_requires_grad(self.teacher_head)
 
+        # Compiled callables live OFF the module tree, in a plain dict.
+        #
+        # `torch.compile(module)` returns an `OptimizedModule` wrapper, and
+        # assigning that back onto `self.student_backbone` would register it as a
+        # submodule -- at which point every key in `student_backbone.state_dict()`
+        # gains an `_orig_mod.` prefix. That state dict is the *only* handoff to
+        # stage 2, and `checkpoint_strict: false` is the default there, so the
+        # result would be a stage-2 encoder that matched zero keys, loaded a
+        # random trunk, logged one line about missing keys and trained to
+        # completion looking entirely healthy.
+        self._compiled: dict[str, Any] = {}
+        self.grad_checkpointing = False
+
+    # ------------------------------------------------------------- runtime
+
+    def configure_runtime(
+        self,
+        *,
+        compile_enabled: bool = False,
+        compile_mode: str = "default",
+        grad_checkpointing: bool = False,
+        channels_last: bool = False,
+        fused_attention: bool = True,
+        logger=None,
+    ) -> dict[str, Any]:
+        """Apply the execution-level options and report what took effect.
+
+        None of these change the function the model computes; they change how it
+        is executed. Each is reported back (and logged into the run's event
+        stream) because two of them can silently *fail* to apply:
+        ``torch.compile`` falls back to eager on a backend error, and
+        ``fused_attention`` finds nothing to switch on a stock SwinV2 trunk.
+
+        Args:
+            compile_enabled / compile_mode: See
+                :func:`~src.utils.training.device.maybe_compile`. ``"default"``
+                is the safe choice here. ``"reduce-overhead"`` adds CUDA graphs,
+                which capture the parameter *pointers* -- fine for the student,
+                but the teacher's parameters are rewritten in place by the EMA
+                every step and there is no reason to take that risk for a trunk
+                that runs under ``no_grad`` anyway.
+            grad_checkpointing: Recompute student activations during backward
+                instead of storing them. Buys roughly half the activation memory
+                for roughly a third more compute, so it is a way to *afford a
+                larger batch*, not a speedup on its own. Applied to the student
+                only -- the teacher stores no activations to begin with.
+            channels_last: NHWC memory format. Only the patch-embed convolution
+                benefits; SwinV2's blocks are already channel-last internally.
+                Off by default.
+            fused_attention: Ask timm for SDPA where it offers it.
+        """
+        from src.utils.training.device import enable_fused_attention, maybe_compile
+
+        applied: dict[str, Any] = {}
+
+        if grad_checkpointing:
+            setter = getattr(self.student_backbone, "set_grad_checkpointing", None)
+            if callable(setter):
+                setter(True)
+                self.grad_checkpointing = True
+                applied["grad_checkpointing"] = True
+            elif logger is not None:
+                logger.warning(
+                    "%s does not expose set_grad_checkpointing; continuing without it.",
+                    self.backbone_name,
+                )
+
+        if fused_attention:
+            switched = enable_fused_attention(self.student_backbone)
+            switched += enable_fused_attention(self.teacher_backbone)
+            applied["fused_attention_modules"] = switched
+            if logger is not None and switched == 0:
+                logger.info(
+                    "No fused-attention modules on %s. SwinV2 window attention is cosine "
+                    "attention with a clamped logit scale and a continuous relative-position "
+                    "bias, which SDPA cannot express; the speedup on this trunk comes from "
+                    "autocast and inductor fusion instead.",
+                    self.backbone_name,
+                )
+
+        if channels_last:
+            self.to(memory_format=torch.channels_last)
+            applied["channels_last"] = True
+
+        if compile_enabled:
+            if self.grad_checkpointing and logger is not None:
+                logger.warning(
+                    "torch.compile together with gradient checkpointing frequently causes "
+                    "graph breaks that undo both. Prefer one or the other."
+                )
+            self._compiled["student_backbone"] = maybe_compile(
+                self.student_backbone, True, compile_mode, logger
+            )
+            self._compiled["teacher_backbone"] = maybe_compile(
+                self.teacher_backbone, True, compile_mode, logger
+            )
+            self._compiled["student_head"] = maybe_compile(
+                self.student_head, True, compile_mode, logger
+            )
+            self._compiled["teacher_head"] = maybe_compile(
+                self.teacher_head, True, compile_mode, logger
+            )
+            applied["compiled"] = sorted(self._compiled)
+            applied["compile_mode"] = compile_mode
+
+        return applied
+
+    def _module(self, name: str) -> nn.Module:
+        """The compiled callable for ``name`` when there is one, else the module."""
+        return self._compiled.get(name, getattr(self, name))
+
     def student_parameters(self) -> list[nn.Parameter]:
         """Parameters the optimizer should own (the teacher is EMA-only)."""
         return list(self.student_backbone.parameters()) + list(self.student_head.parameters())
+
+    def ema_pairs(self) -> list[tuple[nn.Module, nn.Module]]:
+        """``(student, teacher)`` module pairs the EMA advances, in order."""
+        return [
+            (self.student_backbone, self.teacher_backbone),
+            (self.student_head, self.teacher_head),
+        ]
+
+    # -------------------------------------------------------------- forward
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Pooled student features, so a trained DINO can act as a plain encoder."""
         return self.forward_features(x)
 
-    def forward_features(self, x: torch.Tensor, teacher: bool = False) -> torch.Tensor:
-        backbone = self.teacher_backbone if teacher else self.student_backbone
-        features = backbone(x)
+    @staticmethod
+    def _pool(features: torch.Tensor) -> torch.Tensor:
         # SwinV2 has no class token, so pooling must average the spatial grid --
         # taking `features[:, 0]` would silently select one corner patch, and
         # would disagree with BackboneFeatureExtractor._pool, which is what
@@ -268,17 +407,62 @@ class DINO(nn.Module):
             return features.mean(dim=1)
         return features
 
+    def _backbone_features(
+        self,
+        name: str,
+        x: torch.Tensor,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        """Pooled features for ``x``, optionally in chunks of ``chunk_size`` images.
+
+        Chunking exists purely as an OOM valve: it splits the *input* batch, so
+        the peak activation of any one backbone call falls proportionally, while
+        the autograd graphs of all chunks stay alive until backward. It therefore
+        helps when a single forward's transient allocation is what overflows, and
+        does nothing for the accumulated graph. Leave it unset unless a run OOMs.
+        """
+        backbone = self._module(name)
+        if not chunk_size or chunk_size >= x.shape[0]:
+            return self._pool(backbone(x))
+        return torch.cat([self._pool(backbone(part)) for part in x.split(int(chunk_size))], dim=0)
+
+    def forward_features(self, x: torch.Tensor, teacher: bool = False) -> torch.Tensor:
+        return self._backbone_features("teacher_backbone" if teacher else "student_backbone", x)
+
     def forward_student(
         self,
         x: torch.Tensor,
         return_bottleneck: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.student_head(
-            self.forward_features(x, teacher=False), return_bottleneck=return_bottleneck
-        )
+        return self.forward_student_views(x, return_bottleneck=return_bottleneck)
 
     def forward_teacher(self, x: torch.Tensor) -> torch.Tensor:
-        return self.teacher_head(self.forward_features(x, teacher=True))
+        return self.forward_teacher_views(x)
+
+    def forward_student_views(
+        self,
+        views: torch.Tensor,
+        return_bottleneck: bool = False,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Prototype logits for a stacked ``[V * B, C, H, W]`` view tensor.
+
+        The blocks must be **view-major** -- all of view 0, then all of view 1 --
+        because :class:`~src.losses.dino.CustomDINOLoss` chunks the output back
+        into per-view groups. ``MultiCropCollate`` produces exactly that layout.
+        """
+        features = self._backbone_features("student_backbone", views, chunk_size)
+        return self._module("student_head")(features, return_bottleneck=return_bottleneck)
+
+    @torch.no_grad()
+    def forward_teacher_views(
+        self,
+        views: torch.Tensor,
+        chunk_size: int | None = None,
+    ) -> torch.Tensor:
+        """Prototype logits for the teacher's stacked global views, under ``no_grad``."""
+        features = self._backbone_features("teacher_backbone", views, chunk_size)
+        return self._module("teacher_head")(features)
 
 
 def build_dino(backbone_cfg: Any, head_cfg: Any, freeze_last_layer_epochs: int = 1) -> DINO:
