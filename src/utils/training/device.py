@@ -100,12 +100,13 @@ def enable_fused_attention(module: torch.nn.Module) -> int:
     because on the stock ``timm`` SwinV2 that number is **zero**, and it is worth
     seeing rather than assuming. SwinV2's window attention is *cosine* attention:
     it L2-normalises ``q`` and ``k``, multiplies by a clamped learned logit scale
-    and adds a continuous relative-position bias before the softmax.
-    ``F.scaled_dot_product_attention`` cannot express the normalisation or the
-    scale clamp, so timm does not offer a fused path there and FlashAttention is
-    not reachable for this backbone. The speed on that path comes from autocast
-    (the QK^T and AV matmuls become tensor-core GEMMs) and from inductor fusing
-    the bias-add/softmax/dropout chain -- not from SDPA.
+    and adds a continuous relative-position bias before the softmax, and timm
+    offers no fused path for that combination, so this flag finds nothing to
+    switch. The function *is* expressible with SDPA all the same -- fold the
+    per-head scale into the normalised ``q``, pass the bias as ``attn_mask``,
+    disable SDPA's own ``1/sqrt(d)`` -- which is what
+    ``src/models/backbones/sdpa_attention.py`` does for the stage-1 trunks; on
+    this backbone that conversion, not this flag, is the fused-attention route.
 
     The call is still made because ``timm`` does expose ``fused_attn`` on other
     trunks in this repository's baseline set (Swin-T, ViT-style heads), and on

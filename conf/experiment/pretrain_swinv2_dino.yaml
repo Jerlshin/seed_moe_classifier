@@ -66,6 +66,32 @@ experiment:
     # (near-duplicate crops underflow to zero distance in half precision).
     amp: "auto"
 
+    # SwinV2's window attention is cosine attention, which timm only runs
+    # eagerly: per block, autograd materialises AND saves two full
+    # [B*nW, heads, N, N] matrices (the pre-scale q^k^T product, kept for the
+    # logit_scale gradient, and the softmax output). Summed over SwinV2-Base's
+    # 24 blocks at 96 student views that is ~12 GB of bf16 activations per
+    # micro-batch -- the largest single consumer of memory capacity and
+    # bandwidth in the step, and what caps the physical batch. torch.compile
+    # does not remove it (inductor's SDPA pattern-matcher does not recognise
+    # the cosine-attention chain; measured, not assumed).
+    #
+    # The same function IS expressible with F.scaled_dot_product_attention:
+    # fold the clamped per-head logit scale into the normalised q, pass the
+    # relative-position bias (+ shift mask) as attn_mask, set scale=1.0.
+    # Algebraically identical -- tests/test_throughput.py pins values and
+    # gradients in fp64 -- and the fused kernel stores a logsumexp instead of
+    # the N^2 matrices. Each module is parity-checked against its own stock
+    # forward at conversion time and left on the eager path (with a warning)
+    # if this timm's semantics have drifted.
+    #
+    # With this on, activation memory stops being the batch-size constraint:
+    # prefer  data.batch_size=64 gradient_accumulation_steps=1  (identical
+    # effective batch, one forward at 384 views, and the Sinkhorn/KoLeo batch
+    # statistics computed over the full effective batch -- the regime they were
+    # designed for). Measure both with scripts/bench_pretrain_step.py.
+    sdpa_attention: true
+
     # torch.compile. Costs a few minutes of graph capture on the first step and
     # then fuses the pointwise chains around SwinV2's attention and MLP blocks.
     #

@@ -66,6 +66,14 @@ CPU pipeline, not the GPU.
 **The EMA is two kernels, not ~880.** See
 :class:`~src.utils.training.ema.TeacherEmaUpdater`.
 
+**Window attention is SDPA, by algebraic rewrite.** timm runs SwinV2's cosine
+attention eagerly, and per block autograd saves two full ``[B*nW, heads, N, N]``
+matrices for backward -- ~12 GB of bf16 at 96 student views, the step's largest
+memory and bandwidth consumer and the binding constraint on the physical batch.
+``experiment.training.sdpa_attention`` rebinds each attention module to an
+algebraically identical ``F.scaled_dot_product_attention`` form, parity-checked
+per module at conversion time. See ``src/models/backbones/sdpa_attention.py``.
+
 Precision and compilation are configured under ``experiment.training`` -- see
 ``conf/experiment/pretrain_swinv2_dino.yaml``. ``amp: auto`` selects bf16 on
 Ampere and later, fp16 with a ``GradScaler`` on older CUDA cards, and off on
@@ -457,6 +465,13 @@ def main(cfg: DictConfig) -> None:
             ),
             channels_last=bool(
                 OmegaConf.select(cfg, "experiment.training.channels_last", default=False)
+            ),
+            # Default true: every module parity-checks itself against its own
+            # stock forward at conversion time and falls back on disagreement,
+            # so the failure mode of a drifted timm is current performance, not
+            # a wrong model.
+            sdpa_attention=bool(
+                OmegaConf.select(cfg, "experiment.training.sdpa_attention", default=True)
             ),
             logger=logger,
         )

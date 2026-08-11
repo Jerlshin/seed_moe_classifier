@@ -290,15 +290,18 @@ class DINO(nn.Module):
         grad_checkpointing: bool = False,
         channels_last: bool = False,
         fused_attention: bool = True,
+        sdpa_attention: bool = False,
         logger=None,
     ) -> dict[str, Any]:
         """Apply the execution-level options and report what took effect.
 
         None of these change the function the model computes; they change how it
         is executed. Each is reported back (and logged into the run's event
-        stream) because two of them can silently *fail* to apply:
-        ``torch.compile`` falls back to eager on a backend error, and
-        ``fused_attention`` finds nothing to switch on a stock SwinV2 trunk.
+        stream) because three of them can silently *fail* to apply:
+        ``torch.compile`` falls back to eager on a backend error,
+        ``fused_attention`` finds nothing to switch on a stock SwinV2 trunk, and
+        ``sdpa_attention`` refuses any module that fails its conversion-time
+        parity check.
 
         Args:
             compile_enabled / compile_mode: See
@@ -316,11 +319,39 @@ class DINO(nn.Module):
             channels_last: NHWC memory format. Only the patch-embed convolution
                 benefits; SwinV2's blocks are already channel-last internally.
                 Off by default.
-            fused_attention: Ask timm for SDPA where it offers it.
+            fused_attention: Ask timm for SDPA where it offers it. On SwinV2
+                this finds nothing (see ``sdpa_attention``); it stays on for the
+                baseline trunks that do expose the flag.
+            sdpa_attention: Rebind SwinV2's cosine window attention to an
+                algebraically identical ``F.scaled_dot_product_attention`` form
+                -- see ``src/models/backbones/sdpa_attention.py``. Applied to
+                both trunks **before** compilation so the compiled graphs trace
+                the fused path. This is the change that stops each block saving
+                two full ``[B·nW, heads, N, N]`` attention matrices for
+                backward (~12 GB bf16 at 96 student views), which is what frees
+                the memory to raise the physical batch.
         """
+        from src.models.backbones.sdpa_attention import convert_swinv2_attention_to_sdpa
         from src.utils.training.device import enable_fused_attention, maybe_compile
 
         applied: dict[str, Any] = {}
+
+        if sdpa_attention:
+            converted = convert_swinv2_attention_to_sdpa(self.student_backbone, logger=logger)
+            converted += convert_swinv2_attention_to_sdpa(self.teacher_backbone, logger=logger)
+            applied["sdpa_attention_modules"] = converted
+            if logger is not None:
+                if converted:
+                    logger.info(
+                        "Rebound %s SwinV2 window-attention modules to SDPA "
+                        "(parity-checked per module).",
+                        converted,
+                    )
+                else:
+                    logger.warning(
+                        "sdpa_attention was requested but no module converted; the run "
+                        "stays on eager cosine attention. Check the warnings above."
+                    )
 
         if grad_checkpointing:
             setter = getattr(self.student_backbone, "set_grad_checkpointing", None)
@@ -340,10 +371,11 @@ class DINO(nn.Module):
             applied["fused_attention_modules"] = switched
             if logger is not None and switched == 0:
                 logger.info(
-                    "No fused-attention modules on %s. SwinV2 window attention is cosine "
-                    "attention with a clamped logit scale and a continuous relative-position "
-                    "bias, which SDPA cannot express; the speedup on this trunk comes from "
-                    "autocast and inductor fusion instead.",
+                    "No timm fused-attention modules on %s: SwinV2 window attention is "
+                    "cosine attention, for which timm offers no fused path. The fused "
+                    "route on this trunk is the sdpa_attention conversion "
+                    "(src/models/backbones/sdpa_attention.py), which refactors the same "
+                    "function into F.scaled_dot_product_attention.",
                     self.backbone_name,
                 )
 

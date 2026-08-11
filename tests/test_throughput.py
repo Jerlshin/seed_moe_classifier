@@ -29,6 +29,10 @@ from PIL import Image
 from src.datasets.dataset import MultiCropCollate
 from src.datasets.transforms import DataAugmentationDINO
 from src.losses.dino import CustomDINOLoss
+from src.models.backbones.sdpa_attention import (
+    convert_swinv2_attention_to_sdpa,
+    sdpa_window_attention_forward,
+)
 from src.models.backbones.swinv2_dino import DINO
 from src.utils.training.ema import TeacherEmaUpdater
 
@@ -321,6 +325,128 @@ def test_ema_refuses_a_mismatched_pair():
     teacher = torch.nn.Sequential(torch.nn.Linear(4, 4))
     with pytest.raises(ValueError, match="EMA pair mismatch"):
         TeacherEmaUpdater([(student, teacher)])
+
+
+# ------------------------------------------------- SDPA window attention
+
+def _stock_and_converted_window_attention(dtype=torch.float32, attn_drop: float = 0.0):
+    """One stock timm WindowAttention and a converted deep copy of it."""
+    from timm.models.swin_transformer_v2 import WindowAttention
+
+    torch.manual_seed(3)
+    stock = WindowAttention(
+        dim=32, window_size=(4, 4), num_heads=4, attn_drop=attn_drop
+    ).to(dtype)
+    converted = copy.deepcopy(stock)
+    count = convert_swinv2_attention_to_sdpa(converted)
+    return stock, converted, count
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("with_mask", [False, True])
+def test_sdpa_window_attention_matches_stock_values_and_gradients(dtype, with_mask):
+    """SDPA(q̂s, k̂, v, bias, scale=1) == softmax((q̂k̂ᵀ)s + bias)v -- values and grads.
+
+    fp64 agreement at 1e-12 relative is evidence about the *algebra* (folding
+    the per-head logit scale into q, merging the window axis into the head axis
+    for the shift mask); fp32 agreement at 1e-5 is evidence the reassociation
+    stays inside float epsilon. The gradients are the part that actually trains
+    -- logit_scale's gradient in the stock path flows through the saved q̂k̂ᵀ
+    matrix, and in the SDPA path through q itself, so matching them is exactly
+    the claim that the ~12 GB of saved attention matrices were redundant.
+    """
+    stock, converted, count = _stock_and_converted_window_attention(dtype)
+    assert count == 1
+
+    torch.manual_seed(5)
+    n = 16  # (4, 4) window
+    if with_mask:
+        x = torch.randn(6, n, 32, dtype=dtype)  # batch 3 x 2 windows
+        mask = torch.randn(2, n, n, dtype=dtype)
+    else:
+        x = torch.randn(3, n, 32, dtype=dtype)
+        mask = None
+
+    stock_out = stock(x, mask=mask)
+    converted_out = converted(x, mask=mask)
+    tolerance = {"rtol": 1e-12, "atol": 1e-12} if dtype is torch.float64 else {"atol": 1e-5}
+    assert torch.allclose(stock_out, converted_out, **tolerance)
+
+    stock_out.square().sum().backward()
+    converted_out.square().sum().backward()
+    for (name, stock_param), (_, converted_param) in zip(
+        stock.named_parameters(), converted.named_parameters()
+    ):
+        assert stock_param.grad is not None, name
+        assert torch.allclose(
+            stock_param.grad, converted_param.grad, **tolerance
+        ), f"gradient diverged on {name}"
+
+
+def test_sdpa_conversion_leaves_state_dict_and_module_tree_alone():
+    """Conversion rebinds ``forward`` on the instance and touches nothing else.
+
+    The bare ``student_backbone.state_dict()`` is the only handoff to stage 2,
+    so like ``torch.compile`` the conversion must never rename a key or add a
+    submodule. It must also be idempotent: a second call finds every forward
+    already bound and converts nothing twice.
+    """
+    stock, converted, count = _stock_and_converted_window_attention()
+    assert count == 1
+    assert list(converted.state_dict()) == list(stock.state_dict())
+    assert dict(converted.named_modules()).keys() == dict(stock.named_modules()).keys()
+    assert convert_swinv2_attention_to_sdpa(converted) == 0  # idempotent
+
+
+def test_sdpa_conversion_refuses_what_it_cannot_prove():
+    """The parity guard is the licence to run this at all.
+
+    The rewrite reimplements the forward from module attributes, so a timm
+    whose semantics have drifted would make it silently wrong. A module whose
+    stock forward disagrees with the rewrite -- simulated here by binding a
+    different forward -- must stay unconverted, as must a module using
+    attention dropout (SDPA matches it in distribution, not in RNG draws).
+    """
+    import types
+
+    from timm.models.swin_transformer_v2 import WindowAttention
+
+    drifted = WindowAttention(dim=32, window_size=(4, 4), num_heads=4)
+    drifted.forward = types.MethodType(
+        lambda self, x, mask=None: self.proj(x), drifted
+    )
+    assert convert_swinv2_attention_to_sdpa(drifted) == 0
+
+    dropout = WindowAttention(dim=32, window_size=(4, 4), num_heads=4, attn_drop=0.1)
+    assert convert_swinv2_attention_to_sdpa(dropout) == 0
+
+
+@pytest.mark.slow
+def test_sdpa_conversion_preserves_the_full_dino_forward():
+    """End to end: a converted DINO computes the same student and teacher outputs."""
+    model = DINO(
+        backbone_name="swinv2_tiny_window16_256", input_dim=768,
+        hidden_dim=64, bottleneck_dim=16, out_dim=32, pretrained=False,
+    ).eval()
+    reference = copy.deepcopy(model)
+
+    state_before = list(model.student_backbone.state_dict())
+    applied = model.configure_runtime(compile_enabled=False, sdpa_attention=True)
+    assert applied["sdpa_attention_modules"] > 0
+    assert list(model.student_backbone.state_dict()) == state_before
+
+    views = torch.randn(2, 3, 256, 256)
+    with torch.no_grad():
+        assert torch.allclose(
+            model.forward_student_views(views),
+            reference.forward_student_views(views),
+            atol=1e-5,
+        )
+        assert torch.allclose(
+            model.forward_teacher_views(views),
+            reference.forward_teacher_views(views),
+            atol=1e-5,
+        )
 
 
 @pytest.mark.slow
