@@ -9,7 +9,8 @@ reproduce the paper's t-SNE figures (Figs. 8-9) without launching a training run
         --checkpoint $SEED_PRETRAIN_BACKBONE \
         --max-samples 2000
 
-These are the **backbone's** features at its native width (1024 for SwinV2-Base),
+These are the **backbone's** features at its native width (768 for SwinV2-Tiny,
+1024 for Base),
 *not* the paper's ``z in R^384``. The projection to ``z`` is a trained layer
 belonging to :class:`~src.models.builder.DinoV2SwinV2Encoder`, and a
 freshly-initialised copy of it would project the features through random
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backbone-name",
-        default="swinv2_base_window16_256",
+        default="swinv2_tiny_window16_256",
         help="SwinV2 variant. Must match the checkpoint's architecture.",
     )
     parser.add_argument("--image-size", type=int, default=256)

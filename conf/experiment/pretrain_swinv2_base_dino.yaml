@@ -1,0 +1,57 @@
+# @package _global_
+#
+# Stage-1 CAPACITY CONTROL: the identical DINO recipe on SwinV2-Base.
+#
+#   python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_base_dino
+#   python scripts/launch.py pretrain --gpus 2 experiment=pretrain_swinv2_base_dino
+#
+# Inherits every hyperparameter from `pretrain_swinv2_dino` and changes exactly
+# two things: the trunk (27.58 M / 13.32 GFLOPs per view -> 86.89 M / 43.94) and
+# the two paths it writes to. Everything else -- ImageNet init, unfrozen trunk,
+# 2 global + 4 local crops, the 768->1024->1024->256->2048 head shape, 2,048
+# prototypes, 100 epochs, 10 warmup epochs, the derived LR, the teacher
+# schedules -- is inherited, so the Tiny/Base gap measures capacity and nothing
+# else.
+#
+# Note what does NOT need changing. Both variants emit an 8x8 final-stage token
+# grid at 256 px; only the channel width differs (768 vs 1024), and the Eq. 4
+# projection inside DinoV2SwinV2Encoder absorbs that, so stage 2 consumes either
+# checkpoint unmodified. `model.backbone.feature_dim` must move with the name --
+# `DINO.__init__` cross-checks it against the trunk's actual `num_features` and
+# refuses a mismatch rather than training a head onto the wrong width.
+#
+# Cost: ~3.3x the per-view FLOPs of the primary run. If batch 32 does not fit,
+# preserve the recipe by lowering the physical batch and letting the effective
+# batch follow it (accumulation stays 1, the LR re-derives itself):
+#
+#     ... experiment=pretrain_swinv2_base_dino \
+#         data.batch_size=16 experiment.training.effective_batch_size=16
+#
+# Measure first: scripts/bench_pretrain_step.py --backbone swinv2_base_window16_256 \
+#     --feature-dim 1024 --find-batch-size 8,16,24,32
+
+defaults:
+  - pretrain_swinv2_dino
+
+experiment:
+  name: "pretrain_swinv2_base_dino"
+
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_swinv2_base_dino"
+    # A DIFFERENT publication path. Writing the shared one would overwrite the
+    # encoder every stage-2 variant reads, and the whole comparison suite would
+    # silently switch trunks mid-table -- with `checkpoint_strict: false`
+    # swallowing the width mismatch as "missing keys" and one log line.
+    #
+    # To run stage 2 against this control, point the encoder at it explicitly:
+    #     python main.py finetune \
+    #         model.backbone.name=swinv2_base_window16_256 \
+    #         model.backbone.feature_dim=1024 \
+    #         model.backbone.checkpoint_path=<this path>/dino_pretrained_backbone.pth
+    # or export SEED_PRETRAIN_BACKBONE to the same file.
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_base_pretrained.pth"
+
+model:
+  backbone:
+    name: "swinv2_base_window16_256"
+    feature_dim: 1024

@@ -1,4 +1,9 @@
 from src.utils.training.attention import log_attention_maps
+from src.utils.training.budget import (
+    BACKWARD_MULTIPLIER,
+    StageOneBudget,
+    measure_gflops_per_view,
+)
 from src.utils.training.checkpoint import CheckpointManager, to_cpu_state_dict
 from src.utils.training.device import (
     AcceleratorReport,
@@ -63,6 +68,7 @@ from src.utils.training.tracker import ExperimentTracker
 
 __all__ = [
     "AcceleratorReport",
+    "BACKWARD_MULTIPLIER",
     "AmpConfig",
     "CheckpointManager",
     "DistributedContext",
@@ -71,6 +77,7 @@ __all__ = [
     "InterruptGuard",
     "PeriodicSaver",
     "ResumeState",
+    "StageOneBudget",
     "TeacherEmaUpdater",
     "TrainingProgress",
     "all_reduce_max",
@@ -101,6 +108,7 @@ __all__ = [
     "logsumexp_across_ranks",
     "main_process_first",
     "maybe_compile",
+    "measure_gflops_per_view",
     "reduce_metrics",
     "resolve_amp",
     "resolve_compile",

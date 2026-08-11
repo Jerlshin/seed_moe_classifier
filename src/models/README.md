@@ -15,7 +15,7 @@ plus the supervised baselines the revision compares against.
 The single place the paper's embedding width is realised:
 
 ```
-images ──SwinV2 trunk──▶ pooled [batch, 768 or 1024] ──projection──▶ z [batch, 384]
+images ──SwinV2 trunk──▶ pooled [batch, 768 (Tiny) or 1024 (Base)] ──projection──▶ z [batch, 384]
 ```
 
 No SwinV2 variant emits 384 channels (Tiny/Small: 768, Base: 1024), so a learned
@@ -148,8 +148,8 @@ gradients disabled and only ever moves by EMA (momentum 0.996, Table 1) — the
 trainer drives that with `lightly.models.utils.update_momentum`.
 
 `DINOHead` is `Linear → BatchNorm → GELU → … → Linear(bottleneck) → L2-normalize
-→ weight-normed Linear(65,536)`, matching Section 4's description. The final
+→ weight-normed Linear(out_dim)`, matching Section 4's description. The final
 layer's weight-norm gain is frozen, and its gradients are cancelled for the first
-epoch (`freeze_last_layer_epochs`) — that 65,536-wide layer is where a collapsing
+epoch (`freeze_last_layer_epochs`) — the prototype layer is where a collapsing
 run collapses first. `_set_weight_norm_gain` handles both PyTorch weight-norm
 APIs, since the legacy `weight_g` attribute moved under `parametrizations`.

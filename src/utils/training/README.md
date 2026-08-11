@@ -92,7 +92,7 @@ a run that dies mid-epoch — which is exactly when you most want the metrics.
 
 `log_metrics` drops non-scalar values silently, letting callers pass a mixed dict
 without filtering. `log_figure` writes a PNG to `<run_dir>/figures/`, pushes to
-both trackers, then closes the figure so a 300-epoch run does not accumulate
+both trackers, then closes the figure so a long run does not accumulate
 canvases.
 
 ## `checkpoint.py`

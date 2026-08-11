@@ -1,7 +1,7 @@
 # `tests/` — pytest suite
 
 ```bash
-python -m pytest tests/ -q             # all 419, ~30s
+python -m pytest tests/ -q             # all 458, ~35s
 python -m pytest tests/ -k arcface     # one topic
 python -m pytest tests/test_models.py  # one file
 ```

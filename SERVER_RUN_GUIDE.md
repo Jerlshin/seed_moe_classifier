@@ -140,8 +140,36 @@ from byte-identical weights, or the comparison table partly measures
 self-supervised initialisation noise instead of the architecture change under
 test.
 
-300 epochs at the paper's schedule. Budget for a multi-hour run on a single
-modern GPU.
+**100 epochs** from ImageNet-1k weights on SwinV2-Tiny (27.58 M, 13.32
+GFLOPs/view — both measured), at a physical batch of 32 with accumulation 1.
+Budget for a multi-hour run on a single modern GPU; the trainer prints a
+compute/parameter budget at startup and again at the end, with measured and
+estimated quantities labelled apart.
+
+Encoders are additionally kept at epochs **25, 50 and 100**
+(`dino_backbone_epoch_0025.pth` and friends, never pruned), so the question
+"did 100 epochs earn their cost over 25?" can be answered by pointing stage 2 at
+each in turn:
+
+```bash
+SEED_PRETRAIN_BACKBONE=$SEED_OUTPUT_DIR/pretrain_swinv2_dino/dino_backbone_epoch_0025.pth \
+    python main.py finetune
+```
+
+**Measure the batch before committing.** Physical batch is what Sinkhorn and
+KoLeo estimate from — accumulation averages gradients and buys those statistics
+nothing — so it is worth finding the largest that fits:
+
+```bash
+python scripts/bench_pretrain_step.py --find-batch-size 16,24,32,48,64
+```
+
+It runs the real micro-step at each candidate in a fresh subprocess (a failed
+attempt leaves the allocator fragmented, so reusing the process would understate
+every later candidate), reports peak VRAM and img/s per size, and names the
+largest that fits. Raise `data.batch_size` and
+`experiment.training.effective_batch_size` **together** so accumulation stays 1;
+the learning rate re-derives itself from the effective batch.
 
 **On two GPUs**, and on any platform that ends the session before the run does:
 
@@ -159,11 +187,19 @@ all six views of a sample stay on the rank that owns it, because the loss pairs 
 student view against the teacher's output for that same image.
 
 The **effective batch does not change**. `data.batch_size` is per-rank, and
-`experiment.training.effective_batch_size` (64) derives the accumulation count
-from it and the world size — 1 GPU at `16 x 4` and 2 at `16 x 2` are the same 64
+`experiment.training.effective_batch_size` (32) derives the accumulation count
+from it and the world size — 1 GPU at `32 x 1` and 2 at `16 x 1` are the same 32
 images per optimizer step. A mismatch that does not divide exactly is refused
-rather than rounded. Holding the per-rank micro-batch fixed is also what keeps
-Sinkhorn and KoLeo computing the same function they compute on one GPU.
+rather than rounded.
+
+Note the trade that splitting makes, though: `16 x 2` keeps the *gradient*
+identical to `32 x 1` and halves what Sinkhorn and KoLeo estimate from, since
+both are computed per micro-batch. If the second card has the memory, the
+statistically better use of it is `data.batch_size=32` on both ranks with
+`effective_batch_size=64` — a different, larger run — or
+`model.loss.distributed_sinkhorn=true`, which normalises over the concatenated
+global batch and restores the 32-image estimate exactly (a different objective
+from the single-GPU one, hence opt-in).
 
 `resume=auto` continues from the newest valid checkpoint and starts fresh when
 there is none, so the **identical command line** works for the first launch and
@@ -191,7 +227,7 @@ What adapts by itself:
 
 | Resolved | To | Why |
 | --- | --- | --- |
-| `amp: auto` | **fp16 + `GradScaler`** | `sm_75` has no hardware bf16. The Sinkhorn normaliser, the 8,192-way log-softmax and the KoLeo distances are pinned to fp32 inside the autocast region, which is what makes fp16 safe here. |
+| `amp: auto` | **fp16 + `GradScaler`** | `sm_75` has no hardware bf16. The Sinkhorn normaliser, the 2,048-way prototype log-softmax and the KoLeo distances are pinned to fp32 inside the autocast region, which is what makes fp16 safe here. |
 | `compile.enabled: auto` | on (Triton supports `sm_75`) | Costs a few minutes of graph capture on the first step. Set `false` if a short session cannot amortise it. |
 | `data.num_workers: auto` | 2 per rank | Per-process setting; the literal 8 would put 16 augmentation workers on 4 vCPUs. |
 | SDPA backend | memory-efficient (no flash below `sm_80`) | Still avoids materialising the `[B*nW, heads, N, N]` matrices, which is the whole point of the rewrite. |
@@ -199,16 +235,19 @@ What adapts by itself:
 What does not adapt, and why these two flags matter: `max_runtime_minutes` stops
 the run *cleanly with a complete checkpoint* before the platform kills it — more
 reliable than being signalled, since not every platform signals first — and
-`resume_every_minutes` bounds the worst case to minutes rather than to
-`save_interval: 50` **epochs**, which on a 300-epoch run is longer than the whole
-session.
+`resume_every_minutes` bounds the worst case to minutes rather than to an epoch
+interval, which on a session-limited platform can exceed the whole session.
 
-Measure the batch geometry before committing:
+Measure the batch geometry before committing. On 16 GB Turing cards the
+configured batch of 32 is the thing to check first:
 
 ```bash
-python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 16 --accum 2
-python scripts/bench_pretrain_step.py --batch-size 8 --accum 4    # if 16 OOMs
+python scripts/bench_pretrain_step.py --find-batch-size 8,16,24,32
+python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 16
 ```
+
+If 32 does not fit, lower both together (`data.batch_size=16
+experiment.training.effective_batch_size=16`) rather than raising accumulation.
 
 ### 3.4 Stage 2 — single finetune run (smoke-test the head before the full suite)
 
@@ -460,7 +499,7 @@ Key points:
   warning, not a crash.
 - Defaults are tuned for a 16 GB disk: no optimizer-state checkpoints, no
   teacher weights saved, `keep_last_n_checkpoints: 1`, histograms off. A
-  300-epoch pretrain run with those turned on is how the disk fills — leave
+  100-epoch pretrain run with those turned on is how the disk fills — leave
   them off unless actively debugging.
 
 ---

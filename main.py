@@ -67,7 +67,16 @@ SMOKE_OVERRIDES = [
 LAUNCHER_STAGES = ("pretrain", "finetune", "ablation")
 
 COMMANDS["smoke"] = [
-    [*PRETRAIN, *SMOKE_OVERRIDES],
+    [
+        *PRETRAIN,
+        *SMOKE_OVERRIDES,
+        # `effective_batch_size` is the authority, so at `data.batch_size=2` it
+        # would otherwise derive 16 accumulation steps for a 2-batch run —
+        # harmless, but it makes the smoke test exercise a schedule no real run
+        # uses. Pin the effective batch to the micro-batch instead, which keeps
+        # accumulation at 1 and the derived learning rate meaningful.
+        "experiment.training.effective_batch_size=2",
+    ],
     [
         *FINETUNE,
         *SMOKE_OVERRIDES,

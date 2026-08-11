@@ -179,7 +179,7 @@ mixed dict of metrics and metadata without filtering first.
 Keeps named artifacts ("best", "final") indefinitely and prunes rolling interval
 checkpoints by filename prefix to `keep_last_n`. The defaults across this repo
 (`keep_last_n_checkpoints: 1`, no optimizer state, no teacher weights) are tuned
-for a 16 GB rented disk; a 300-epoch run with them turned off is how the disk
+for a 16 GB rented disk; a long run with them turned off is how the disk
 fills.
 
 ### `select_device`

@@ -46,8 +46,18 @@ steps.
 
 A partially collapsed run has a perfectly plausible-looking loss curve, so the
 loss figure will not reveal any of this. :meth:`CustomDINOLoss.collapse_metrics`
-reports the diagnostics that will: teacher output entropy and the KL between the
-teacher's mean assignment and uniform.
+reports the diagnostics that will: teacher output entropy, the KL between the
+teacher's mean assignment and uniform, and how many prototypes the batch
+effectively used.
+
+**Entropy is a conditional quantity, not a score.** It scales with ``log K``, so
+it is not comparable across prototype counts, and under Sinkhorn centering it
+cannot fall below ``log(K / B_teacher)`` no matter what the model does -- 3.47 of
+a 7.62 maximum at the configured ``K = 2048`` and 64 teacher views. The metrics
+therefore ship with their own bounds (:meth:`CustomDINOLoss.entropy_bounds`), a
+normalised form, and ``K`` and ``B_teacher`` alongside, so a number in a log line
+can be read without the config next to it. Nothing here labels high entropy
+"good" or low entropy "collapse"; both readings are wrong at the edges.
 
 Two things this module does *not* do any more
 ---------------------------------------------
@@ -55,9 +65,10 @@ Two things this module does *not* do any more
 **It does not recompute the student's log-softmax twelve times.** Eq. 1 pairs 2
 teacher views against 6 student views. Written as a double loop, the inner
 ``F.log_softmax(student_logits)`` is evaluated once per *pair*, so each student
-view's softmax over 8,192 prototypes is computed twice and back-propagated twice.
+view's softmax over ``out_dim`` prototypes is computed twice and back-propagated
+twice.
 :meth:`CustomDINOLoss.compute_dino_loss` now takes one log-softmax over the whole
-``[6B, 8192]`` block and contracts every pair in a single ``einsum``. Same
+``[6B, out_dim]`` block and contracts every pair in a single ``einsum``. Same
 arithmetic, ~6x less of it, and one kernel where there were ~36.
 
 **It does not synchronise with the GPU on every step.** The diagnostics used to
@@ -92,7 +103,7 @@ def _at_least_float32(tensor: torch.Tensor) -> torch.Tensor:
     """Promote half precision to fp32, and leave anything wider alone.
 
     Every numerically delicate step in this module -- the Sinkhorn log-space
-    normaliser, the log-softmax over 8,192 prototypes, the KoLeo pairwise
+    normaliser, the log-softmax over the prototypes, the KoLeo pairwise
     distances -- needs at least fp32, and under autocast the inputs arrive as
     bf16 or fp16. A bare ``.float()`` would do that, but it would also silently
     *downcast* an fp64 input, which is exactly what a numerical test written in
@@ -124,7 +135,7 @@ def koleo_regularizer(features: torch.Tensor, epsilon: float = 1e-8) -> torch.Te
 
     Args:
         features: ``[batch, dim]``. L2-normalised internally, so pass the
-            bottleneck embedding rather than the 65k-wide prototype logits.
+            bottleneck embedding rather than the wide prototype logits.
             Always evaluated in fp32: under fp16 autocast the squared distances
             of near-duplicate crops underflow to exactly zero.
     """
@@ -466,7 +477,7 @@ class CustomDINOLoss(nn.Module):
         followed by a masked mean over the ``T x V`` pairs. Identical value and
         identical gradient to the loop it replaces (``tests/test_losses.py``
         checks it against a hand-written double loop), but the student's
-        log-softmax over 8,192 prototypes is evaluated once per view instead of
+        log-softmax over the prototypes is evaluated once per view instead of
         once per pair.
         """
         student_ids = list(student_view_ids) if student_view_ids is not None else list(range(self.num_crops))
@@ -493,7 +504,7 @@ class CustomDINOLoss(nn.Module):
         batch = student_output.shape[0] // self.num_crops
 
         # fp32 throughout: `student_temp` is 0.1, so the logits are multiplied by
-        # 10 before a softmax over 8,192 classes. Autocast already promotes
+        # 10 before a softmax over `out_dim` classes. Autocast already promotes
         # log_softmax, but the division ahead of it happens in whatever dtype
         # arrives, and fp16 has ~3 decimal digits to lose there.
         student_log_probs = F.log_softmax(
@@ -520,31 +531,117 @@ class CustomDINOLoss(nn.Module):
             self._metric_scalars["cross_view_terms"] = float(loss_terms)
         return (pair_losses * mask).sum() / loss_terms
 
+    def entropy_bounds(self, teacher_batch: int) -> tuple[float, float]:
+        """``(H_min, H_max)`` for one teacher row, given the batch it came from.
+
+        Entropy is **not** interpretable on its own, and the reason is structural
+        rather than statistical. ``H_max = log K`` is the usual ceiling. The floor
+        is the part that gets misread: an *exactly* doubly-stochastic assignment
+        gives every prototype column ``B_teacher / K`` of the mass, so no single
+        row (mass 1) can concentrate on fewer than ``K / B_teacher`` prototypes:
+
+            H_min = log(K / B_teacher)     [sinkhorn, B_teacher < K]
+
+        At ``K = 2048`` and ``2 x 32 = 64`` teacher views that is **3.47 against a
+        7.62 maximum** -- nearly half the nominal range is structurally
+        unreachable. A run reporting ``H = 3.6`` there is close to the sharpest
+        the normaliser permits, while the same 3.6 read against ``[0, log K]``
+        looks like comfortable headroom. Under ``centering="ema"`` nothing
+        constrains the rows and the floor is 0.
+
+        **The floor is a reference, not a guarantee, at the shipped iteration
+        count.** ``sinkhorn_iterations: 3`` does not converge: measured on random
+        logits at ``K = 128``, ``B = 16``, the prototype column masses after 3
+        iterations span 0.071 to 0.333 around a 0.125 target, and the observed
+        entropy sits ~4 % *below* ``log(K / B_teacher)``. It approaches the bound
+        from below as iterations rise and crosses it once the assignment is
+        genuinely doubly stochastic (~200 iterations on that example). So read
+        ``H_min`` as "where a converged Sinkhorn would floor this", expect the
+        measured ``H`` to sit slightly under it, and treat a *large* gap -- not a
+        small one -- as the signal. ``tests/test_losses.py`` pins both halves of
+        this behaviour so the caveat cannot quietly stop being true.
+
+        Raising the physical batch lowers the floor (more prototypes reachable
+        per row) and lowering ``out_dim`` raises the normalised entropy; the two
+        move together, which is why they were changed together.
+        """
+        prototypes = int(self.center.shape[-1])
+        maximum = float(np.log(prototypes))
+        if self.centering != "sinkhorn" or teacher_batch <= 0 or teacher_batch >= prototypes:
+            return 0.0, maximum
+        return float(np.log(prototypes / teacher_batch)), maximum
+
     @torch.no_grad()
     def collapse_metrics(self, teacher_probs: torch.Tensor) -> dict[str, torch.Tensor]:
         """Diagnostics that reveal collapse when the loss curve does not.
 
-        ``teacher_entropy`` falling toward 0 means the targets have sharpened to
-        one-hot; ``prototype_kl_to_uniform`` rising means the batch is using a
-        shrinking subset of the prototypes. Either alone is the signature the
-        loss curve hides.
+        None of these is good or bad on its own, and the logging deliberately
+        does not say which direction is which. What each one *is*:
 
-        Returns **device tensors**, not floats. Converting here would put a
-        ``cudaStreamSynchronize`` in the middle of every forward pass, three
-        times over, to produce numbers that get logged once in ten steps;
-        :attr:`last_metrics` does the conversion when a caller actually wants
-        them. ``teacher_entropy_max`` stays a Python float because it depends
-        only on the prototype count.
+        ``teacher_entropy`` (``H``)
+            Mean entropy of a teacher row, in nats. Compare it against
+            ``teacher_entropy_min`` and ``_max`` from :meth:`entropy_bounds`, not
+            against zero -- the floor is a property of the centering and the
+            batch, not of the model. Note that ``H`` sitting a few percent
+            *below* ``teacher_entropy_min`` is expected at
+            ``sinkhorn_iterations: 3``; see :meth:`entropy_bounds`.
+        ``teacher_entropy_normalized``
+            ``H / log K``. Comparable across prototype counts, which a bare ``H``
+            is not: halving ``out_dim`` moves ``H`` by ``log 2`` for free.
+        ``prototype_kl_to_uniform``
+            KL of the batch's mean assignment from uniform. Rising means the
+            batch is concentrating on a shrinking subset of prototypes -- a
+            different failure from per-row sharpening, and the one Sinkhorn is
+            supposed to prevent.
+        ``prototype_perplexity`` / ``prototype_utilization``
+            ``exp(H(marginal))`` and that divided by ``K``: the effective number
+            of prototypes the batch actually used, and its share of the total.
+            More directly readable than the KL, and defined for any centering
+            mode. Note the ceiling is ``min(K, ...)`` in principle but is reached
+            in practice only when the marginal is flat.
+        ``prototype_dim`` / ``teacher_batch_size``
+            ``K`` and ``B_teacher``, logged as metrics because every number above
+            is conditional on them and a run's own artifacts should not require
+            the config to interpret.
+
+        Returns **device tensors** for the computed quantities. Converting here
+        would put a ``cudaStreamSynchronize`` in the middle of every forward
+        pass to produce numbers logged once in ten steps; :attr:`last_metrics`
+        does the conversion when a caller actually wants them. The bounds and
+        counts are Python floats -- they depend only on shapes.
+
+        Cost: two extra reductions over an already-materialised ``[B, K]`` tensor
+        (a mean and a log-sum), on logging steps only. Nothing here is per-step.
         """
         probs = _at_least_float32(teacher_probs).clamp_min(1e-12)
+        prototypes = probs.shape[-1]
+        teacher_batch = int(probs.shape[0])
         entropy = (-probs * probs.log()).sum(dim=-1).mean()
         marginal = probs.mean(dim=0)
         uniform = 1.0 / marginal.numel()
         kl_uniform = (marginal * (marginal / uniform).log()).sum()
-        self._metric_scalars["teacher_entropy_max"] = float(np.log(probs.shape[-1]))
+        # Effective prototypes in use: the perplexity of the mean assignment.
+        # Robust in a way a threshold count is not -- no cutoff to choose, and it
+        # degrades smoothly rather than stepping as mass crosses a boundary.
+        marginal_entropy = -(marginal * marginal.log()).sum()
+        perplexity = marginal_entropy.exp()
+
+        maximum = float(np.log(prototypes))
+        minimum, _ = self.entropy_bounds(teacher_batch)
+        self._metric_scalars.update(
+            {
+                "teacher_entropy_max": maximum,
+                "teacher_entropy_min": minimum,
+                "prototype_dim": float(prototypes),
+                "teacher_batch_size": float(teacher_batch),
+            }
+        )
         return {
             "teacher_entropy": entropy,
+            "teacher_entropy_normalized": entropy / maximum if maximum > 0 else entropy,
             "prototype_kl_to_uniform": kl_uniform,
+            "prototype_perplexity": perplexity,
+            "prototype_utilization": perplexity / float(prototypes),
         }
 
     @torch.no_grad()

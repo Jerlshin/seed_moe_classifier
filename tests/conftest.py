@@ -61,9 +61,43 @@ REVISED_TEACHER_TEMP = 0.07
 SUBMITTED_WARMUP_EPOCHS = 5
 REVISED_WARMUP_EPOCHS = 30
 SUBMITTED_DINO_OUT_DIM = 65536
-REVISED_DINO_OUT_DIM = 8192
+#: The first revision's prototype count. Kept so a test can say which revision
+#: it means: 8,192 was chosen against a batch of 16, and the current 2,048 is
+#: the value that follows from raising the physical batch and reading Sinkhorn's
+#: per-prototype evidence (B_teacher / K) as the quantity that matters.
+FIRST_REVISION_DINO_OUT_DIM = 8192
+REVISED_DINO_OUT_DIM = 2048
 SUBMITTED_CENTER_MOMENTUM = 0.9
 REVISED_CENTER_MOMENTUM = 0.99
+
+# Stage-1 backbone and recipe, second revision. The submitted trunk was
+# SwinV2-Base at random initialisation for 300 epochs; the revision starts from
+# ImageNet-1k on SwinV2-Tiny for 100. All four numbers below were MEASURED from
+# timm rather than quoted, and `test_models.py` re-measures them.
+SUBMITTED_BACKBONE = "swinv2_base_window16_256"
+REVISED_BACKBONE = "swinv2_tiny_window16_256"
+SUBMITTED_BACKBONE_FEATURE_DIM = 1024
+REVISED_BACKBONE_FEATURE_DIM = 768
+REVISED_BACKBONE_PARAMS_M = 27.58      # +-0.01, swinv2_tiny_window16_256
+REVISED_BACKBONE_GFLOPS_PER_VIEW = 13.32   # forward, 1 view at 256 px
+SUBMITTED_EPOCHS = 300
+REVISED_EPOCHS = 100
+REVISED_LR_WARMUP_EPOCHS = 10
+REVISED_DROP_PATH_RATE = 0.1
+
+# Learning rate. Section 6.1's 0.0005 is DINO's rate at ITS reference batch of
+# 256; the revision derives the run's rate from the effective batch by the
+# linear scaling rule, which at 32 gives 6.25e-05.
+LR_BASE = 0.0005
+LR_REFERENCE_BATCH = 256
+REVISED_PHYSICAL_BATCH = 32
+REVISED_EFFECTIVE_BATCH = 32
+REVISED_LEARNING_RATE = LR_BASE * REVISED_EFFECTIVE_BATCH / LR_REFERENCE_BATCH
+
+# DINO projection head, resized with the trunk: 768 -> 1024 -> 1024 -> 256 -> 2048.
+REVISED_DINO_HIDDEN_DIM = 1024
+REVISED_DINO_BOTTLENECK_DIM = 256
+REVISED_DINO_HEAD_LAYERS = 3
 
 # AdaCos fixed scale for C = 27: sqrt(2) * ln 26. The submitted 30.0 is
 # ArcFace's face-recognition value and is 6.5x too large here.

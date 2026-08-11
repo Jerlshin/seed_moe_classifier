@@ -70,7 +70,7 @@ Logged: loss, learning rate, current teacher temperature (so the Eq. 2 schedule
 is visible in the run), gradient norms, and a loss curve figure (paper Fig. 6).
 
 `publish_shared_backbone()` failing is a warning, not an error — the per-stage
-copy is already safely on disk, and discarding a completed 300-epoch pretraining
+copy is already safely on disk, and discarding a completed 100-epoch pretraining
 run over a file-copy failure would be indefensible.
 
 ### Running it on more than one GPU
@@ -131,7 +131,7 @@ later.
 `build_optimizer()` takes a list of modules and de-duplicates parameters by
 identity. The encoder must be included even in the frozen recipe, because it owns
 the Eq. 4 projection to `z`, which is trainable. Omitting it would silently
-freeze the one layer adapting 1024 backbone channels to the head's 384 — the head
+freeze the one layer adapting the backbone's 768 channels to the head's 384 — the head
 would train against a random projection, and nothing would report an error.
 
 ### Epoch loop

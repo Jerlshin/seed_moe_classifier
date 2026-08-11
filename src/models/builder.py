@@ -637,6 +637,16 @@ class BackboneFeatureExtractor(nn.Module):
         checkpoint_path: Optional pretrained weights to load.
         pretrained: Ask timm for its own pretrained weights.
         dynamic_img_size: timm flag; see the caveat above.
+        drop_path_rate: Stochastic depth, timm's own mechanism. **0.0 here**,
+            and stage 2 leaves it there: the trunk is frozen by default, so
+            there is nothing to regularise, and every variant in the comparison
+            table must see the same kernels rather than an extra source of
+            sampling noise. It is plumbed through only because
+            ``model.backbone.drop_path_rate`` exists in the shared config group
+            (stage 1 sets 0.1) and a key that silently does nothing in one stage
+            is a trap. Passing 0.0 to ``timm.create_model`` is identical to not
+            passing it, so the stage-2 model is unchanged. Meaningful only if
+            you also set ``freeze: false`` to fine-tune the trunk.
         strict: Strict ``load_state_dict``.
         freeze: Disable gradients and force eval mode.
     """
@@ -649,6 +659,7 @@ class BackboneFeatureExtractor(nn.Module):
         dynamic_img_size: bool = True,
         strict: bool = False,
         freeze: bool = True,
+        drop_path_rate: float = 0.0,
     ):
         super().__init__()
         self.model_name = validate_swinv2_name(model_name)
@@ -659,6 +670,7 @@ class BackboneFeatureExtractor(nn.Module):
             pretrained=pretrained,
             num_classes=0,
             dynamic_img_size=dynamic_img_size,
+            drop_path_rate=float(drop_path_rate),
         )
 
         self.load_report: dict[str, list[str]] | None = None
@@ -778,6 +790,8 @@ class DinoV2SwinV2Encoder(nn.Module):
         dynamic_img_size: timm flag; see :class:`BackboneFeatureExtractor`.
         strict: Strict ``load_state_dict``.
         freeze_backbone: Freeze the SwinV2 trunk.
+        drop_path_rate: Stochastic depth on the trunk; see
+            :class:`BackboneFeatureExtractor`. 0.0 in stage 2.
         projection_hidden_dim: Optional hidden width inside the projection.
         projection_dropout: Dropout inside the projection's hidden variant.
         token_mode: ``"grid"`` to emit the token grid, ``"pooled"`` for a vector.
@@ -792,6 +806,7 @@ class DinoV2SwinV2Encoder(nn.Module):
         dynamic_img_size: bool = True,
         strict: bool = False,
         freeze_backbone: bool = True,
+        drop_path_rate: float = 0.0,
         projection_hidden_dim: int | None = None,
         projection_dropout: float = 0.0,
         token_mode: str = "grid",
@@ -806,6 +821,7 @@ class DinoV2SwinV2Encoder(nn.Module):
             dynamic_img_size=dynamic_img_size,
             strict=strict,
             freeze=freeze_backbone,
+            drop_path_rate=drop_path_rate,
         )
         backbone_dim = self.encoder.feature_dim
         if backbone_dim is None:
@@ -922,6 +938,7 @@ def build_encoder(
         dynamic_img_size=bool(getattr(backbone_cfg, "dynamic_img_size", True)),
         strict=bool(getattr(backbone_cfg, "checkpoint_strict", False)),
         freeze_backbone=bool(getattr(backbone_cfg, "freeze", True)),
+        drop_path_rate=float(getattr(backbone_cfg, "drop_path_rate", 0.0) or 0.0),
         projection_hidden_dim=getattr(backbone_cfg, "projection_hidden_dim", None),
         projection_dropout=float(getattr(backbone_cfg, "projection_dropout", 0.0) or 0.0),
         token_mode=str(token_mode),
@@ -942,4 +959,5 @@ def build_feature_extractor(cfg: Any) -> BackboneFeatureExtractor:
         dynamic_img_size=bool(getattr(cfg, "dynamic_img_size", True)),
         strict=bool(getattr(cfg, "checkpoint_strict", False)),
         freeze=bool(getattr(cfg, "freeze", True)),
+        drop_path_rate=float(getattr(cfg, "drop_path_rate", 0.0) or 0.0),
     )

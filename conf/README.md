@@ -12,11 +12,15 @@ conf/
     loss/      arcface_kl.yaml       # combined hierarchical objective
                dino.yaml             # DINO self-distillation
                flat_cce.yaml         # plain CCE at both hierarchy levels
-  experiment/  pretrain_swinv2_dino.yaml
+  experiment/  pretrain_swinv2_dino.yaml       # stage 1, primary (Tiny, ImageNet, unfrozen)
+               pretrain_swinv2_base_dino.yaml  # stage 1, capacity control (Base)
                finetune_hierarchical_moe.yaml
+               control_imagenet_frozen.yaml    # ImageNet + frozen trunk, no stage 1
                ablation_flat_classifier.yaml
                baseline_resnet50.yaml
                baseline_swin_tiny.yaml
+               baseline_swinv2_supervised.yaml
+               baseline_linear_probe.yaml
                baseline_hierarchical_cce.yaml
   tracking/    default.yaml          # W&B + TensorBoard + jsonl
 ```
@@ -132,11 +136,11 @@ its source. A failure there means the configs have drifted from the paper.
 | `experiment.training.epochs` (pretrain) | 300 | Table 1 |
 | `experiment.training.clip_grad` | 3.0 | Table 1 |
 | `experiment.training.momentum_teacher` | 0.996 | Table 1 |
-| `experiment.training.learning_rate` (pretrain) | 0.0005 | Section 6.1 |
+| `experiment.training.lr_base` (pretrain) | 0.0005, at a reference batch of 256 | Section 6.1 |
 | `model.loss.warmup_teacher_temp` → `teacher_temp` | 0.02 → 0.04 | Table 1 |
 | `model.loss.warmup_teacher_temp_epochs` | 5 | Table 1 |
 | `model.loss.center_momentum` | 0.9 | Eq. 3 |
-| `model.head.out_dim` (DINO) | 65,536 | Table 1 |
+| `model.head.out_dim` (DINO) | 65,536 (revised to 2,048) | Table 1 |
 | `data.augmentation` crops | 2 global + 4 local | Table 1 |
 | crop scales | (0.4, 1.0) / (0.05, 0.4) | Table 1 |
 | `model.head.embed_dim` | 384 | Eq. 4 |

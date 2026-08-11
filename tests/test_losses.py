@@ -25,6 +25,7 @@ from src.losses.moe import (
     switch_load_balancing_loss,
 )
 from tests.conftest import (
+    REVISED_DINO_OUT_DIM,
     SUBMITTED_CENTER_MOMENTUM,
     PAPER_EMBED_DIM,
     PAPER_NUM_EXPERTS,
@@ -429,6 +430,213 @@ def test_dino_loss_lower_bound_is_the_teacher_entropy():
     entropy = -(probs * probs.log()).sum(dim=-1).mean()
     assert value.item() == pytest.approx(entropy.item(), abs=1e-5)
     assert value.item() <= math.log(8) + 1e-5
+
+
+# ------------------------------------------ prototype entropy diagnostics
+#
+# These are DIAGNOSTICS, not scores. Every assertion below is about the metric
+# being interpretable -- carrying its own bounds and its own conditioning -- and
+# never about a direction being good. High entropy is not health and low entropy
+# is not collapse; both readings are wrong at the edges the bounds describe.
+
+
+def entropy_loss(out_dim: int, centering: str = "sinkhorn") -> CustomDINOLoss:
+    return CustomDINOLoss(
+        out_dim=out_dim, num_crops=6, warmup_teacher_temp=0.04, teacher_temp=0.07,
+        warmup_teacher_temp_epochs=30, num_epochs=100, centering=centering,
+    )
+
+
+def test_entropy_metrics_carry_their_own_bounds_and_conditioning():
+    """A logged H is meaningless without K and B_teacher; both are logged."""
+    loss_fn = entropy_loss(REVISED_DINO_OUT_DIM)
+    teacher_batch = 64  # 2 global crops x physical batch 32
+    probs = torch.full((teacher_batch, REVISED_DINO_OUT_DIM), 1.0 / REVISED_DINO_OUT_DIM)
+
+    metrics = loss_fn.collapse_metrics(probs)
+    scalars = loss_fn._metric_scalars
+
+    assert scalars["prototype_dim"] == REVISED_DINO_OUT_DIM
+    assert scalars["teacher_batch_size"] == teacher_batch
+    assert scalars["teacher_entropy_max"] == pytest.approx(math.log(REVISED_DINO_OUT_DIM))
+    # A uniform teacher sits exactly at the ceiling.
+    assert float(metrics["teacher_entropy"]) == pytest.approx(math.log(REVISED_DINO_OUT_DIM), abs=1e-4)
+    assert float(metrics["teacher_entropy_normalized"]) == pytest.approx(1.0, abs=1e-5)
+    assert float(metrics["prototype_kl_to_uniform"]) == pytest.approx(0.0, abs=1e-6)
+    assert float(metrics["prototype_utilization"]) == pytest.approx(1.0, abs=1e-4)
+
+
+def test_the_sinkhorn_entropy_floor_is_structural_not_a_model_property():
+    """Doubly-stochastic assignment forbids H below log(K / B_teacher).
+
+    The number this pins is the reason the metric ships with a floor: at the
+    configured K = 2048 and 64 teacher views, 46 % of the [0, log K] range is
+    unreachable, so a run reporting H = 3.6 is near the sharpest the normaliser
+    allows while looking mid-range to a naive reading.
+    """
+    loss_fn = entropy_loss(REVISED_DINO_OUT_DIM)
+    minimum, maximum = loss_fn.entropy_bounds(teacher_batch=64)
+
+    assert maximum == pytest.approx(math.log(REVISED_DINO_OUT_DIM))
+    assert minimum == pytest.approx(math.log(REVISED_DINO_OUT_DIM / 64))
+    assert minimum == pytest.approx(math.log(32))
+    assert 0 < minimum < maximum
+
+    # Raising the physical batch lowers the floor: more prototypes are reachable
+    # per row, so the two are one decision.
+    tighter, _ = loss_fn.entropy_bounds(teacher_batch=32)
+    looser, _ = loss_fn.entropy_bounds(teacher_batch=128)
+    assert looser < minimum < tighter
+
+
+def test_the_floor_is_zero_without_the_doubly_stochastic_constraint():
+    """EMA centering constrains no row, so nothing forbids a one-hot teacher."""
+    loss_fn = entropy_loss(REVISED_DINO_OUT_DIM, centering="ema")
+    minimum, maximum = loss_fn.entropy_bounds(teacher_batch=64)
+    assert minimum == 0.0
+    assert maximum == pytest.approx(math.log(REVISED_DINO_OUT_DIM))
+
+    # ... and a batch at least as large as K removes the constraint either way.
+    assert entropy_loss(64).entropy_bounds(teacher_batch=64)[0] == 0.0
+
+
+def test_the_floor_is_the_converged_limit_and_three_iterations_sit_just_under_it():
+    """The caveat, measured. `sinkhorn_iterations: 3` does not reach the bound.
+
+    The floor assumes an *exactly* doubly-stochastic assignment. Three
+    iterations do not converge -- the prototype column masses here span 0.071 to
+    0.333 around a 0.125 target -- so the observed entropy lands slightly below
+    ``log(K / B_teacher)`` and approaches it from underneath as iterations rise.
+    Documented rather than silently rounded away, because "H is below the floor"
+    would otherwise read as a bug in the metric.
+    """
+    from src.losses.dino import sinkhorn_knopp
+
+    torch.manual_seed(0)
+    prototypes, teacher_batch = 128, 16
+    loss_fn = entropy_loss(prototypes)
+    minimum, maximum = loss_fn.entropy_bounds(teacher_batch)
+    logits = torch.randn(teacher_batch, prototypes) * 10.0
+
+    def entropy_at(iterations: int) -> float:
+        assignment = sinkhorn_knopp(logits, temperature=0.04, iterations=iterations)
+        return float(loss_fn.collapse_metrics(assignment)["teacher_entropy"])
+
+    shipped = entropy_at(3)
+    assert shipped <= maximum
+    # Close to the floor, and just under it -- within 5 %.
+    assert shipped == pytest.approx(minimum, rel=0.05)
+    assert shipped < minimum
+
+    # Converging the normaliser lifts the entropy monotonically past the bound,
+    # which is what makes the bound the right reference to quote.
+    assert entropy_at(50) > shipped
+    assert entropy_at(400) > minimum
+
+    # The premise the floor rests on -- uniform prototype marginals -- is what
+    # iterating buys, and the loop ends on a ROW normalisation, so the columns
+    # are always one step stale and never land exactly on B/K. Assert the spread
+    # collapsing rather than a tolerance it does not reach: at 3 iterations the
+    # column masses span a factor of ~4.7, at 400 a factor of ~1.15.
+    def column_spread(iterations: int) -> float:
+        column_mass = sinkhorn_knopp(logits, temperature=0.04, iterations=iterations).sum(dim=0)
+        return float(column_mass.max() / column_mass.min())
+
+    assert column_spread(3) > 4.0
+    assert column_spread(50) < column_spread(3)
+    assert column_spread(400) < 1.5
+
+    # Rows, by contrast, are exact at every iteration count -- the final rescale
+    # guarantees it, and the loss contracts against them as a distribution.
+    for iterations in (3, 400):
+        rows = sinkhorn_knopp(logits, temperature=0.04, iterations=iterations).sum(dim=1)
+        assert torch.allclose(rows, torch.ones_like(rows), atol=1e-5)
+
+
+def test_normalised_entropy_is_comparable_across_prototype_counts():
+    """A bare H moves by log 2 when out_dim halves, for no change in behaviour."""
+    small, large = entropy_loss(1024), entropy_loss(2048)
+    uniform_small = torch.full((32, 1024), 1.0 / 1024)
+    uniform_large = torch.full((32, 2048), 1.0 / 2048)
+
+    raw_small = float(small.collapse_metrics(uniform_small)["teacher_entropy"])
+    raw_large = float(large.collapse_metrics(uniform_large)["teacher_entropy"])
+    assert raw_large - raw_small == pytest.approx(math.log(2), abs=1e-4)
+
+    normalised_small = float(small.collapse_metrics(uniform_small)["teacher_entropy_normalized"])
+    normalised_large = float(large.collapse_metrics(uniform_large)["teacher_entropy_normalized"])
+    assert normalised_small == pytest.approx(normalised_large, abs=1e-5)
+
+
+def test_prototype_utilization_counts_the_prototypes_actually_used():
+    """Perplexity of the marginal: no threshold to choose, and it degrades smoothly."""
+    prototypes = 256
+    loss_fn = entropy_loss(prototypes)
+
+    # Exactly 16 prototypes carrying all the mass, uniformly.
+    used = 16
+    probs = torch.zeros(32, prototypes)
+    probs[:, :used] = 1.0 / used
+    metrics = loss_fn.collapse_metrics(probs)
+    assert float(metrics["prototype_perplexity"]) == pytest.approx(used, rel=1e-3)
+    assert float(metrics["prototype_utilization"]) == pytest.approx(used / prototypes, rel=1e-3)
+
+    # A single prototype: utilisation collapses to 1/K rather than to 0, which is
+    # the honest floor -- one prototype IS being used.
+    collapsed = torch.zeros(32, prototypes)
+    collapsed[:, 0] = 1.0
+    collapsed_metrics = loss_fn.collapse_metrics(collapsed)
+    assert float(collapsed_metrics["prototype_perplexity"]) == pytest.approx(1.0, rel=1e-3)
+    assert float(collapsed_metrics["teacher_entropy"]) == pytest.approx(0.0, abs=1e-4)
+    assert float(collapsed_metrics["prototype_kl_to_uniform"]) == pytest.approx(
+        math.log(prototypes), rel=1e-4
+    )
+
+
+def test_entropy_metrics_hold_no_hidden_prototype_count():
+    """Every bound must follow out_dim, not a constant left over from 8,192."""
+    for prototypes in (64, 512, REVISED_DINO_OUT_DIM, 8192):
+        loss_fn = entropy_loss(prototypes)
+        probs = torch.full((8, prototypes), 1.0 / prototypes)
+        loss_fn.collapse_metrics(probs)
+        assert loss_fn._metric_scalars["prototype_dim"] == prototypes
+        assert loss_fn._metric_scalars["teacher_entropy_max"] == pytest.approx(
+            math.log(prototypes)
+        )
+        assert loss_fn._metric_scalars["teacher_entropy_min"] == pytest.approx(
+            math.log(prototypes / 8)
+        )
+
+
+def test_diagnostics_stay_off_the_synchronisation_path_until_read():
+    """Device tensors until `last_metrics` asks; gated on `metrics_enabled`."""
+    loss_fn = entropy_loss(REVISED_DINO_OUT_DIM)
+    returned = loss_fn.collapse_metrics(torch.full((8, REVISED_DINO_OUT_DIM), 1.0 / REVISED_DINO_OUT_DIM))
+    assert all(isinstance(value, torch.Tensor) for value in returned.values())
+
+    loss_fn.metrics_enabled = False
+    loss_fn._metric_tensors.clear()
+    student = torch.randn(6 * 4, REVISED_DINO_OUT_DIM)
+    teacher = torch.randn(2 * 4, REVISED_DINO_OUT_DIM)
+    loss_fn.compute_dino_loss(student, teacher, epoch=0)
+    assert "teacher_entropy" not in loss_fn._metric_tensors
+
+    loss_fn.metrics_enabled = True
+    loss_fn.compute_dino_loss(student, teacher, epoch=0)
+    metrics = loss_fn.last_metrics
+    for key in (
+        "teacher_entropy",
+        "teacher_entropy_normalized",
+        "teacher_entropy_min",
+        "teacher_entropy_max",
+        "prototype_dim",
+        "teacher_batch_size",
+        "prototype_perplexity",
+        "prototype_utilization",
+        "prototype_kl_to_uniform",
+    ):
+        assert key in metrics, f"{key} must reach the tracker"
+        assert isinstance(metrics[key], float)
 
 
 # ------------------------------------------------------- ArcFace (Eq. 13)

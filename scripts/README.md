@@ -66,7 +66,7 @@ python scripts/verify_runtime.py --gpus 2
 
 A failure in 3 or 4 does not mean the run will be wrong — both paths refuse or
 fall back rather than proceeding — but it does mean the run will be slow, and
-knowing that before committing 300 epochs is the point.
+knowing that before committing 100 epochs is the point.
 
 ## `dry_run.py`
 
@@ -86,7 +86,7 @@ real training.
 
 ```bash
 python scripts/dry_run.py
-python scripts/dry_run.py --backbone swinv2_base_window16_256 --epochs 3
+python scripts/dry_run.py --backbone swinv2_tiny_window16_256 --epochs 3
 python scripts/dry_run.py --device cpu --top-k 4 --no-efficiency
 ```
 
@@ -204,7 +204,7 @@ data["subvariety_labels"]  # [n]  0..26
 data["paths"]              # [n]  source image paths
 ```
 
-These are the **backbone's** features at its native width (1024 for SwinV2-Base),
+These are the **backbone's** features at its native width (768 for SwinV2-Tiny),
 *not* the paper's `z ∈ ℝ³⁸⁴`. The projection to `z` is a trained layer belonging
 to `DinoV2SwinV2Encoder`, and a freshly-initialised copy of it would project
 through random weights — worse than useless for inspecting what pretraining

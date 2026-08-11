@@ -7,18 +7,55 @@
 # Supervised comparison backbones (ResNet-50, Swin-T) live in
 # conf/experiment/baseline_*.yaml and go through src/models/baselines.py.
 #
-# `feature_dim` is the backbone's own output width, NOT the paper's z. SwinV2-Base
-# emits 1024 channels; DinoV2SwinV2Encoder projects that down to the 384-D z of
+# `feature_dim` is the backbone's own output width, NOT the paper's z. SwinV2-Tiny
+# emits 768 channels; DinoV2SwinV2Encoder projects that down to the 384-D z of
 # Eq. 4, so `encoder(images).shape[-1] == 384` regardless of which variant is
-# chosen here. Use `swinv2_tiny_window16_256` / `swinv2_small_window16_256`
-# (both 768) for a lighter run -- update `feature_dim` to match.
+# chosen here. `swinv2_base_window16_256` (1024) is the capacity control -- use
+# `experiment=pretrain_swinv2_base_dino`, which sets both fields together.
+#
+# Every window16_256 variant emits the SAME 8x8 final-stage token grid at 256 px,
+# which is what makes the Tiny/Base swap invisible to stage 2's grid routing.
+# Only the channel width changes, and the Eq. 4 projection absorbs it.
 #
 # `data.image_size` must equal the window resolution in the model name (256).
 
-name: "swinv2_base_window16_256"
-feature_dim: 1024
+# Backbone, RESIZED for the revision. SwinV2-Base is 86.89 M parameters and
+# 43.94 GFLOPs/view against 9,357 crops from 81 photographs; Tiny is 27.58 M and
+# 13.32 GFLOPs/view (both measured, not quoted) for the same 8x8 grid. Stage 1
+# runs 6 views per image, so the 3.3x compute cut is what makes 100 epochs of
+# in-domain self-distillation affordable at a physical batch the collapse guards
+# can actually estimate from.
+name: "swinv2_tiny_window16_256"
+feature_dim: 768
+
+# ImageNet-1k initialisation.
+#
+# FALSE here is the STAGE-2 default and means "the weights come from the stage-1
+# checkpoint below", which is the whole point of the two-stage recipe. Stage 1
+# sets it true (conf/experiment/pretrain_swinv2_dino.yaml) so self-distillation
+# starts from ImageNet rather than from noise, and the two ImageNet controls set
+# it true as well:
+#
+#   experiment=control_imagenet_frozen      ImageNet -> frozen -> stage 2
+#   experiment=baseline_swinv2_supervised   ImageNet -> unfrozen -> stage 2
+#
+# Leaving it false here also keeps stage 2 runnable on a machine with no network
+# access, which a global `true` would break for every downstream variant.
 pretrained: false
+
 dynamic_img_size: true
+
+# Stochastic depth (timm's `drop_path_rate`). This is timm's own per-block
+# DropPath -- there is no second mechanism in this repository, and there must
+# not be one.
+#
+# 0.0 for stage 2, where the trunk is frozen by default and the comparison
+# between variants must not carry extra sampling noise. Stage 1 sets 0.1 for the
+# STUDENT only: DINO's teacher is an EMA of the student and its outputs are the
+# training targets, so stochastic depth in the teacher would inject noise into
+# the labels rather than into the learner. `DINO.__init__` disables DropPath on
+# the teacher copy after the deepcopy and reports how many modules it silenced.
+drop_path_rate: 0.0
 
 # Optional hidden layer inside the Eq. 4 projection to z; null keeps it linear.
 projection_hidden_dim: null
@@ -32,6 +69,9 @@ projection_dropout: 0.0
 #      ablation and baseline run reads. Pinning one file here is what makes the
 #      component-wise comparison valid: each variant starts from byte-identical
 #      encoder weights.
+#
+# Set to null for a run that must NOT read the self-supervised encoder -- the
+# two ImageNet controls do exactly that.
 checkpoint_path: "${oc.env:SEED_PRETRAIN_BACKBONE,${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_pretrained.pth}"
 checkpoint_strict: false
 
@@ -40,4 +80,10 @@ checkpoint_strict: false
 # head; set `freeze: false` to follow the paper and fine-tune end to end. Note
 # that the Eq. 4 projection to z is trainable either way -- freezing applies to
 # the SwinV2 trunk only.
+#
+# STAGE 1 REFUSES A TRUE HERE. Self-distillation against a frozen trunk trains
+# the projection head alone, which is ImageNet feature extraction wearing a DINO
+# loss, not domain adaptation. `build_dino` raises rather than doing it silently;
+# the frozen-ImageNet comparison is a stage-2 control
+# (experiment=control_imagenet_frozen), not a stage-1 mode.
 freeze: true

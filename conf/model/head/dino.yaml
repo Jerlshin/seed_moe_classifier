@@ -3,21 +3,45 @@
 # "The projection head consists of a multi-layer perceptron (MLP) with batch
 # normalization and GELU activation functions. The final embeddings are
 # normalized to facilitate stable self-distillation."
+#
+# Realised width chain (num_layers counts the linear layers up to and including
+# the bottleneck; the prototype layer is separate and weight-normalised):
+#
+#   in_dim=768 -> 1024 -> 1024 -> 256 -> L2 normalize -> weight_norm(2048)
+#
+# This head is DISCARDED at the end of stage 1. Nothing downstream depends on
+# any width here: the only handoff to stage 2 is `student_backbone`, so the head
+# can be resized on evidence about stage 1 alone.
 
 name: "dino_projection"
 
 in_dim: ${model.backbone.feature_dim}
-hidden_dim: 2048
+
+# hidden_dim, RESIZED with the backbone. 2048 was DINO's width for a 65,536-way
+# prototype layer; against a 768-channel trunk and 2,048 prototypes it is the
+# widest thing in the head for no stated reason. 1024 keeps the MLP at the
+# trunk's own scale.
+hidden_dim: 1024
 bottleneck_dim: 256
 
-# out_dim, RECALIBRATED. Table 1's 65,536 is DINO's value, set for ImageNet-1k's
-# 1.28 M images -- 0.051 prototypes per image. Against 9,357 images that is 7.00
-# prototypes per image, a 137x higher density, and the prototype layer alone is
-# 16.8 M parameters (71 % of the head, ~19 % of the student). Total exposure here
-# is 300 x 9,357 = 2.81 M presentations, about 2 % of DINO's 100-epoch budget.
-# 8,192 gives 0.88 prototypes per image and removes ~14.7 M parameters.
-# Set 65536 to reproduce the submitted configuration.
-out_dim: 8192
+# out_dim, RECALIBRATED TWICE.
+#
+# Table 1's 65,536 is DINO's value, set for ImageNet-1k's 1.28 M images -- 0.051
+# prototypes per image. Against 9,357 images that is 7.00 per image, a 137x
+# higher density. The first revision cut it to 8,192; this one cuts it to 2,048,
+# because prototype count and BATCH SIZE are one decision, not two:
+#
+#   Sinkhorn-Knopp makes the teacher's assignment doubly stochastic within the
+#   batch, so each prototype's column receives exactly B_teacher/K of the mass.
+#   At 8,192 prototypes and 2 x 32 = 64 teacher views that is 1/128 of a view per
+#   prototype -- the assignment is decided almost entirely by the normaliser
+#   rather than by the data, and the entropy floor it imposes (log(K/B_teacher))
+#   sits at 4.85 of a 9.01 maximum. At 2,048 the floor is 3.47 of 7.62 and each
+#   prototype's column carries 4x more evidence.
+#
+# 2,048 also removes ~1.5 M parameters from the prototype layer. Set 8192 to
+# reproduce the previous revision, 65536 for the submitted configuration.
+out_dim: 2048
 num_layers: 3
 
 # Head normalisation: "layer" | "batch" | "none".

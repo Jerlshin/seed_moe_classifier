@@ -3,9 +3,15 @@
 Reference implementation of **"Hierarchical Deep Learning for Fine-Grained Seed
 Classification: A Self-Supervised and Mixture-of-Experts Approach"**.
 
-Two stages: DINO-style self-supervised pretraining of a Swin Transformer V2 encoder,
-then a hierarchical head that classifies 4 seed types and 27 sub-varieties with
-a Mixture-of-Experts, cross-attention refinement, and ArcFace metric learning.
+Two stages: DINO-style self-supervised pretraining of a Swin Transformer V2
+encoder, then a hierarchical head that classifies 4 seed types and 27
+sub-varieties with a Mixture-of-Experts, cross-attention refinement, and ArcFace
+metric learning.
+
+```text
+Stage 1   ImageNet-1k → SwinV2-Tiny → DINO self-distillation (trunk unfrozen)
+Stage 2   the resulting encoder (frozen) → hierarchical MoE head
+```
 
 ```
 image ──SwinV2──▶ pooled ──proj──▶ z ∈ ℝ³⁸⁴                            (Eq. 4)
@@ -27,12 +33,17 @@ image ──SwinV2──▶ pooled ──proj──▶ z ∈ ℝ³⁸⁴        
                         SubVarietyEmbedding ──▶ ArcFace(27)           (Eq. 13)
 ```
 
-> **Revision status.** This tree implements the peer-review revision, which
-> differs from the submitted manuscript in two deliberate ways: the router
-> activates **2 of 6** experts rather than 4, and **SwinV2 is the only encoder**
-> — the comparative ViT-S/14 path has been removed. Both are reversible
-> (`model.head.top_k=4` reproduces the submitted routing).
-> [`REVISION_NOTES.md`](REVISION_NOTES.md) is the full change record.
+> **Revision status.** This tree implements the peer-review revision. The
+> headline departures from the submitted manuscript: the router activates
+> **2 of 6** experts rather than 4; **SwinV2 is the only encoder** (the
+> comparative ViT-S/14 path has been removed); and stage 1 now runs
+> **SwinV2-Tiny from ImageNet-1k for 100 epochs** rather than SwinV2-Base from
+> random initialisation for 300. Almost all of it is reversible by override —
+> `model.head.top_k=4` restores the submitted routing,
+> `experiment=pretrain_swinv2_base_dino` the submitted trunk.
+> [`REVISION_NOTES.md`](REVISION_NOTES.md) is the full change record and
+> [`architecture/02_BACKBONE_AND_SSL.md`](architecture/02_BACKBONE_AND_SSL.md)
+> the stage-1 detail.
 
 ## Install
 
@@ -55,6 +66,28 @@ python main.py smoke         # 2-batch dry run of both stages
 python main.py pretrain --gpus 2    # the same, as a 2-rank DDP job
 ```
 
+Stage-1 variants, all config-driven:
+
+```bash
+# the primary run: SwinV2-Tiny, ImageNet init, unfrozen, 2 global + 4 local
+# crops, physical batch 32 at accumulation 1, 100 epochs, encoders kept at
+# 25 / 50 / 100
+python main.py pretrain
+
+# capacity control: the identical recipe on SwinV2-Base
+python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_base_dino
+
+# the stage-1 control (no stage 1 at all): ImageNet, frozen, straight to stage 2
+python -m src.trainers.moe_finetune experiment=control_imagenet_frozen
+```
+
+Measure before changing the batch — physical batch is what Sinkhorn and KoLeo
+estimate from, and accumulation cannot substitute for it:
+
+```bash
+python scripts/bench_pretrain_step.py --find-batch-size 16,24,32,48,64
+```
+
 Anything after the stage name is forwarded as a Hydra override:
 
 ```bash
@@ -71,7 +104,7 @@ python scripts/dry_run.py         # synthetic end-to-end smoke test, no dataset 
 python scripts/verify_runtime.py  # are the fast paths exact on THIS machine?
 python main.py pretrain           # produces the shared encoder, run once
 python scripts/run_ablations.py   # six component-wise variants
-python scripts/run_baselines.py   # linear probe, SwinV2-supervised, ResNet-50, Swin-T, hierarchical CCE
+python scripts/run_baselines.py   # linear probe, ImageNet frozen/unfrozen, ResNet-50, Swin-T, hierarchical CCE
 python scripts/generate_plots.py  # figures + outputs/reports/summary_metrics.csv
 ```
 
@@ -96,6 +129,31 @@ Useful flags: `--dry-run` prints the commands without running them,
 `--variants`/`--models` selects a subset, and everything after a bare `--` is
 forwarded to every run as a Hydra override.
 
+## Stage-1 recipe
+
+| | Value | Note |
+| --- | --- | --- |
+| Backbone | `swinv2_tiny_window16_256` | 27.58 M params, 13.32 GFLOPs/view @256 — both measured |
+| Initialisation | ImageNet-1k (`ms_in1k`) | the trunk then **trains**; `build_dino` refuses `freeze=true` |
+| Stochastic depth | 0.1, student only | the teacher copy is silenced — its outputs are the targets |
+| Views | 2 global @256 + 4 local @101 | local crops kept deliberately; whether they earn their cost is an ablation to run |
+| Physical batch | 32, accumulation 1 | Sinkhorn/KoLeo are per-micro-batch, so accumulation is not a substitute |
+| DINO head | 768 → 1024 → 1024 → 256 → 2048 | discarded after stage 1; nothing downstream depends on it |
+| Prototypes | 2,048 | `K/B_teacher = 32` prototypes per teacher view, against 128 at 8,192 |
+| Epochs | 100, encoders kept at 25 / 50 / 100 | so "was 100 necessary?" is a suite away, not an assumption |
+| Learning rate | derived: `0.0005 × B_eff/256` = **6.25e-05** | Section 6.1's 0.0005 is the rate at batch 256 |
+| Warmup | 10 epochs, linear, then cosine | one `SequentialLR`, resumable mid-warmup |
+| Weight decay | 0.04 → 0.4 cosine, **matrices only** | biases, norms, `logit_scale` and `cpb_mlp` excluded |
+| Teacher | momentum 0.996 → 1.0; τ 0.04 → 0.07 over 30 epochs | unchanged |
+| Clip / freeze last layer | 3.0 / 1 epoch | unchanged (Table 1, Section 6.1) |
+
+Every run prints a copy-pasteable compute/parameter budget and writes it to
+`events.jsonl` and W&B as `budget/*`, with measured and estimated quantities
+labelled apart. The teacher entropy diagnostics ship with their own bounds
+(`teacher_entropy_min/_max`, the normalised form, `K`, `B_teacher`,
+`prototype_utilization`), because entropy read against zero says nothing —
+Sinkhorn's structural floor here is 3.47 of a 7.62 maximum.
+
 ## Ablation and baseline matrix
 
 | Variant | What it removes | Selected by |
@@ -108,7 +166,8 @@ forwarded to every run as a Hydra override.
 | `wo_kl` | Eq. 10 hierarchy-consistency loss | `model.head.use_kl_loss=false` |
 | `wo_cross_attn` | Eqs. 11–12 Q/K/V refinement | `model.head.use_cross_attention=false` |
 | `linear_probe` | everything but a frozen encoder + two linear heads | `experiment=baseline_linear_probe` |
-| `swinv2_supervised` | the self-supervised stage (ImageNet SwinV2-Base instead) | `experiment=baseline_swinv2_supervised` |
+| `swinv2_supervised` | the self-supervised stage (ImageNet SwinV2, trunk unfrozen) | `experiment=baseline_swinv2_supervised` |
+| `imagenet_frozen` | the self-supervised stage (ImageNet SwinV2, trunk frozen) | `experiment=control_imagenet_frozen` |
 | `resnet50` | ImageNet ResNet-50, supervised end to end | `experiment=baseline_resnet50` |
 | `swin_tiny` | ImageNet Swin-T, supervised end to end | `experiment=baseline_swin_tiny` |
 | `hierarchical_cce` | two-stage hierarchy, plain CCE, no MoE/attn/ArcFace | `experiment=baseline_hierarchical_cce` |
@@ -178,6 +237,8 @@ index and invalidates existing checkpoints — update
 | [`src/trainers/`](src/trainers/README.md) | Hydra training entry points and the suite runner |
 | [`src/utils/`](src/utils/README.md) | Metrics, efficiency profiling, reporting, figures, tracking |
 | [`conf/`](conf/README.md) | Hydra config groups |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | One-page map of both stages and the interface between them |
+| [`architecture/`](architecture/00_OVERVIEW.md) | Per-topic design documents |
 | [`tests/`](tests/README.md) | pytest suite |
 | [`scripts/`](scripts/README.md) | Suite runners, plotting, feature extraction, dry run |
 
@@ -229,8 +290,10 @@ $SEED_OUTPUT_DIR/
   checkpoints/
     dinov2_swinv2_pretrained.pth   # the shared encoder every downstream run reads
   pretrain_swinv2_dino/
-    dino_pretrained_backbone.pth
+    dino_pretrained_backbone.pth       # the stage-2 handoff
     dino_pretrained_final.pth
+    dino_backbone_epoch_{0025,0050,0100}.pth   # milestone encoders, never pruned
+    dino_milestone_epoch_{0025,0050,0100}.pth
   finetune_hierarchical_moe/
     best_hierarchical_moe.pth
     hierarchical_moe_final.pth
@@ -240,6 +303,7 @@ $SEED_OUTPUT_DIR/
     hydra/                         # logs, config snapshot, tensorboard, wandb, figures
   ablations/{full_model,wo_moe,wo_arcface,wo_residual,wo_kl,wo_cross_attn}/
   baselines/{linear_probe,swinv2_supervised,resnet50,swin_tiny,hierarchical_cce}/
+  controls/imagenet_frozen/         # ImageNet + frozen trunk, the stage-1 control
   reports/
     summary_metrics.csv            # one row per variant, all metrics + cost
     {variant}_confusion_seed_type.png
@@ -258,12 +322,12 @@ exactly those two files.
 
 Defaults are tuned for a small (16 GB) rented disk: parameter/gradient
 histograms off, `keep_last_n_checkpoints: 1`, no optimizer state,
-no teacher weights. Turning these on for a 300-epoch run is how the disk fills.
+no teacher weights. Turning these on for a 100-epoch run is how the disk fills.
 
 ## Testing
 
 ```bash
-python -m pytest tests/ -q          # 419 tests, no network access, ~30s
+python -m pytest tests/ -q          # 458 tests, no network access, ~35s
 python scripts/dry_run.py           # real encoder, synthetic data, full pipeline
 ```
 

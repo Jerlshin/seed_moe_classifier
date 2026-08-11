@@ -10,16 +10,25 @@ final embeddings are normalized to facilitate stable self-distillation." So the
 head is ``Linear -> norm -> GELU -> ... -> Linear(bottleneck) -> L2 normalize ->
 weight-normalised Linear(out_dim)``.
 
-Two revisions to that description
----------------------------------
+Three revisions to that description
+-----------------------------------
+
+**Initialisation.** The trunk starts from ImageNet-1k
+(``model.backbone.pretrained=true``) rather than from noise, and it *trains* --
+``build_dino`` refuses ``model.backbone.freeze=true`` outright, because
+self-distillation against a frozen trunk fits the projection head to fixed
+features and adapts nothing, with no error to say so. Stochastic depth
+(``drop_path_rate``) applies to the student only; :func:`disable_drop_path`
+silences the teacher copy, whose outputs are the targets.
 
 **``out_dim``.** Table 1's 65,536 prototypes are DINO's value, set for
 ImageNet-1k's 1.28 M images -- 0.051 prototypes per image. Against this dataset's
 9,357 images that is **7.00 prototypes per image, a 137x higher density**, and
-the prototype layer alone is 16.8 M parameters (71 % of the head, ~19 % of the
-student). Total training exposure here is ``300 x 9,357 = 2.81 M`` image
-presentations, about 2 % of DINO's 100-epoch ImageNet budget. The revision
-default is 8,192; see ``conf/model/head/dino.yaml``.
+the prototype layer alone is 16.8 M parameters. The current default is 2,048,
+which is a decision about the *batch* as much as the head: Sinkhorn-Knopp gives
+each prototype ``B_teacher / out_dim`` of the assignment mass, so at 64 teacher
+views 2,048 prototypes carry four times the evidence per column that 8,192 did.
+See ``conf/model/head/dino.yaml``.
 
 **The head's normalisation.** ``use_batch_norm=True`` couples the teacher to the
 student in a way the EMA does not cover: ``update_momentum`` EMAs *parameters*,
@@ -38,19 +47,19 @@ collapsing run collapses first.
 
 :meth:`DINOHead.forward` can return the pre-prototype bottleneck alongside the
 logits, which is what the KoLeo regulariser consumes -- applying it to the
-65k-wide prototype output would measure the wrong space.
+prototype output would measure the wrong space.
 
 One forward per step, not six
 -----------------------------
 
 :meth:`DINO.forward_student_views` takes **all** the student's views as one
 stacked tensor and issues a single backbone call. The obvious loop --
-``[model.forward_student(view) for view in views]`` -- is six separate SwinV2-Base
-forwards at batch 16, and a Swin block at batch 16 is nowhere near large enough
-to saturate a GPU: each of its ~200 kernels spends more time being launched than
+``[model.forward_student(view) for view in views]`` -- is six separate SwinV2
+forwards at the micro-batch size, which is nowhere near large enough to saturate
+a GPU: each of a Swin block's ~200 kernels spends more time being launched than
 running, and that launch overhead is paid six times over. Stacking makes it one
-forward at batch 96, which is the same arithmetic on tensors large enough to
-matter, with a sixth of the launches.
+forward at ``6 x batch`` (192 views at the configured batch of 32), which is the
+same arithmetic on tensors large enough to matter, with a sixth of the launches.
 
 It also costs almost nothing in memory. The loop already holds all six autograd
 graphs simultaneously -- backward runs after the last view -- so peak activation
@@ -101,6 +110,31 @@ def _resolve_head_norm(use_batch_norm: bool | str | None) -> str:
     return "batch" if bool(use_batch_norm) else "none"
 
 
+def disable_drop_path(module: nn.Module) -> int:
+    """Set every ``DropPath`` probability in ``module`` to zero. Returns the count.
+
+    Stochastic depth belongs to the **student** alone. The teacher is a deep copy
+    of the student and is advanced only by the EMA, so it inherits the student's
+    ``drop_path_rate`` -- and ``model.train()`` puts it in training mode, where
+    timm's ``DropPath`` is active. The teacher's outputs are the *targets* of
+    Eq. 1, so leaving it on would randomly delete residual branches from the
+    label rather than from the learner: a different, noisier objective, with a
+    loss curve that looks entirely normal. DINO's reference implementation
+    constructs its teacher without the flag for the same reason; here the copy
+    already exists, so the probabilities are zeroed in place instead, which keeps
+    ``teacher.state_dict()`` byte-identical to the student's at initialisation.
+
+    ``drop_prob`` is a plain float attribute rather than a buffer, so it is not
+    part of any state dict and a resumed run re-applies this at construction.
+    """
+    silenced = 0
+    for child in module.modules():
+        if type(child).__name__ == "DropPath" and getattr(child, "drop_prob", 0.0):
+            child.drop_prob = 0.0
+            silenced += 1
+    return silenced
+
+
 class DINOHead(nn.Module):
     """MLP projection head with GELU and an L2-normalised bottleneck.
 
@@ -126,7 +160,7 @@ class DINOHead(nn.Module):
         use_batch_norm: bool | str = "layer",
         norm_last_layer: bool = True,
         num_layers: int = 3,
-        hidden_dim: int = 2048,
+        hidden_dim: int = 1024,
         bottleneck_dim: int = 256,
         freeze_last_layer_epochs: int = 1,
     ):
@@ -184,8 +218,7 @@ class DINOHead(nn.Module):
 
         The KoLeo regulariser needs the bottleneck, not the prototype logits:
         uniformity is a property of the representation, and measuring it in the
-        65k-wide prototype space would measure the head's output distribution
-        instead.
+        prototype space would measure the head's output distribution instead.
         """
         bottleneck = F.normalize(self.mlp(x), dim=-1, p=2)  # per Section 4
         logits = self.last_layer(bottleneck)
@@ -255,8 +288,14 @@ class DINO(nn.Module):
         backbone_name: timm model identifier.
         input_dim: Backbone output width, feeding the projection head.
         hidden_dim / bottleneck_dim / out_dim: Projection head widths.
-        pretrained: Initialise the backbone from timm's pretrained weights.
+        pretrained: Initialise the backbone from timm's ImageNet weights. The
+            primary stage-1 configuration sets this ``True``: DINO from a random
+            trunk was budgeted at 300 epochs, and starting from ImageNet-1k
+            changes what that budget is for.
         dynamic_img_size: Allow non-native input resolutions.
+        drop_path_rate: Stochastic depth for the **student** trunk (timm's own
+            mechanism; there is no second one). The teacher copy is silenced --
+            see :func:`disable_drop_path`.
         projection_layers: Linear layers in the head.
         projection_use_batch_norm: Head normalisation, "layer" / "batch" /
             "none"; see :class:`DINOHead`.
@@ -273,6 +312,7 @@ class DINO(nn.Module):
         out_dim: int,
         pretrained: bool = False,
         dynamic_img_size: bool = True,
+        drop_path_rate: float = 0.0,
         projection_layers: int = 3,
         projection_use_batch_norm: bool | str = "layer",
         projection_norm_last_layer: bool = True,
@@ -283,11 +323,14 @@ class DINO(nn.Module):
         # stale or mistyped backbone name fails in the first second rather than
         # after an epoch of self-distillation against the wrong encoder.
         self.backbone_name = validate_swinv2_name(backbone_name)
+        self.pretrained_init = bool(pretrained)
+        self.drop_path_rate = float(drop_path_rate)
         self.student_backbone = timm.create_model(
             self.backbone_name,
             pretrained=pretrained,
             num_classes=0,
             dynamic_img_size=dynamic_img_size,
+            drop_path_rate=self.drop_path_rate,
         )
         backbone_dim = getattr(self.student_backbone, "num_features", None)
         if backbone_dim is not None and int(backbone_dim) != int(input_dim):
@@ -312,6 +355,12 @@ class DINO(nn.Module):
         self.teacher_backbone = copy.deepcopy(self.student_backbone)
         self.teacher_head = DINOHead(**head_kwargs)
         self.teacher_head.load_state_dict(self.student_head.state_dict())
+
+        # Stochastic depth is a property of the learner, not of the target. The
+        # deepcopy inherited it; this takes it back out. Recorded because "did
+        # the teacher get drop path" is exactly the kind of question a loss curve
+        # cannot answer later.
+        self.teacher_drop_paths_disabled = disable_drop_path(self.teacher_backbone)
 
         deactivate_requires_grad(self.teacher_backbone)
         deactivate_requires_grad(self.teacher_head)
@@ -381,8 +430,8 @@ class DINO(nn.Module):
                 both trunks **before** compilation so the compiled graphs trace
                 the fused path. This is the change that stops each block saving
                 two full ``[B·nW, heads, N, N]`` attention matrices for
-                backward (~12 GB bf16 at 96 student views), which is what frees
-                the memory to raise the physical batch.
+                backward (several GB of bf16 at 192 student views), which is what
+                frees the memory to raise the physical batch.
         """
         from src.models.backbones.sdpa_attention import convert_swinv2_attention_to_sdpa
         from src.utils.training.device import enable_fused_attention, maybe_compile
@@ -586,6 +635,76 @@ dino.yaml`` already documents for the EMA, now with a second reason.
         """Parameters the optimizer should own (the teacher is EMA-only)."""
         return list(self.student_backbone.parameters()) + list(self.student_head.parameters())
 
+    def parameter_summary(self) -> dict[str, int]:
+        """Parameter counts, split the way the cost table reports them.
+
+        ``student_trainable`` is the one to read when checking that the trunk is
+        actually being fine-tuned: it equals ``student_total`` in the intended
+        stage-1 regime and collapses to the head's count if anything froze the
+        backbone. ``teacher_total`` is reported as its own row because the
+        teacher doubles the *resident* parameter count while contributing
+        nothing to the gradient -- a distinction a single "model size" hides.
+        """
+
+        def count(module: nn.Module, trainable_only: bool = False) -> int:
+            return sum(
+                parameter.numel()
+                for parameter in module.parameters()
+                if not trainable_only or parameter.requires_grad
+            )
+
+        backbone = count(self.student_backbone)
+        head = count(self.student_head)
+        return {
+            "backbone": backbone,
+            "dino_head": head,
+            "student_total": backbone + head,
+            "student_trainable": (
+                count(self.student_backbone, True) + count(self.student_head, True)
+            ),
+            "student_backbone_trainable": count(self.student_backbone, True),
+            "teacher_total": count(self.teacher_backbone) + count(self.teacher_head),
+            "prototype_layer": count(self.student_head.last_layer),
+        }
+
+    @torch.no_grad()
+    def shape_report(self, image_size: int = 256, device: torch.device | None = None) -> dict[str, Any]:
+        """Trace one image through both paths and report every intermediate shape.
+
+        Run once at startup. The three shapes worth checking by eye are the token
+        grid (``8x8`` for every ``swinv2_*_window16_256``, and what stage 2's grid
+        routing consumes), the pooled width feeding the head, and the prototype
+        width -- which must agree between student and teacher, because the loss
+        contracts them against each other and a mismatch would surface as a shape
+        error deep inside an einsum rather than here.
+        """
+        target = device if device is not None else next(self.student_backbone.parameters()).device
+        was_training = self.training
+        self.eval()
+        try:
+            probe = torch.zeros(1, 3, int(image_size), int(image_size), device=target)
+            tokens = self.student_backbone.forward_features(probe)
+            pooled = self._pool(self.student_backbone(probe))
+            student_logits, bottleneck = self.student_head(pooled, return_bottleneck=True)
+            teacher_logits = self.teacher_head(
+                self._pool(self.teacher_backbone(probe))
+            )
+        finally:
+            self.train(was_training)
+
+        grid = tuple(tokens.shape[1:3]) if tokens.ndim == 4 else (1, int(tokens.shape[1]))
+        return {
+            "input": tuple(probe.shape),
+            "backbone_tokens": tuple(tokens.shape),
+            "token_grid": grid,
+            "tokens_per_image": int(grid[0] * grid[1]),
+            "pooled_features": tuple(pooled.shape),
+            "head_input_dim": int(pooled.shape[-1]),
+            "head_bottleneck": tuple(bottleneck.shape),
+            "student_prototypes": tuple(student_logits.shape),
+            "teacher_prototypes": tuple(teacher_logits.shape),
+        }
+
     def ema_pairs(self) -> list[tuple[nn.Module, nn.Module]]:
         """``(student, teacher)`` module pairs the EMA advances, in order."""
         return [
@@ -684,7 +803,28 @@ dino.yaml`` already documents for the EMA, now with a second reason.
 
 
 def build_dino(backbone_cfg: Any, head_cfg: Any, freeze_last_layer_epochs: int = 1) -> DINO:
-    """Instantiate :class:`DINO` from the ``model.backbone`` and ``model.head`` nodes."""
+    """Instantiate :class:`DINO` from the ``model.backbone`` and ``model.head`` nodes.
+
+    Refuses ``model.backbone.freeze=true``. That flag is a *stage-2* setting --
+    it means "the trunk is a fixed feature extractor and only the head trains" --
+    and honouring it here would turn self-distillation into a projection head
+    fitted to frozen ImageNet features, which adapts nothing to the domain and is
+    the exact failure this stage exists to avoid. There is no error PyTorch would
+    raise for it: the loss would fall, the checkpoint would be written, and the
+    published encoder would be the ImageNet one. The comparison it looks like it
+    is asking for is a real experiment, and it lives at
+    ``experiment=control_imagenet_frozen`` in stage 2.
+    """
+    if bool(getattr(backbone_cfg, "freeze", False)):
+        raise ValueError(
+            "model.backbone.freeze=true is not a stage-1 configuration. DINO fine-tunes the "
+            "trunk; freezing it would train the projection head against fixed ImageNet "
+            "features and publish an unadapted encoder, with no error and a normal-looking "
+            "loss curve.\n"
+            "  - to pretrain (the intended regime): model.backbone.freeze=false\n"
+            "  - for the frozen-ImageNet comparison, run the stage-2 control instead:\n"
+            "      python -m src.trainers.moe_finetune experiment=control_imagenet_frozen"
+        )
     return DINO(
         backbone_name=str(backbone_cfg.name),
         input_dim=int(head_cfg.in_dim),
@@ -693,6 +833,7 @@ def build_dino(backbone_cfg: Any, head_cfg: Any, freeze_last_layer_epochs: int =
         out_dim=int(head_cfg.out_dim),
         pretrained=bool(getattr(backbone_cfg, "pretrained", False)),
         dynamic_img_size=bool(getattr(backbone_cfg, "dynamic_img_size", True)),
+        drop_path_rate=float(getattr(backbone_cfg, "drop_path_rate", 0.0) or 0.0),
         projection_layers=int(getattr(head_cfg, "num_layers", 3)),
         projection_use_batch_norm=getattr(head_cfg, "use_batch_norm", "layer"),
         projection_norm_last_layer=bool(getattr(head_cfg, "norm_last_layer", True)),

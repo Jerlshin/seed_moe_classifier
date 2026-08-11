@@ -16,6 +16,22 @@ from omegaconf import OmegaConf
 from tests.conftest import (
     ADACOS_SCALE_27,
     DATASET_NUM_CROPS,
+    FIRST_REVISION_DINO_OUT_DIM,
+    LR_BASE,
+    LR_REFERENCE_BATCH,
+    REVISED_BACKBONE,
+    REVISED_BACKBONE_FEATURE_DIM,
+    REVISED_DINO_BOTTLENECK_DIM,
+    REVISED_DINO_HEAD_LAYERS,
+    REVISED_DINO_HIDDEN_DIM,
+    REVISED_DROP_PATH_RATE,
+    REVISED_EFFECTIVE_BATCH,
+    REVISED_EPOCHS,
+    REVISED_LEARNING_RATE,
+    REVISED_LR_WARMUP_EPOCHS,
+    REVISED_PHYSICAL_BATCH,
+    SUBMITTED_BACKBONE_FEATURE_DIM,
+    SUBMITTED_EPOCHS,
     REVISED_CENTER_MOMENTUM,
     REVISED_DINO_OUT_DIM,
     REVISED_TEACHER_MOMENTUM_FINAL,
@@ -78,6 +94,8 @@ def finetune_cfg(conf_dir):
 #: worst moment to discover a dangling interpolation.
 ALL_EXPERIMENTS = [
     "pretrain_swinv2_dino",
+    "pretrain_swinv2_base_dino",
+    "control_imagenet_frozen",
     "finetune_hierarchical_moe",
     "ablation_flat_classifier",
     "baseline_resnet50",
@@ -122,7 +140,9 @@ def test_only_swinv2_is_available_as_a_dinov2_backbone(conf_dir):
 
 def test_encoder_projects_to_the_paper_embedding_dimension(finetune_cfg):
     """Whatever SwinV2 emits natively, the head still receives z in R^384."""
-    assert finetune_cfg.model.backbone.feature_dim == 1024   # SwinV2-Base's own width
+    # SwinV2-Tiny's own width. The projection to z is what makes the Tiny/Base
+    # swap invisible to the head.
+    assert finetune_cfg.model.backbone.feature_dim == REVISED_BACKBONE_FEATURE_DIM
     assert finetune_cfg.model.head.embed_dim == PAPER_EMBED_DIM
     assert finetune_cfg.model.head.feature_dim == PAPER_EMBED_DIM
 
@@ -140,11 +160,163 @@ def test_dino_pretraining_keeps_the_table_1_values_it_should(pretrain_cfg):
     training = pretrain_cfg.experiment.training
 
     assert pretrain_cfg.model.backbone.name.startswith("swinv2")   # "Swin Transformer v2"
-    assert pretrain_cfg.data.batch_size == 16                       # "Batch Size 16"
-    assert training.epochs == 300                                   # "Number of Epochs 300"
     assert training.clip_grad == pytest.approx(PAPER_CLIP_GRAD)     # "Clip Gradient 3"
     # Table 1's 0.996 is now the *start* of a cosine schedule, not a constant.
     assert training.momentum_teacher == pytest.approx(SUBMITTED_TEACHER_MOMENTUM)
+    # Multi-crop is unchanged and deliberately so: whether the four local crops
+    # earn their cost is an ablation to run, not an assumption to act on.
+    assert pretrain_cfg.data.augmentation.local_crops_number == PAPER_LOCAL_CROPS
+
+
+def test_stage_one_starts_from_imagenet_and_trains_the_trunk(pretrain_cfg):
+    """ImageNet -> SwinV2-Tiny -> DINO fine-tuning, not ImageNet feature extraction.
+
+    ``freeze=false`` is the assertion that matters. Stage 1 with a frozen trunk
+    fits the projection head to fixed features and publishes an unadapted
+    encoder, and nothing in the loss curve would say so -- which is why
+    ``build_dino`` refuses it outright rather than trusting this config.
+    """
+    backbone = pretrain_cfg.model.backbone
+    assert backbone.name == REVISED_BACKBONE
+    assert backbone.feature_dim == REVISED_BACKBONE_FEATURE_DIM
+    assert backbone.pretrained is True
+    assert backbone.freeze is False
+    assert backbone.drop_path_rate == pytest.approx(REVISED_DROP_PATH_RATE)
+
+
+def test_stage_two_backbone_defaults_keep_the_checkpoint_path(finetune_cfg):
+    """The ImageNet flag belongs to the stage-1 experiment, not to the group.
+
+    A global ``pretrained: true`` would make every stage-2 run download ImageNet
+    weights and then overwrite them with the stage-1 checkpoint -- wasted on a
+    server and fatal on a machine with no network access.
+    """
+    backbone = finetune_cfg.model.backbone
+    assert backbone.pretrained is False
+    assert backbone.freeze is True
+    assert "dinov2_swinv2_pretrained.pth" in str(backbone.checkpoint_path)
+
+
+def test_frozen_imagenet_control_is_the_lower_arm_of_the_stage_one_comparison(conf_dir):
+    """A = ImageNet frozen; B = ImageNet + DINO. B - A is what stage 1 contributes."""
+    cfg = build(conf_dir, "experiment=control_imagenet_frozen")
+    OmegaConf.resolve(cfg)
+    backbone = cfg.model.backbone
+    assert backbone.pretrained is True
+    assert backbone.freeze is True
+    # Null, or it would silently load the self-supervised encoder and stop being
+    # a control.
+    assert backbone.checkpoint_path is None
+    # Everything else must match the run it is compared against.
+    reference = build(conf_dir, "experiment=finetune_hierarchical_moe")
+    OmegaConf.resolve(reference)
+    assert cfg.model.head == reference.model.head
+    assert cfg.model.loss == reference.model.loss
+    assert cfg.experiment.training.epochs == reference.experiment.training.epochs
+    assert cfg.experiment.training.split_protocol == reference.experiment.training.split_protocol
+
+
+def test_base_capacity_control_changes_only_the_trunk(conf_dir):
+    """SwinV2-Base at the identical recipe, publishing to its own path."""
+    cfg = build(conf_dir, "experiment=pretrain_swinv2_base_dino")
+    reference = build(conf_dir, "experiment=pretrain_swinv2_dino")
+    OmegaConf.resolve(cfg)
+    OmegaConf.resolve(reference)
+
+    assert cfg.model.backbone.name == "swinv2_base_window16_256"
+    assert cfg.model.backbone.feature_dim == SUBMITTED_BACKBONE_FEATURE_DIM
+    # The head's in_dim follows feature_dim, so the two cannot disagree.
+    assert cfg.model.head.in_dim == SUBMITTED_BACKBONE_FEATURE_DIM
+    # Identical recipe otherwise.
+    for key in ("epochs", "warmup_epochs", "lr_base", "effective_batch_size", "save_epochs"):
+        assert cfg.experiment.training[key] == reference.experiment.training[key]
+    assert cfg.data.batch_size == reference.data.batch_size
+    # And a DIFFERENT publication path: writing the shared one would swap the
+    # trunk under every stage-2 variant with only a "missing keys" log line.
+    assert (
+        cfg.experiment.training.shared_backbone_path
+        != reference.experiment.training.shared_backbone_path
+    )
+
+
+def test_stage_one_duration_and_milestones(pretrain_cfg):
+    """100 epochs, with 25/50/100 kept permanently so the length can be ablated."""
+    training = pretrain_cfg.experiment.training
+    assert training.epochs == REVISED_EPOCHS
+    assert training.epochs < SUBMITTED_EPOCHS
+    assert list(training.save_epochs) == [25, 50, 100]
+    assert max(training.save_epochs) == training.epochs
+    # The rolling series must not fight the milestones for `keep_last_n`.
+    assert training.save_interval == 0
+
+
+def test_physical_batch_is_preferred_to_accumulation(pretrain_cfg):
+    """Sinkhorn and KoLeo are per-micro-batch, so accumulation cannot stand in.
+
+    The submitted 16x4 and this 32x1 have the same effective batch and are not
+    the same run: the former gives four 16-sample assignments where the latter
+    gives one 32-sample assignment.
+    """
+    training = pretrain_cfg.experiment.training
+    assert pretrain_cfg.data.batch_size == REVISED_PHYSICAL_BATCH
+    assert training.effective_batch_size == REVISED_EFFECTIVE_BATCH
+    assert training.gradient_accumulation_steps == 1
+    # Single GPU: effective batch / (micro x world) must be exactly 1.
+    assert training.effective_batch_size == pretrain_cfg.data.batch_size
+
+
+def test_learning_rate_is_derived_from_the_effective_batch(pretrain_cfg):
+    """Section 6.1's 0.0005 is DINO's rate at batch 256, not at this batch.
+
+    Quoting it verbatim next to batch 32 is an 8x overstatement of the step
+    size, and a literal rate is also immune to every knob that moves the batch.
+    The config therefore leaves `learning_rate` null and the trainer derives it.
+    """
+    from src.trainers.contrastive_pretrain import resolve_learning_rate
+    import logging
+
+    training = pretrain_cfg.experiment.training
+    assert training.learning_rate is None, "a literal rate would not follow the batch"
+    assert training.lr_base == pytest.approx(LR_BASE)
+    assert training.lr_reference_batch_size == LR_REFERENCE_BATCH
+    assert training.lr_scaling == "linear"
+
+    resolved, provenance = resolve_learning_rate(
+        pretrain_cfg, REVISED_EFFECTIVE_BATCH, logging.getLogger("test")
+    )
+    assert resolved == pytest.approx(REVISED_LEARNING_RATE)
+    assert resolved == pytest.approx(6.25e-05)
+    assert provenance["rule"] == "linear"
+
+    # Doubling the batch doubles the rate; that is the whole point.
+    doubled, _ = resolve_learning_rate(
+        pretrain_cfg, 2 * REVISED_EFFECTIVE_BATCH, logging.getLogger("test")
+    )
+    assert doubled == pytest.approx(2 * resolved)
+
+
+def test_learning_rate_warmup_is_configured(pretrain_cfg):
+    """10 epochs of linear warmup; the submitted configuration had none."""
+    training = pretrain_cfg.experiment.training
+    assert training.warmup_epochs == REVISED_LR_WARMUP_EPOCHS
+    assert training.warmup_epochs < training.epochs
+    assert training.scheduler.name == "cosine"
+    # null t_max means `epochs - warmup_epochs`, so the cosine finishes with the
+    # run rather than being truncated by the warmup.
+    assert training.scheduler.t_max is None
+
+
+def test_dino_head_is_sized_for_the_tiny_trunk(pretrain_cfg):
+    """768 -> 1024 -> 1024 -> 256 -> 2048, and none of it reaches stage 2."""
+    head = pretrain_cfg.model.head
+    assert head.in_dim == REVISED_BACKBONE_FEATURE_DIM
+    assert head.hidden_dim == REVISED_DINO_HIDDEN_DIM
+    assert head.bottleneck_dim == REVISED_DINO_BOTTLENECK_DIM
+    assert head.num_layers == REVISED_DINO_HEAD_LAYERS
+    assert head.out_dim == REVISED_DINO_OUT_DIM
+    # The two DINO-specific behaviours are unchanged.
+    assert head.use_batch_norm == "layer"
+    assert head.norm_last_layer is True
 
 
 def test_stage_one_collapse_guards_are_recalibrated(pretrain_cfg):
@@ -170,16 +342,25 @@ def test_stage_one_collapse_guards_are_recalibrated(pretrain_cfg):
     assert loss.lambda_koleo > 0
 
 
-def test_prototype_count_is_sized_for_this_dataset(pretrain_cfg):
+def test_prototype_count_is_sized_for_this_dataset_and_batch(pretrain_cfg):
     """65,536 prototypes for 9,357 images is 7.00 per image; DINO's ratio is 0.051.
 
-    That is 137x the prototype density DINO was tuned at, and the layer alone is
-    16.8 M parameters against a total training exposure of ~2 % of DINO's budget.
+    That is 137x the prototype density DINO was tuned at. The second cut, from
+    8,192 to 2,048, is about the BATCH rather than the dataset: Sinkhorn gives
+    each prototype ``B_teacher / K`` of the assignment mass, so the prototype
+    count and the physical batch are one decision. At 64 teacher views, 2,048
+    prototypes carry 4x the evidence per column that 8,192 did.
     """
     out_dim = pretrain_cfg.model.head.out_dim
     assert out_dim == REVISED_DINO_OUT_DIM
-    assert out_dim < SUBMITTED_DINO_OUT_DIM
+    assert out_dim < FIRST_REVISION_DINO_OUT_DIM < SUBMITTED_DINO_OUT_DIM
     assert out_dim / DATASET_NUM_CROPS < 1.0, "fewer prototypes than training images"
+
+    # Teacher views per Sinkhorn estimate: 2 global crops x the physical batch.
+    teacher_views = 2 * pretrain_cfg.data.batch_size
+    assert out_dim / teacher_views <= 32, (
+        "each prototype column must carry a meaningful share of the batch's mass"
+    )
 
 
 def test_stage_one_schedules_the_momentum_and_weight_decay(pretrain_cfg):
@@ -187,14 +368,17 @@ def test_stage_one_schedules_the_momentum_and_weight_decay(pretrain_cfg):
     training = pretrain_cfg.experiment.training
     assert training.momentum_teacher_final == pytest.approx(REVISED_TEACHER_MOMENTUM_FINAL)
     assert training.weight_decay_final > training.weight_decay
-    # Every collapse guard is a batch statistic, so the effective batch matters.
-    assert training.gradient_accumulation_steps * pretrain_cfg.data.batch_size >= 64
 
 
 def test_dino_optimizer_matches_section_6_1(pretrain_cfg):
-    """"AdamW with an initial learning rate of 0.0005 ... cosine decay scheduler"."""
+    """"AdamW with an initial learning rate of 0.0005 ... cosine decay scheduler".
+
+    The rate itself is checked by ``test_learning_rate_is_derived_from_the_
+    effective_batch``: 0.0005 survives as ``lr_base``, the reference-batch value
+    the scaling rule is applied to.
+    """
     assert pretrain_cfg.experiment.training.optimizer.name == "AdamW"
-    assert pretrain_cfg.experiment.training.learning_rate == pytest.approx(0.0005)
+    assert pretrain_cfg.experiment.training.lr_base == pytest.approx(0.0005)
     assert pretrain_cfg.experiment.training.scheduler.name == "cosine"
     assert pretrain_cfg.experiment.training.freeze_last_layer_epochs == 1
 

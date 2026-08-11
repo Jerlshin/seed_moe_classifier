@@ -1,22 +1,31 @@
 #!/usr/bin/env python
 """Run the supervised and simple-hierarchical baselines.
 
-    python scripts/run_baselines.py                          # all five
+    python scripts/run_baselines.py                          # all six
     python scripts/run_baselines.py --models resnet50
+    python scripts/run_baselines.py --models imagenet_frozen  # the stage-1 control
     python scripts/run_baselines.py --dry-run
     python scripts/run_baselines.py -- experiment.training.epochs=30
 
-Five reference points, each answering a different question:
+Six reference points, each answering a different question:
 
 ``linear_probe``
     Frozen self-supervised encoder plus two linear heads, plain CE. The
     cheapest possible read of what stage 1 alone learned, with no head
     machinery to credit or blame.
 
+``imagenet_frozen``
+    ImageNet SwinV2, trunk **frozen**, full hierarchical head, no stage 1. The
+    lower arm of the stage-1 comparison: the proposed model minus this is what
+    in-domain self-supervised pretraining contributes, with the head, the split
+    and the seeds all held fixed. Stage 1 is the most expensive thing in the
+    pipeline, so this is the row that has to justify it.
+
 ``swinv2_supervised``
-    ImageNet SwinV2-Base with the full hierarchical head, but no self-supervised
-    stage at all. Isolates what DINO pretraining contributes while holding the
-    encoder family and head architecture fixed.
+    The same ImageNet initialisation with the trunk **unfrozen**, still with no
+    self-supervised stage. Read against ``imagenet_frozen`` it isolates
+    adaptation from initialisation; read against the proposed model it isolates
+    supervised adaptation from self-supervised adaptation.
 
 ``resnet50``
     ImageNet-pretrained ResNet-50, trained end to end. The conventional CNN
@@ -34,11 +43,12 @@ Five reference points, each answering a different question:
     proposed model's encoder and code path with toggles flipped, so it is the
     tightest of the five controls.
 
-Results land in ``outputs/baselines/{model}/``. ``resnet50``, ``swin_tiny`` and
-``swinv2_supervised`` own their backbones and therefore ignore the DINOv2
-checkpoint by design; ``linear_probe`` and ``hierarchical_cce`` read the same
-shared encoder as the ablation suite, which is what keeps them comparable with
-the full model.
+Results land in ``outputs/baselines/{model}/`` (``imagenet_frozen`` writes to
+``outputs/controls/imagenet_frozen/``). ``resnet50``, ``swin_tiny``,
+``swinv2_supervised`` and ``imagenet_frozen`` own their backbones and therefore
+ignore the stage-1 checkpoint by design; ``linear_probe`` and
+``hierarchical_cce`` read the same shared encoder as the ablation suite, which is
+what keeps them comparable with the full model.
 
 Build the combined table afterwards with ``python scripts/generate_plots.py``.
 """
@@ -75,9 +85,19 @@ BASELINE_VARIANTS: list[VariantSpec] = [
     ),
     VariantSpec(
         name="swinv2_supervised",
-        description="ImageNet SwinV2-Base + the full hierarchical head, no self-supervised stage",
+        description="ImageNet SwinV2 + the full hierarchical head, trunk UNFROZEN, no stage 1",
         group="baseline",
         experiment="baseline_swinv2_supervised",
+    ),
+    VariantSpec(
+        name="imagenet_frozen",
+        # The lower arm of the stage-1 comparison. Read against the proposed
+        # model, the difference is what in-domain self-supervised pretraining
+        # contributes; read against `swinv2_supervised`, it is what unfreezing
+        # contributes. Neither number exists without this row.
+        description="ImageNet SwinV2 + the full hierarchical head, trunk FROZEN, no stage 1",
+        group="control",
+        experiment="control_imagenet_frozen",
     ),
     VariantSpec(
         name="resnet50",
@@ -105,7 +125,7 @@ VARIANTS_BY_NAME = {spec.name: spec for spec in BASELINE_VARIANTS}
 #: encoder. A SwinV2 state dict would at best be ignored by a ResNet and at worst
 #: partially loaded; `swinv2_supervised` is the shape-compatible case and is
 #: excluded deliberately, since its whole purpose is to NOT read stage 1.
-END_TO_END_BASELINES = {"resnet50", "swin_tiny", "swinv2_supervised"}
+END_TO_END_BASELINES = {"resnet50", "swin_tiny", "swinv2_supervised", "imagenet_frozen"}
 
 #: Learning rates swept per end-to-end baseline. A single shared value cannot be
 #: right for both end-to-end ImageNet fine-tuning and frozen-encoder head

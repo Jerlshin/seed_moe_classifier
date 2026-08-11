@@ -1,0 +1,53 @@
+# @package _global_
+#
+# CONTROL A: ImageNet-1k initialisation, frozen trunk, no stage 1 at all.
+#
+#   python -m src.trainers.moe_finetune experiment=control_imagenet_frozen
+#
+# The lower arm of the experiment that isolates what in-domain self-supervised
+# pretraining contributes:
+#
+#   A  control_imagenet_frozen     ImageNet -> FROZEN            -> stage 2
+#   B  finetune_hierarchical_moe   ImageNet -> DINO (unfrozen)   -> stage 2
+#
+# B - A is the contribution of stage 1, measured with the head, the split, the
+# seeds and every stage-2 hyperparameter held identical -- this file inherits
+# all of them from `finetune_hierarchical_moe` and changes only how the encoder
+# got its weights. Run it at the same five seeds as everything else:
+#
+#   for s in 42 43 44 45 46; do
+#     python -m src.trainers.moe_finetune experiment=control_imagenet_frozen seed=$s
+#   done
+#
+# No new freezing machinery is involved. `model.backbone.freeze` already drives
+# `BackboneFeatureExtractor`, which disables gradients and pins the trunk to
+# eval mode via its overridden `train()`; this file just sets it. The Eq. 4
+# projection to z stays trainable, as it does in every frozen configuration --
+# freezing applies to the SwinV2 trunk only.
+#
+# Read this next to `baseline_swinv2_supervised`, which is the same ImageNet
+# initialisation with the trunk UNFROZEN and no stage 1. The three rows together
+# separate initialisation, adaptation and objective:
+#
+#   control_imagenet_frozen      ImageNet, frozen,   no stage 1
+#   baseline_swinv2_supervised   ImageNet, unfrozen, no stage 1  (supervised adaptation)
+#   finetune_hierarchical_moe    ImageNet, then DINO stage 1     (self-supervised adaptation)
+
+defaults:
+  - finetune_hierarchical_moe
+
+experiment:
+  name: "control_imagenet_frozen"
+  group: "control"
+  variant: "imagenet_frozen"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/controls/imagenet_frozen"
+
+model:
+  backbone:
+    # No stage-1 encoder. Null is what stops `BackboneFeatureExtractor` reading
+    # the shared checkpoint -- without it the run would load the DINO weights
+    # and stop being a control.
+    checkpoint_path: null
+    pretrained: true    # ImageNet-1k (timm `ms_in1k`)
+    freeze: true        # the point of this arm

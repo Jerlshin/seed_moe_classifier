@@ -39,10 +39,10 @@ peak VRAM per rank, and mean/peak SM utilisation where NVML is available. Use it
 to answer, on the actual server GPU, in minutes:
 
 * what ``sdpa_attention`` buys (``--no-sdpa`` vs default);
-* whether a physical batch of 64 at ``--accum 1`` now fits, and its img/s
-  (the effective batch — physical x accumulation x ranks — must stay 64: the
-  collapse guards are batch statistics and the LR/momentum regime is tuned to
-  it);
+* **the largest physical batch the card can hold** (``--find-batch-size``),
+  which is the measurement the training configuration is waiting on: Sinkhorn
+  and KoLeo are evaluated per micro-batch, so the physical batch is what their
+  estimates are made from and accumulation cannot substitute for it;
 * whether ``--grad-checkpointing`` is needed to fit, and what it costs;
 * what a compile mode is worth (``--compile-mode max-autotune-no-cudagraphs``);
 * what a second GPU actually buys (``--scaling 1,2``), which on a T4 pair
@@ -92,14 +92,28 @@ NORMALIZE_STD = (0.229, 0.224, 0.225)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--backbone", default="swinv2_base_window16_256")
-    parser.add_argument("--feature-dim", type=int, default=1024)
+    parser.add_argument("--backbone", default="swinv2_tiny_window16_256")
+    parser.add_argument("--feature-dim", type=int, default=768)
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--local-crop-size", type=int, default=101)
     parser.add_argument("--local-crops", type=int, default=4)
-    parser.add_argument("--out-dim", type=int, default=8192)
-    parser.add_argument("--batch-size", type=int, default=16, help="physical images per micro-batch per rank")
-    parser.add_argument("--accum", type=int, default=4, help="micro-batches per optimizer step")
+    parser.add_argument("--out-dim", type=int, default=2048)
+    parser.add_argument("--hidden-dim", type=int, default=1024, help="DINO head hidden width")
+    parser.add_argument("--bottleneck-dim", type=int, default=256)
+    parser.add_argument("--drop-path", type=float, default=0.1, help="student stochastic depth")
+    parser.add_argument("--batch-size", type=int, default=32, help="physical images per micro-batch per rank")
+    parser.add_argument("--accum", type=int, default=1, help="micro-batches per optimizer step")
+    parser.add_argument(
+        "--find-batch-size",
+        default=None,
+        help=(
+            "Comma-separated physical batch sizes to try, e.g. '16,24,32,48,64'. Runs the real "
+            "micro-step at each in a FRESH SUBPROCESS, reports peak VRAM and img/s per "
+            "candidate, and names the largest that fits. This is the measurement to take "
+            "before committing to a batch: an OOM here costs seconds, the same OOM twenty "
+            "minutes into epoch 1 costs the run."
+        ),
+    )
     parser.add_argument("--steps", type=int, default=24, help="timed micro-batches")
     parser.add_argument("--warmup", type=int, default=8, help="untimed micro-batches (compile capture)")
     parser.add_argument("--amp", default="auto", choices=["auto", "bf16", "fp16", "off"])
@@ -226,11 +240,98 @@ def run_scaling(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----------------------------------------------------------- batch-size search
+
+
+def run_batch_size_search(args: argparse.Namespace) -> int:
+    """Try each candidate physical batch in its own process; report what fits.
+
+    A **fresh subprocess per candidate** is not fastidiousness. CUDA's caching
+    allocator does not return freed blocks to the driver, so a batch of 64 that
+    OOMs leaves the process holding a fragmented reservation, and every smaller
+    candidate measured afterwards in the same process reports a peak that
+    reflects the failed attempt rather than itself. An OOM is also not reliably
+    recoverable in-process once autograd has partially unwound.
+
+    Candidates run largest-last so the table reads in the order a reader
+    chooses from, and a failure at one size does not stop the rest -- 48 can
+    fail while 64 succeeds under a different allocator split, and seeing that is
+    the point.
+    """
+    candidates = sorted(
+        {int(item) for item in str(args.find_batch_size).replace(" ", "").split(",") if item}
+    )
+    skip_prefixes = ("--find-batch-size", "--batch-size", "--json", "--accum")
+    forwarded: list[str] = []
+    skip_next = False
+    for argument in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if any(argument.startswith(prefix) for prefix in skip_prefixes):
+            skip_next = "=" not in argument
+            continue
+        forwarded.append(argument)
+
+    rows: list[dict] = []
+    for batch_size in candidates:
+        output = PROJECT_ROOT / f".bench_batch_{batch_size}.json"
+        command = [
+            sys.executable, str(Path(__file__).resolve()), *forwarded,
+            "--batch-size", str(batch_size), "--accum", "1", "--json", str(output),
+        ]
+        print(f"\n$ {' '.join(command)}", flush=True)
+        code = subprocess.call(command, cwd=str(PROJECT_ROOT))
+        if code != 0 or not output.exists():
+            print(f"batch {batch_size}: FAILED (exit {code}) -- treat as does not fit.")
+            rows.append({"batch_size": batch_size, "fits": False})
+            output.unlink(missing_ok=True)
+            continue
+        row = json.loads(output.read_text())
+        row["fits"] = True
+        row["batch_size"] = batch_size
+        rows.append(row)
+        output.unlink(missing_ok=True)
+
+    print("\n" + "=" * 78)
+    print(f"{'batch':>6}  {'fits':>5}  {'peak GiB':>9}  {'ms/step':>9}  {'img/s':>9}  {'views/s':>9}")
+    print("-" * 78)
+    for row in rows:
+        if not row["fits"]:
+            print(f"{row['batch_size']:>6}  {'no':>5}  {'-':>9}  {'-':>9}  {'-':>9}  {'-':>9}")
+            continue
+        print(
+            f"{row['batch_size']:>6}  {'yes':>5}  {row.get('peak_memory_gib', 0.0):>9.2f}  "
+            f"{row['ms_per_micro_batch']:>9.1f}  {row['images_per_second']:>9.1f}  "
+            f"{row['views_per_second']:>9.1f}"
+        )
+    print("=" * 78)
+
+    fitting = [row["batch_size"] for row in rows if row["fits"]]
+    if not fitting:
+        print("Nothing fits. Lower the candidates, or enable grad_checkpointing.")
+        return 1
+    largest = max(fitting)
+    print(
+        f"Largest physical batch that fits: {largest}.\n"
+        f"Use it with accumulation 1 and let the LR follow:\n"
+        f"    python main.py pretrain data.batch_size={largest} "
+        f"experiment.training.effective_batch_size={largest}\n"
+        "Leave headroom: this measures one micro-step on an otherwise idle card, and a real "
+        "run also holds the dataloader's pinned buffers and any allocator fragmentation that "
+        "accumulates over an epoch. If the largest candidate fits with under ~10 % of the "
+        "card free, take the next one down."
+    )
+    return 0
+
+
 # ---------------------------------------------------------------------- main
 
 
 def main() -> int:
     args = parse_args()
+    if args.find_batch_size:
+        return run_batch_size_search(args)
     if args.scaling:
         return run_scaling(args)
 
@@ -256,10 +357,14 @@ def main() -> int:
     model = DINO(
         backbone_name=args.backbone,
         input_dim=args.feature_dim,
-        hidden_dim=2048,
-        bottleneck_dim=256,
+        hidden_dim=args.hidden_dim,
+        bottleneck_dim=args.bottleneck_dim,
         out_dim=args.out_dim,
+        # Weights are irrelevant to a shape-and-schedule benchmark, and skipping
+        # the download keeps this runnable offline. Drop path IS relevant: it
+        # changes what backward has to store.
         pretrained=False,
+        drop_path_rate=args.drop_path,
     ).to(device)
     runtime = model.configure_runtime(
         compile_enabled=args.compile,

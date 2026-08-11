@@ -27,14 +27,14 @@ Section 4: *"an MLP with batch normalization and GELU activation functions. The
 final embeddings are normalized to facilitate stable self-distillation."*
 
 ```
-Linear(in_dim, 2048) → BN → GELU
-Linear(2048, 2048)   → BN → GELU
-Linear(2048, 256)                     # bottleneck
+Linear(768, 1024)  → LayerNorm → GELU
+Linear(1024, 1024) → LayerNorm → GELU
+Linear(1024, 256)                     # bottleneck
 L2 normalize
 weight_norm(Linear(256, 65536, bias=False))
 ```
 
-Two collapse guards, both on that final 65,536-wide layer:
+Two collapse guards, both on that final prototype layer:
 
 * `norm_last_layer=True` freezes its weight-norm gain permanently.
 * `freeze_last_layer_epochs=1` cancels its gradients for the first epoch
@@ -63,11 +63,19 @@ Two collapse guards, both on that final 65,536-wide layer:
 — the DINO head width, the encoder's projection to `z` — interpolates from
 `feature_dim`, so switching variants is a two-line config change:
 
-| `name` | `feature_dim` |
-| --- | --- |
-| `swinv2_tiny_window16_256` | 768 |
-| `swinv2_small_window16_256` | 768 |
-| `swinv2_base_window16_256` (default) | 1024 |
+| `name` | `feature_dim` | Params | GFLOPs/view @256 |
+| --- | --- | --- | --- |
+| `swinv2_tiny_window16_256` (**default**) | 768 | 27.58 M | 13.32 |
+| `swinv2_small_window16_256` | 768 | 49.7 M | 25.9 |
+| `swinv2_base_window16_256` | 1024 | 86.89 M | 43.94 |
+
+Tiny and Base figures are measured, and `tests/test_stage1_recipe.py`
+re-measures them. All three emit the same `8x8` final-stage token grid at
+256 px — only the channel width differs — which is what makes the swap invisible
+to stage 2's grid routing. `experiment=pretrain_swinv2_base_dino` runs the
+identical stage-1 recipe on Base as a capacity control, and sets both `name` and
+`feature_dim` together (`DINO.__init__` cross-checks them against the trunk's
+actual `num_features` and refuses a mismatch).
 
 `data.image_size` must equal the window resolution in the model name.
 

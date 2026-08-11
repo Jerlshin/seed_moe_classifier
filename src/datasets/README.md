@@ -76,7 +76,7 @@ hangs at the collective timeout rather than failing.
 
 The trainer must call `sampler.set_epoch(epoch)` every epoch. The permutation is
 a function of `seed + epoch`, so skipping it gives every epoch the identical
-order — no error, no change in the loss magnitude, and 300 epochs of one epoch.
+order — no error, no change in the loss magnitude, and 100 epochs of one epoch.
 
 ## Other datasets
 

@@ -118,26 +118,45 @@ def test_each_ablation_disables_exactly_one_component(variant, flag):
 
 
 def test_baseline_suite_covers_the_requested_models_plus_the_missing_controls():
-    """The three submitted baselines, plus the two the suite could not do without.
+    """The three submitted baselines, plus the three the suite could not do without.
 
     ``linear_probe`` answers the question a reviewer asks before any other --
     does the head machinery beat a linear layer on the same frozen features? --
     and ``hierarchical_cce`` is not that control, because it keeps the residual
-    and the SubVarietyEmbedding MLP. ``swinv2_supervised`` is the only variant
-    that separates in-domain self-supervision from the architecture.
+    and the SubVarietyEmbedding MLP.
+
+    ``imagenet_frozen`` and ``swinv2_supervised`` are the pair that separates
+    stage 1 from the architecture: same ImageNet initialisation, trunk frozen in
+    one and unfrozen in the other, neither reading a stage-1 checkpoint. Stage 1
+    is the most expensive thing in the pipeline, and without the frozen arm there
+    is no measurement of what it bought.
     """
     from scripts.run_baselines import BASELINE_VARIANTS
 
     assert sorted(spec.name for spec in BASELINE_VARIANTS) == [
         "hierarchical_cce",
+        "imagenet_frozen",
         "linear_probe",
         "resnet50",
         "swin_tiny",
         "swinv2_supervised",
     ]
     for spec in BASELINE_VARIANTS:
+        # The control is a control, not a baseline, and is named and grouped as
+        # one -- `generate_plots.py` groups the comparison table on `group`.
+        if spec.name == "imagenet_frozen":
+            assert spec.experiment == "control_imagenet_frozen"
+            assert spec.group == "control"
+            continue
         assert spec.experiment.startswith("baseline_")
         assert spec.group == "baseline"
+
+
+def test_the_imagenet_controls_never_receive_the_stage_one_checkpoint():
+    """Both ImageNet arms must ignore the shared encoder, or they stop being controls."""
+    from scripts.run_baselines import END_TO_END_BASELINES
+
+    assert {"imagenet_frozen", "swinv2_supervised"} <= END_TO_END_BASELINES
 
 
 # ------------------------------------------------------- command construction

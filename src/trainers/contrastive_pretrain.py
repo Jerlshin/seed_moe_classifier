@@ -10,6 +10,11 @@ that do not require patch tokens -- KoLeo and Sinkhorn-Knopp centering. It is
     python main.py pretrain data.batch_size=2 experiment.training.epochs=1 \
         experiment.training.max_batches=2
 
+The regime::
+
+    ImageNet-1k -> SwinV2-Tiny -> DINO self-distillation (trunk unfrozen)
+        -> domain-adapted encoder -> stage 2
+
 Per training step:
 
 1. Build ``2 + local_crops_number`` augmented views of each image.
@@ -19,13 +24,22 @@ Per training step:
    projection head's final-layer gradients during the first epoch.
 5. Advance the teacher by EMA at a cosine-scheduled momentum (0.996 -> 1.0).
 
-Gradients accumulate over ``gradient_accumulation_steps`` micro-batches before
-stepping, because every collapse guard in DINO is a batch statistic and
-``batch_size=16`` is far below the regime they were designed for.
+The **physical** batch is what the collapse guards see. Sinkhorn's assignment and
+KoLeo's nearest-neighbour distances are computed inside each micro-batch, so
+accumulation averages *gradients* and buys those statistics nothing: 16x4 and
+32x1 are the same effective batch and not the same run. The configuration
+therefore prefers physical batch to accumulation
+(``data.batch_size=32``, ``gradient_accumulation_steps=1``) and derives the
+learning rate from the effective batch it ends up with -- see
+:func:`resolve_learning_rate`, which applies the linear scaling rule rather than
+quoting DINO's rate at a batch 8x smaller than the one it belongs to.
 
 The run ends by writing two files: ``dino_pretrained_final.pth`` (full state) and
 ``dino_pretrained_backbone.pth`` (a bare ``student_backbone`` state dict). The
-latter is the **only** handoff to stage 2.
+latter is the **only** handoff to stage 2. ``experiment.training.save_epochs``
+additionally keeps a permanent encoder at each listed epoch
+(``dino_backbone_epoch_0025.pth`` and friends), which is what makes "was 100
+epochs necessary?" a question stage 2 can answer instead of a claim.
 
 How a step is executed
 ======================
@@ -37,7 +51,7 @@ of its wall clock not computing.
 
 **One backbone call, not six.** All ``6B`` student views go through
 ``forward_student_views`` as a single stacked tensor, and the teacher's ``2B``
-globals as another. A SwinV2 block at batch 16 does not fill a GPU -- its kernels
+globals as another. A SwinV2 block at one micro-batch does not fill a GPU -- its kernels
 are launch-bound -- and the per-view loop paid that overhead six times for the
 same total arithmetic. Peak activation memory is unchanged, because the loop
 already kept all six autograd graphs alive until backward.
@@ -69,7 +83,7 @@ CPU pipeline, not the GPU.
 
 **Window attention is SDPA, by algebraic rewrite.** timm runs SwinV2's cosine
 attention eagerly, and per block autograd saves two full ``[B*nW, heads, N, N]``
-matrices for backward -- ~12 GB of bf16 at 96 student views, the step's largest
+matrices for backward -- several GB of bf16 at 192 student views, the step's largest
 memory and bandwidth consumer and the binding constraint on the physical batch.
 ``experiment.training.sdpa_attention`` rebinds each attention module to an
 algebraically identical ``F.scaled_dot_product_attention`` form, parity-checked
@@ -98,14 +112,26 @@ batch -- and with it the LR/momentum regime the schedules are tuned to.
 ``experiment.training.effective_batch_size`` is therefore the authority:
 :func:`resolve_accumulation` derives ``gradient_accumulation_steps`` from it and
 the world size, and refuses to start on a combination that does not divide
-exactly. One GPU at ``16 x 4`` and two at ``16 x 2`` are the same 64 images per
+exactly. One GPU at ``32 x 1`` and two at ``16 x 1`` are the same 32 images per
 optimizer step.
 
 **Holding the per-rank micro-batch fixed is also what preserves the objective.**
 Sinkhorn centering and KoLeo are batch statistics, not per-sample means, and both
 are already computed per *micro-batch* under accumulation. A rank that sees the
-same 16 images per micro-batch therefore computes the identical function to a
-single-GPU run's micro-batch. What genuinely must be synchronised is
+same number of images per micro-batch therefore computes the identical function
+to a single-GPU run's micro-batch.
+
+The corollary is worth stating, because it cuts against the usual reading of
+"same effective batch, same run": splitting the configured batch of 32 across
+two ranks as ``16 x 2`` keeps the *gradient* identical to ``32 x 1`` and halves
+what Sinkhorn and KoLeo estimate from. If a second GPU is available, the
+statistically better use of it is ``data.batch_size=32`` on both ranks with
+``effective_batch_size=64`` -- a different, larger run -- or
+``model.loss.distributed_sinkhorn=true``, which normalises the assignment over
+the concatenated global batch and restores the 32-image estimate exactly (a
+different objective from the single-GPU one, hence opt-in).
+
+What genuinely must be synchronised is
 synchronised: gradients (by DDP, at accumulation boundaries only -- see
 :meth:`~src.models.backbones.swinv2_dino.DINO.no_sync`), the EMA centering buffer
 under ``centering="ema"``, and the teacher's weights at construction. Making the
@@ -146,6 +172,7 @@ from typing import Any
 import hydra
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from omegaconf import DictConfig, OmegaConf
@@ -165,6 +192,7 @@ from src.utils.training import (
     InterruptGuard,
     PeriodicSaver,
     ResumeState,
+    StageOneBudget,
     TeacherEmaUpdater,
     TrainingProgress,
     all_reduce_max,
@@ -179,6 +207,7 @@ from src.utils.training import (
     configure_backend,
     log_attention_maps,
     load_checkpoint_payload,
+    measure_gflops_per_view,
     resolve_amp,
     resolve_compile,
     resolve_num_workers,
@@ -331,45 +360,312 @@ def resume_position(
     )
 
 
-def build_optimizer(parameters, cfg: DictConfig, device: torch.device, logger) -> optim.Optimizer:
-    """AdamW over the student's parameters (Section 6.1), fused where available.
+#: Optimizer-group key marking the group the weight-decay schedule may move.
+#: The no-decay group carries ``False`` and the epoch-end ramp skips it; without
+#: the flag the ramp would walk every group and undo the split the moment the
+#: first epoch ended.
+WEIGHT_DECAY_FLAG = "apply_weight_decay"
+
+
+def resolve_learning_rate(
+    cfg: DictConfig,
+    effective_batch: int,
+    logger,
+) -> tuple[float, dict[str, Any]]:
+    """Return ``(lr, provenance)`` for the batch this run actually assembled.
+
+    Section 6.1 states 0.0005. That is DINO's rate **at its reference batch of
+    256**, and quoting it next to a batch of 16 or 32 is a 16x or 8x
+    overstatement of the intended step size -- the linear scaling rule
+    (Goyal et al., 2017) is what connects the two, and nothing in the previous
+    configuration applied it. Worse, the literal value was immune to every knob
+    that changes the batch: raising ``data.batch_size``, changing the
+    accumulation, or launching on a second GPU all moved the effective batch and
+    left the rate alone.
+
+    So the rate is derived here from ``effective_batch`` -- the number
+    :func:`resolve_accumulation` just finished pinning, which already accounts
+    for the micro-batch, the world size and the accumulation count:
+
+        lr = lr_base * effective_batch / lr_reference_batch_size
+
+    ``experiment.training.learning_rate`` remains an override: set a float and it
+    is used verbatim. ``lr_scaling: "none"`` uses ``lr_base`` at any batch. Both
+    paths return the same provenance dict, which is logged and written into the
+    event stream, so a run's own artifacts say which rule produced its rate.
+    """
+    training = "experiment.training"
+    configured = OmegaConf.select(cfg, f"{training}.learning_rate", default=None)
+    base = float(OmegaConf.select(cfg, f"{training}.lr_base", default=5e-4))
+    reference = int(OmegaConf.select(cfg, f"{training}.lr_reference_batch_size", default=256) or 256)
+    mode = str(OmegaConf.select(cfg, f"{training}.lr_scaling", default="linear")).lower()
+
+    if configured is not None:
+        learning_rate = float(configured)
+        rule = "configured"
+    elif mode == "linear":
+        if reference <= 0:
+            raise ValueError(f"lr_reference_batch_size must be positive, got {reference}")
+        learning_rate = base * effective_batch / reference
+        rule = "linear"
+    elif mode == "none":
+        learning_rate = base
+        rule = "lr_base"
+    else:
+        raise ValueError(f"lr_scaling must be 'linear' or 'none', got {mode!r}")
+
+    provenance = {
+        "learning_rate": learning_rate,
+        "rule": rule,
+        "lr_base": base,
+        "lr_reference_batch_size": reference,
+        "effective_batch_size": int(effective_batch),
+    }
+    if rule == "linear":
+        logger.info(
+            "Learning rate %.6g = lr_base %.6g x effective_batch %s / reference %s "
+            "(linear scaling; set experiment.training.learning_rate to override).",
+            learning_rate, base, effective_batch, reference,
+        )
+    else:
+        logger.info("Learning rate %.6g (%s; no batch scaling applied).", learning_rate, rule)
+    return learning_rate, provenance
+
+
+def _declared_no_decay(module: torch.nn.Module) -> set[str]:
+    """Names the module itself says must not be decayed, or an empty set.
+
+    timm models expose ``no_weight_decay()``, and on SwinV2 it names every
+    ``cpb_mlp`` -- the small MLP that generates the continuous relative-position
+    bias. Those are ordinary 2-D ``Linear`` weights, so no shape rule finds them,
+    and the SwinV2 authors excluded them deliberately: the MLP outputs a *bias*,
+    and decaying its weights pulls the learned position structure toward a
+    constant. Asking the model rather than guessing is both more correct and
+    less to maintain.
+    """
+    declare = getattr(module, "no_weight_decay", None)
+    if not callable(declare):
+        return set()
+    try:
+        return {str(name) for name in declare()}
+    except Exception:  # pragma: no cover - a model with a broken declaration
+        return set()
+
+
+def _is_no_decay(name: str, parameter: torch.nn.Parameter, declared: set[str]) -> bool:
+    """Whether ``name`` belongs in the decay-free group.
+
+    Three rules, in order of authority:
+
+    1. **The model's own declaration** (:func:`_declared_no_decay`).
+    2. **Biases**, by name.
+    3. **Anything with at most one non-singleton dimension.** This is the shape
+       rule DINO's ``get_params_groups`` writes as ``len(param.shape) == 1``,
+       widened for a reason: SwinV2's per-head ``logit_scale`` has shape
+       ``[heads, 1, 1]`` and is 3-D, so the literal 1-D test decays it. It is the
+       learned temperature of cosine attention, and decaying it toward zero
+       drives ``exp(logit_scale)`` toward 1 -- flattening every attention map in
+       the trunk, gradually, with nothing in the loss to say so. Counting
+       non-singleton axes classifies it as what it is: a per-head vector.
+    """
+    if name in declared or any(name.startswith(f"{prefix}.") for prefix in declared):
+        return True
+    if name.endswith(".bias"):
+        return True
+    return sum(1 for size in parameter.shape if size > 1) <= 1
+
+
+def build_param_groups(
+    *modules: torch.nn.Module,
+    weight_decay: float,
+) -> list[dict[str, Any]]:
+    """Split trainable parameters into decayed and non-decayed groups.
+
+    Biases, normalisation gains and every other vector-shaped parameter go into
+    the second group at ``weight_decay = 0``, as in DINO's own
+    ``get_params_groups``; see :func:`_is_no_decay` for the exact rules and why
+    the shape test is not the literal 1-D one.
+
+    Why this matters more here than usual: the weight decay is **scheduled to
+    0.4**, ten times its starting value. Decaying a LayerNorm gain toward zero
+    is not regularisation, it is a gradual deletion of the layer, and at 0.4 the
+    normalisation the trunk depends on erodes over the run while the loss curve
+    stays entirely plausible.
+
+    Parameters are de-duplicated by identity, so a module passed twice does not
+    receive two updates per step. Returns **two** groups always -- an empty one
+    is harmless and keeps ``param_groups[0]`` meaning "the decayed group"
+    regardless of the model.
+    """
+    decayed: dict[int, torch.nn.Parameter] = {}
+    plain: dict[int, torch.nn.Parameter] = {}
+    for module in modules:
+        if module is None:
+            continue
+        declared = _declared_no_decay(module)
+        for name, parameter in module.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            bucket = plain if _is_no_decay(name, parameter, declared) else decayed
+            bucket[id(parameter)] = parameter
+
+    return [
+        {
+            "params": list(decayed.values()),
+            "weight_decay": float(weight_decay),
+            WEIGHT_DECAY_FLAG: True,
+        },
+        {
+            "params": list(plain.values()),
+            "weight_decay": 0.0,
+            WEIGHT_DECAY_FLAG: False,
+        },
+    ]
+
+
+def apply_weight_decay(optimizer: optim.Optimizer, value: float) -> None:
+    """Set the scheduled weight decay on the decayed group only."""
+    for group in optimizer.param_groups:
+        if group.get(WEIGHT_DECAY_FLAG, True):
+            group["weight_decay"] = float(value)
+
+
+def build_optimizer(
+    param_groups,
+    cfg: DictConfig,
+    device: torch.device,
+    logger,
+    learning_rate: float | None = None,
+) -> optim.Optimizer:
+    """AdamW over the student's parameter groups (Section 6.1), fused where available.
 
     The fused implementation runs the whole update as a handful of multi-tensor
     kernels instead of ~440 small ones. That matters more here than the FLOP
-    count suggests: with ``gradient_accumulation_steps: 4`` the optimizer fires
-    once per four micro-batches, and the update's cost is almost entirely kernel
-    launches on tensors far too small to hide them.
+    count suggests: the optimizer fires once per accumulation window, and the
+    update's cost is almost entirely kernel launches on tensors far too small to
+    hide them.
 
     Falls back to the reference implementation if the build does not support it,
     which is a performance difference and never a numerical one.
+
+    ``param_groups`` is what :func:`build_param_groups` returns, so the per-group
+    ``weight_decay`` already set there wins over the value passed here -- which
+    is exactly the point of the split.
     """
     kwargs = {
-        "lr": float(cfg.experiment.training.learning_rate),
+        "lr": float(
+            learning_rate
+            if learning_rate is not None
+            else OmegaConf.select(cfg, "experiment.training.learning_rate", default=5e-4)
+        ),
         "weight_decay": float(cfg.experiment.training.weight_decay),
     }
     if device.type == "cuda" and bool(
         OmegaConf.select(cfg, "experiment.training.fused_optimizer", default=True)
     ):
         try:
-            return optim.AdamW(parameters, fused=True, **kwargs)
+            return optim.AdamW(param_groups, fused=True, **kwargs)
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning("Fused AdamW unavailable (%s); using the default implementation.", exc)
-    return optim.AdamW(parameters, **kwargs)
+    return optim.AdamW(param_groups, **kwargs)
 
 
-def build_scheduler(optimizer: optim.Optimizer, cfg: DictConfig):
-    """Cosine decay over the full run (paper Section 6.1), or ``None``."""
+def resolve_warmup_epochs(cfg: DictConfig) -> int:
+    """Warmup length in epochs, clamped so it cannot consume the whole run.
+
+    A smoke run at ``epochs=1`` composes the same config as a 100-epoch run, and
+    an unclamped 10-epoch warmup there would train the entire job at a tenth of
+    the rate while reporting a warmup that never finished.
+    """
+    epochs = int(cfg.experiment.training.epochs)
+    requested = int(OmegaConf.select(cfg, "experiment.training.warmup_epochs", default=0) or 0)
+    return max(min(requested, max(epochs - 1, 0)), 0)
+
+
+def build_scheduler(optimizer: optim.Optimizer, cfg: DictConfig, logger=None):
+    """Linear warmup then cosine decay, as **one** scheduler object, or ``None``.
+
+    Section 6.1 specifies cosine decay; DINO additionally warms the rate up over
+    the first 10 epochs, which the submitted configuration omitted entirely --
+    so step 0 hit a freshly-initialised prototype layer at the full rate, which
+    is the moment a self-distillation run is least able to absorb it.
+
+    Implemented as ``SequentialLR([LinearLR, CosineAnnealingLR])`` rather than as
+    a warmup branch inside the training loop. One object owns the whole
+    trajectory, which matters for three reasons: the loop keeps its single
+    unconditional ``scheduler.step()``; ``state_dict()`` round-trips both phases
+    *and the milestone*, so a resume inside warmup resumes inside warmup; and
+    there is no second scheduler holding a reference to the same optimizer,
+    which is the usual way a hand-rolled warmup ends up multiplying the rate by
+    two schedules at once.
+
+    The cosine spans ``epochs - warmup_epochs`` by default, so the decay reaches
+    ``eta_min`` on the final epoch. Using the full ``epochs`` would leave the
+    rate at a few percent of peak at the end and make the warmup silently
+    truncate the decay; an explicit ``scheduler.t_max`` overrides it.
+    """
     name = OmegaConf.select(cfg, "experiment.training.scheduler.name", default=None)
     if name is None:
         return None
-    if name == "cosine":
-        t_max = OmegaConf.select(cfg, "experiment.training.scheduler.t_max", default=None)
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=int(t_max or cfg.experiment.training.epochs),
-            eta_min=float(OmegaConf.select(cfg, "experiment.training.scheduler.eta_min", default=0.0)),
+    if name != "cosine":
+        raise ValueError(f"Unsupported scheduler: {name}")
+
+    epochs = int(cfg.experiment.training.epochs)
+    warmup_epochs = resolve_warmup_epochs(cfg)
+    eta_min = float(OmegaConf.select(cfg, "experiment.training.scheduler.eta_min", default=0.0))
+    t_max = OmegaConf.select(cfg, "experiment.training.scheduler.t_max", default=None)
+    cosine_epochs = int(t_max) if t_max else max(epochs - warmup_epochs, 1)
+
+    # Read the target rate BEFORE constructing anything: every LRScheduler
+    # applies its own factor to `param_groups` in ``__init__``, so a peak read
+    # after ``LinearLR`` exists is already the warmup's first step, not the peak.
+    peak = float(optimizer.param_groups[0]["lr"])
+
+    cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_epochs, eta_min=eta_min)
+    if warmup_epochs <= 0:
+        if logger is not None:
+            logger.info(
+                "LR schedule: cosine %.4g -> %.4g over %s epochs (no warmup).",
+                peak, eta_min, cosine_epochs,
+            )
+        return cosine
+
+    # start_factor = 1/warmup_epochs rather than 0: LinearLR rejects 0, and a
+    # first epoch at 1/10th of the target is the same ramp DINO's per-iteration
+    # warmup describes, sampled once per epoch.
+    warmup = optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0 / warmup_epochs,
+        end_factor=1.0,
+        total_iters=warmup_epochs,
+    )
+    if logger is not None:
+        logger.info(
+            "LR schedule: linear warmup %.4g -> %.4g over %s epochs (peak reached at the start "
+            "of epoch %s), then cosine over %s epochs to eta_min=%.4g.",
+            peak / warmup_epochs, peak, warmup_epochs, warmup_epochs + 1, cosine_epochs, eta_min,
         )
-    raise ValueError(f"Unsupported scheduler: {name}")
+    return optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+    )
+
+
+class _StudentViewPass(nn.Module):
+    """One student view, end to end, for the FLOP probe and nothing else.
+
+    ``FlopCounterMode`` intercepts dispatch under a module call, and the quantity
+    the cost table wants is per *view* through the path a training step actually
+    runs -- backbone, pooling, projection head. Measuring the backbone alone
+    would omit the head, which the student evaluates on all six views, not once
+    per image.
+    """
+
+    def __init__(self, model: DINO):
+        super().__init__()
+        self.model = model
+
+    def forward(self, views: torch.Tensor) -> torch.Tensor:
+        return self.model.forward_student_views(views)
 
 
 # --------------------------------------------------------------- view assembly
@@ -731,12 +1027,93 @@ def main(cfg: DictConfig) -> None:
         )
 
         # ------------------------------------------------------------ model
-        logger.info("Initialising DINO with backbone %s.", cfg.model.backbone.name)
+        pretrained_init = bool(OmegaConf.select(cfg, "model.backbone.pretrained", default=False))
+        logger.info(
+            "Initialising DINO with backbone %s (%s initialisation).",
+            cfg.model.backbone.name,
+            "ImageNet-1k pretrained" if pretrained_init else "random",
+        )
         model = build_dino(
             backbone_cfg=cfg.model.backbone,
             head_cfg=cfg.model.head,
             freeze_last_layer_epochs=int(cfg.experiment.training.freeze_last_layer_epochs),
         ).to(device)
+
+        # ------------------------------------------------- startup verification
+        #
+        # Three things that are silent when wrong and expensive to discover late.
+        #
+        # (1) The trunk must be TRAINABLE. `build_dino` already refuses
+        #     `freeze=true`, but nothing stops a future caller from freezing
+        #     parameters afterwards, and a run that self-distils into a frozen
+        #     trunk trains the projection head alone and publishes an unadapted
+        #     encoder. Counted, not assumed.
+        # (2) The teacher must NOT have stochastic depth. It is a deepcopy of the
+        #     student and its outputs are the targets; DropPath there is noise in
+        #     the label.
+        # (3) The shapes, end to end. The token grid in particular: stage 2's
+        #     grid routing consumes an 8x8 final stage, and a backbone swap that
+        #     changed it would surface much later as a reshape deep in the head.
+        parameters = model.parameter_summary()
+        if parameters["student_backbone_trainable"] != parameters["backbone"]:
+            raise RuntimeError(
+                "The SwinV2 trunk is not fully trainable "
+                f"({parameters['student_backbone_trainable']:,} of {parameters['backbone']:,} "
+                "parameters require gradient). Stage 1 fine-tunes the encoder; a frozen trunk "
+                "would train the projection head against fixed features and publish an "
+                "unadapted encoder. Check model.backbone.freeze."
+            )
+        shapes = model.shape_report(image_size=int(cfg.data.image_size), device=device)
+        logger.info(
+            "Shapes | input %s -> tokens %s (grid %sx%s = %s) -> pooled %s -> "
+            "head in %s -> bottleneck %s -> student prototypes %s / teacher %s",
+            shapes["input"], shapes["backbone_tokens"],
+            shapes["token_grid"][0], shapes["token_grid"][1], shapes["tokens_per_image"],
+            shapes["pooled_features"], shapes["head_input_dim"], shapes["head_bottleneck"],
+            shapes["student_prototypes"], shapes["teacher_prototypes"],
+        )
+        logger.info(
+            "Parameters | backbone %.2f M (%.2f M trainable) + DINO head %.2f M = student "
+            "%.2f M | teacher %.2f M (EMA only) | drop_path=%.3g on the student, disabled on "
+            "%s teacher modules",
+            parameters["backbone"] / 1e6,
+            parameters["student_backbone_trainable"] / 1e6,
+            parameters["dino_head"] / 1e6,
+            parameters["student_total"] / 1e6,
+            parameters["teacher_total"] / 1e6,
+            model.drop_path_rate,
+            model.teacher_drop_paths_disabled,
+        )
+        tracker.log_event(
+            "model_shapes",
+            {
+                **{key: list(value) if isinstance(value, tuple) else value
+                   for key, value in shapes.items()},
+                "pretrained_init": "imagenet1k" if pretrained_init else "random",
+                "drop_path_rate": model.drop_path_rate,
+                "teacher_drop_paths_disabled": model.teacher_drop_paths_disabled,
+                **{f"params_{key}": value for key, value in parameters.items()},
+            },
+        )
+
+        # GFLOPs per view, measured on the EAGER model before torch.compile and
+        # DDP touch it -- neither changes the arithmetic, and both make the
+        # dispatch counter's job harder. One forward at batch 1, under no_grad.
+        gflops_per_view = None
+        if bool(OmegaConf.select(cfg, "experiment.budget.enabled", default=True)) and bool(
+            OmegaConf.select(cfg, "experiment.budget.measure_flops", default=True)
+        ):
+            gflops_per_view = measure_gflops_per_view(
+                _StudentViewPass(model), int(cfg.data.image_size), device
+            )
+            if gflops_per_view is None:
+                logger.warning("FLOP counting is unavailable here; the budget omits GFLOPs.")
+            else:
+                logger.info(
+                    "Measured %.2f GFLOPs per %s px view (student backbone + head, forward).",
+                    gflops_per_view, int(cfg.data.image_size),
+                )
+
         runtime = model.configure_runtime(
             compile_enabled=resolve_compile(
                 OmegaConf.select(cfg, "experiment.training.compile.enabled", default="auto"),
@@ -826,8 +1203,31 @@ def main(cfg: DictConfig) -> None:
         )
         tracker.log_event("distributed_runtime", distributed_runtime)
 
-        optimizer = build_optimizer(student_parameters, cfg, device, logger)
-        scheduler = build_scheduler(optimizer, cfg)
+        # The accumulation count is resolved BEFORE the optimizer, because the
+        # learning rate is derived from the effective batch it pins. Deriving
+        # the rate from `data.batch_size` alone, or from a literal, is how a
+        # two-GPU relaunch silently trains at twice the intended step size.
+        accumulation_steps, effective_batch = resolve_accumulation(cfg, context, logger)
+        learning_rate, lr_provenance = resolve_learning_rate(cfg, effective_batch, logger)
+        tracker.log_event("learning_rate", lr_provenance)
+
+        # Two groups: everything with more than one dimension decays, biases and
+        # 1-D normalisation parameters do not. See build_param_groups.
+        param_groups = build_param_groups(
+            model.student_backbone,
+            model.student_head,
+            weight_decay=float(cfg.experiment.training.weight_decay),
+        )
+        logger.info(
+            "Optimizer groups | %s decayed tensors (wd %.3g -> %.3g), %s excluded "
+            "(biases and 1-D norm parameters, wd 0 throughout).",
+            len(param_groups[0]["params"]),
+            float(cfg.experiment.training.weight_decay),
+            float(OmegaConf.select(cfg, "experiment.training.weight_decay_final", default=0.0) or 0.0),
+            len(param_groups[1]["params"]),
+        )
+        optimizer = build_optimizer(param_groups, cfg, device, logger, learning_rate=learning_rate)
+        scheduler = build_scheduler(optimizer, cfg, logger=logger)
 
         save_path = Path(cfg.experiment.training.save_path)
         if context.is_main:
@@ -886,21 +1286,50 @@ def main(cfg: DictConfig) -> None:
         weight_decay_final = OmegaConf.select(
             cfg, "experiment.training.weight_decay_final", default=None
         )
-        accumulation_steps, effective_batch = resolve_accumulation(cfg, context, logger)
-        # Every collapse guard in DINO is a batch statistic, so the number that
-        # matters is the effective batch, not `data.batch_size`.
+        # Every collapse guard in DINO is a batch statistic, and it is the
+        # PER-MICRO-BATCH size those statistics actually see -- Sinkhorn and
+        # KoLeo run inside each micro-batch, so accumulation buys gradient
+        # averaging and nothing else. Both numbers are logged for that reason.
         logger.info(
-            "Effective batch: %s x %s ranks x %s accumulation = %s images "
-            "(%s teacher views/step, %s student views/step)",
+            "Effective batch: %s per rank x %s ranks x %s accumulation = %s images "
+            "(%s teacher views/step, %s student views/step). Sinkhorn/KoLeo see %s images "
+            "and %s teacher views per estimate.",
             int(cfg.data.batch_size),
             context.world_size,
             accumulation_steps,
             effective_batch,
             effective_batch * 2,
             effective_batch * num_crops,
+            int(cfg.data.batch_size),
+            int(cfg.data.batch_size) * 2,
+        )
+        entropy_min, entropy_max = criterion.entropy_bounds(int(cfg.data.batch_size) * 2)
+        logger.info(
+            "Teacher entropy bounds for this configuration: H in [%.3f, %.3f] nats "
+            "(K=%s prototypes, %s teacher views, centering=%s). The floor is structural, "
+            "not a model property -- read H against it, not against 0.",
+            entropy_min, entropy_max, int(cfg.model.head.out_dim),
+            int(cfg.data.batch_size) * 2, criterion.centering,
         )
         clip_grad = cfg.experiment.training.clip_grad
         save_interval = int(cfg.experiment.training.save_interval)
+        # Permanently-kept milestone epochs. Named artifacts, so
+        # `keep_last_n_checkpoints` never prunes them -- the point of the list is
+        # that all of 25/50/100 survive to be evaluated against each other.
+        save_epochs = sorted(
+            {
+                int(epoch)
+                for epoch in (
+                    OmegaConf.select(cfg, "experiment.training.save_epochs", default=None) or []
+                )
+                if 0 < int(epoch) <= epochs
+            }
+        )
+        if save_epochs:
+            logger.info(
+                "Milestone checkpoints (kept permanently) at epochs: %s",
+                ", ".join(str(epoch) for epoch in save_epochs),
+            )
         save_full_checkpoints = bool(cfg.experiment.training.save_full_checkpoints)
         save_teacher = bool(cfg.experiment.training.save_teacher_in_checkpoints)
         fast_forward = bool(
@@ -923,12 +1352,57 @@ def main(cfg: DictConfig) -> None:
 
         momentum = momentum_start
         logger.info(
-            "Training for %s epochs at lr=%s, teacher momentum=%s -> %s.",
+            "Training for %s epochs at lr=%.6g (%s epochs of warmup), teacher momentum=%s -> %s.",
             epochs,
-            cfg.experiment.training.learning_rate,
+            learning_rate,
+            resolve_warmup_epochs(cfg),
             momentum_start,
             momentum_final if momentum_final is not None else "(constant)",
         )
+
+        # ---------------------------------------------------------- budget
+        # Assembled now (everything it needs is resolved), printed twice: here
+        # without the runtime half, and again at the end with it. An interrupted
+        # run therefore still leaves a complete parameter/compute report.
+        batches_per_epoch = (
+            min(len(dataloader), int(max_batches)) if max_batches is not None else len(dataloader)
+        )
+        budget = StageOneBudget.from_model(
+            parameters,
+            gflops_per_view=gflops_per_view,
+            image_size=int(cfg.data.image_size),
+            views_per_image=num_crops,
+            global_views_per_image=2,
+            epochs=epochs,
+            physical_batch_size=int(cfg.data.batch_size),
+            gradient_accumulation_steps=accumulation_steps,
+            world_size=context.world_size,
+            effective_batch_size=effective_batch,
+            steps_per_epoch=-(-batches_per_epoch // accumulation_steps),
+            images_per_epoch=batches_per_epoch * int(cfg.data.batch_size) * context.world_size,
+            precision=amp.label,
+            optimizer=str(cfg.experiment.training.optimizer.name),
+            learning_rate=learning_rate,
+            weight_decay=weight_decay_start,
+            backbone_name=str(cfg.model.backbone.name),
+            pretrained_init="ImageNet-1k" if pretrained_init else "random",
+            drop_path_rate=model.drop_path_rate,
+            prototypes=int(cfg.model.head.out_dim),
+        )
+        budget_enabled = bool(OmegaConf.select(cfg, "experiment.budget.enabled", default=True))
+        if budget_enabled and context.is_main:
+            logger.info("Stage-1 budget (pre-run)\n%s", budget.format_table())
+            tracker.log_metrics(budget.as_metrics(), step=0)
+            tracker.log_event("stage1_budget", {"phase": "start", **budget.as_dict()})
+
+        # Whole-run memory high-water marks. The epoch loop resets CUDA's peak
+        # counters so it can report per-epoch memory, so the run-wide maximum has
+        # to be accumulated here or the final report would show only the last
+        # epoch's peak -- lower than the truth, in the direction that gets a
+        # relaunch OOM-killed.
+        run_peak_allocated_gb = 0.0
+        run_peak_reserved_gb = 0.0
+        images_processed = 0
 
         periodic = PeriodicSaver(
             OmegaConf.select(cfg, "experiment.training.resume_every_minutes", default=None)
@@ -958,7 +1432,7 @@ def main(cfg: DictConfig) -> None:
 
                 # The sampler's permutation is a function of `seed + epoch`.
                 # Without this call every epoch replays the first one -- no
-                # error, no visible change in the loss magnitude, and 300 epochs
+                # error, no visible change in the loss magnitude, and 100 epochs
                 # of one epoch's data.
                 if sampler is not None:
                     sampler.set_epoch(epoch)
@@ -1286,12 +1760,17 @@ def main(cfg: DictConfig) -> None:
                 # Weight decay is cosine-scheduled 0.04 -> 0.4 in DINO. The
                 # submitted constant 0.01 sat below even the schedule's starting
                 # value.
+                #
+                # `apply_weight_decay` moves the DECAYED group only. Walking
+                # every group here -- which is what the previous version did --
+                # would push 0.4 onto the biases and LayerNorm gains that
+                # `build_param_groups` deliberately excluded, so the exclusion
+                # would survive exactly one epoch.
                 if weight_decay_final is not None:
                     decay = cosine_value(
                         weight_decay_start, float(weight_decay_final), epoch + 1, epochs
                     )
-                    for group in optimizer.param_groups:
-                        group["weight_decay"] = decay
+                    apply_weight_decay(optimizer, decay)
 
                 epoch_metrics = {
                     "loss": average_loss,
@@ -1304,8 +1783,18 @@ def main(cfg: DictConfig) -> None:
                     ),
                     "data_wait_fraction": data_wait / epoch_seconds,
                 }
+                images_processed += batches_seen * int(cfg.data.batch_size) * context.world_size
                 if device.type == "cuda":
                     epoch_metrics["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1024**2
+                    epoch_metrics["peak_reserved_mb"] = torch.cuda.max_memory_reserved() / 1024**2
+                    # Run-wide maxima, kept here because the next epoch resets
+                    # the counters these are read from.
+                    run_peak_allocated_gb = max(
+                        run_peak_allocated_gb, epoch_metrics["peak_memory_mb"] / 1024.0
+                    )
+                    run_peak_reserved_gb = max(
+                        run_peak_reserved_gb, epoch_metrics["peak_reserved_mb"] / 1024.0
+                    )
                 tracker.log_metrics(epoch_metrics, epoch + 1, prefix="epoch")
                 logger.info(
                     "Epoch %s/%s | loss=%.5f batches=%s duration=%.2fs img/s=%.1f "
@@ -1345,6 +1834,44 @@ def main(cfg: DictConfig) -> None:
                     tracker.log_event("checkpoint", {"epoch": epoch + 1, "path": checkpoint_file})
                     logger.info("Saved interval checkpoint: %s", checkpoint_file)
 
+                # Milestone checkpoints, written with NO rolling prefix so
+                # `CheckpointManager.prune` never considers them. That is the
+                # difference from the interval series above and the reason both
+                # exist: "is 100 epochs of stage 1 better than 25" is answerable
+                # only if the epoch-25 encoder is still on disk at the end.
+                #
+                # Each one is published as a bare backbone too, because that --
+                # not the training state -- is what stage 2 consumes, and asking
+                # a reader to re-derive it from the full checkpoint is how the
+                # comparison never gets run.
+                if (epoch + 1) in save_epochs:
+                    milestone_file = save_dino_checkpoint(
+                        model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch + 1,
+                        checkpoint_manager=checkpoint_manager,
+                        filename=f"dino_milestone_epoch_{epoch + 1:04d}.pth",
+                        include_optimizer=save_full_checkpoints,
+                        include_teacher=save_teacher,
+                        rolling_prefix=None,
+                    )
+                    milestone_backbone = save_path / f"dino_backbone_epoch_{epoch + 1:04d}.pth"
+                    if context.is_main:
+                        torch.save(
+                            to_cpu_state_dict(model.student_backbone.state_dict()),
+                            milestone_backbone,
+                        )
+                    tracker.log_event(
+                        "milestone_checkpoint",
+                        {
+                            "epoch": epoch + 1,
+                            "path": milestone_file,
+                            "backbone": str(milestone_backbone),
+                        },
+                    )
+                    logger.info(
+                        "Milestone checkpoint at epoch %s (kept permanently): %s | encoder: %s",
+                        epoch + 1, milestone_file, milestone_backbone,
+                    )
+
                 # End-of-epoch resume point. `micro_step=0` means the next epoch
                 # starts from its first batch with nothing to fast-forward.
                 save_resume_checkpoint(
@@ -1374,6 +1901,25 @@ def main(cfg: DictConfig) -> None:
                 "training_interrupted",
                 {"global_step": global_step, "duration_seconds": time.perf_counter() - training_started},
             )
+            # The runtime half of the budget, for the segment that did run. On a
+            # session-limited platform this is the *only* path that ever
+            # executes, so skipping it here would mean the throughput and peak
+            # VRAM of a Kaggle or vast.ai run were never reported at all. The
+            # numbers describe this segment, not the whole schedule.
+            budget.record_runtime(
+                device,
+                training_seconds=time.perf_counter() - training_started,
+                images_processed=images_processed,
+                peak_allocated_gb=run_peak_allocated_gb or None,
+                peak_reserved_gb=run_peak_reserved_gb or None,
+            )
+            budget.notes.append(
+                f"Interrupted at step {global_step} of epoch {epoch + 1}/{epochs}; the runtime "
+                "figures cover this segment only."
+            )
+            if budget_enabled and context.is_main:
+                logger.info("Stage-1 budget (interrupted segment)\n%s", budget.format_table())
+                tracker.log_event("stage1_budget", {"phase": "interrupted", **budget.as_dict()})
             return
 
         # ------------------------------------------------------- final saves
@@ -1420,6 +1966,22 @@ def main(cfg: DictConfig) -> None:
                 **{f"runtime_{key}": value for key, value in runtime.items()},
             },
         )
+
+        # The budget again, now with the runtime half measured. Printed as one
+        # block so it can be pasted into the paper's cost table without being
+        # reassembled from a hundred log lines.
+        budget.record_runtime(
+            device,
+            training_seconds=total_seconds,
+            images_processed=images_processed,
+            peak_allocated_gb=run_peak_allocated_gb or None,
+            peak_reserved_gb=run_peak_reserved_gb or None,
+        )
+        if budget_enabled and context.is_main:
+            logger.info("Stage-1 budget (final)\n%s", budget.format_table())
+            tracker.log_metrics(budget.as_metrics(), step=global_step)
+            tracker.log_event("stage1_budget", {"phase": "final", **budget.as_dict()})
+
         logger.info(
             "Pretraining complete in %.2fs. Final: %s. Backbone for stage 2: %s",
             total_seconds, final_file, backbone_file,

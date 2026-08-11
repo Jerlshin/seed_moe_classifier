@@ -2,7 +2,7 @@
 """Per-module parity report for the SwinV2 -> SDPA attention conversion.
 
     python scripts/diagnose_sdpa_parity.py
-    python scripts/diagnose_sdpa_parity.py --backbone swinv2_tiny_window16_256
+    python scripts/diagnose_sdpa_parity.py --backbone swinv2_base_window16_256
     python scripts/diagnose_sdpa_parity.py --device cpu
 
 For every ``WindowAttention`` module in the backbone this prints, on the
@@ -54,7 +54,7 @@ from src.utils.training import select_device  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--backbone", default="swinv2_base_window16_256")
+    parser.add_argument("--backbone", default="swinv2_tiny_window16_256")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()

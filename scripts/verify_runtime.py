@@ -218,7 +218,7 @@ def run_ddp_check(processes: int) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--backbone", default="swinv2_base_window16_256")
+    parser.add_argument("--backbone", default="swinv2_tiny_window16_256")
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--gpus",
