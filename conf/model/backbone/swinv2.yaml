@@ -25,7 +25,9 @@
 # runs 6 views per image, so the 3.3x compute cut is what makes 100 epochs of
 # in-domain self-distillation affordable at a physical batch the collapse guards
 # can actually estimate from.
-name: "swinv2_tiny_window16_256"
+
+# name: "swinv2_tiny_window16_256"
+name: "swinv2_small_window16_256"
 feature_dim: 768
 
 # ImageNet-1k initialisation.
