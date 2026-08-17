@@ -42,6 +42,10 @@ from tests.conftest import (
     REVISED_BACKBONE_FEATURE_DIM,
     REVISED_BACKBONE_GFLOPS_PER_VIEW,
     REVISED_BACKBONE_PARAMS_M,
+    SHIPPED_BACKBONE,
+    SHIPPED_BACKBONE_FEATURE_DIM,
+    SHIPPED_BACKBONE_GFLOPS_PER_VIEW,
+    SHIPPED_BACKBONE_PARAMS_M,
     REVISED_DINO_BOTTLENECK_DIM,
     REVISED_DINO_HEAD_LAYERS,
     REVISED_DINO_HIDDEN_DIM,
@@ -111,6 +115,41 @@ def test_measured_gflops_per_view_matches_the_reported_budget():
         pytest.skip("FlopCounterMode is unavailable on this torch build")
     # Backbone only; the trainer measures backbone + head, which adds ~0.01.
     assert measured == pytest.approx(REVISED_BACKBONE_GFLOPS_PER_VIEW, rel=0.02)
+
+
+def test_shipped_small_trunk_costs_what_the_stage1_report_claims():
+    """The trunk `conf/` actually selects, measured rather than quoted.
+
+    The stage-1 evaluation report and `STAGE1_EVALUATION.md` both quote 48.96 M
+    parameters and ~25.6 GFLOPs/view, and the published 100-epoch checkpoint is a
+    Small. Pinning them here is what stops those documents from drifting into a
+    claim about the Tiny trunk the configs used to select.
+    """
+    import timm
+
+    backbone = timm.create_model(SHIPPED_BACKBONE, pretrained=False, num_classes=0)
+    parameters = sum(p.numel() for p in backbone.parameters()) / 1e6
+    assert backbone.num_features == SHIPPED_BACKBONE_FEATURE_DIM
+    assert parameters == pytest.approx(SHIPPED_BACKBONE_PARAMS_M, abs=0.05)
+
+    with torch.no_grad():
+        tokens = backbone.forward_features(torch.zeros(1, 3, 256, 256))
+    # Same 8x8 grid as Tiny and Base: the reason a trunk swap is invisible to
+    # stage 2's grid routing, and why only the channel width had to change.
+    assert tokens.shape[1] * tokens.shape[2] == PAPER_TOKEN_GRID
+    assert tokens.shape[-1] == SHIPPED_BACKBONE_FEATURE_DIM
+
+
+@pytest.mark.slow
+def test_shipped_small_trunk_gflops_match_the_evaluation_report():
+    measured = measure_gflops_per_view(
+        __import__("timm").create_model(SHIPPED_BACKBONE, pretrained=False, num_classes=0),
+        256,
+        torch.device("cpu"),
+    )
+    if measured is None:
+        pytest.skip("FlopCounterMode is unavailable on this torch build")
+    assert measured == pytest.approx(SHIPPED_BACKBONE_GFLOPS_PER_VIEW, rel=0.02)
 
 
 # ----------------------------------------------------- initialisation regime

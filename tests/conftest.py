@@ -80,6 +80,21 @@ SUBMITTED_BACKBONE_FEATURE_DIM = 1024
 REVISED_BACKBONE_FEATURE_DIM = 768
 REVISED_BACKBONE_PARAMS_M = 27.58      # +-0.01, swinv2_tiny_window16_256
 REVISED_BACKBONE_GFLOPS_PER_VIEW = 13.32   # forward, 1 view at 256 px
+
+# The trunk `conf/model/backbone/swinv2.yaml` actually selects, and the one the
+# published 100-epoch checkpoint was trained with: SwinV2-**Small**, a third
+# constant rather than an edit to REVISED_BACKBONE, because the Tiny numbers above
+# are still what several tests measure and a test asserting a bare name must be
+# able to say which trunk it means.
+#
+# Both figures are MEASURED: the params from timm, the GFLOPs from
+# FlopCounterMode, and the stage-1 run's own budget report printed 25.57
+# GFLOPs/view for backbone + head against the 25.56 measured here for the
+# backbone alone.
+SHIPPED_BACKBONE = "swinv2_small_window16_256"
+SHIPPED_BACKBONE_FEATURE_DIM = 768
+SHIPPED_BACKBONE_PARAMS_M = 48.96
+SHIPPED_BACKBONE_GFLOPS_PER_VIEW = 25.56
 SUBMITTED_EPOCHS = 300
 REVISED_EPOCHS = 100
 REVISED_LR_WARMUP_EPOCHS = 10

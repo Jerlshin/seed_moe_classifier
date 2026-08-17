@@ -1,7 +1,7 @@
 # `tests/` — pytest suite
 
 ```bash
-python -m pytest tests/ -q             # all 458, ~35s
+python -m pytest tests/ -q             # all 518, ~95s
 python -m pytest tests/ -k arcface     # one topic
 python -m pytest tests/test_models.py  # one file
 ```
@@ -16,6 +16,8 @@ No network access, no weight downloads, no dependency on the real dataset.
 | `test_losses.py` | Bounds, KL direction, ArcFace stability, DINO schedule, ablation toggles |
 | `test_models.py` | Full cascade shapes, Eq. 8/9/11 dataflow, Top-2 routing, the four component toggles, baselines |
 | `test_metrics.py` | Alignment rate, per-class metrics, AUC with absent classes, t-SNE |
+| `test_representation.py` | Stage-1 metrics against cases with known answers: RankMe on collapsed vs full-rank features, probe/k-NN at chance on noise, purity vs Hungarian accuracy on over-clustering, retrieval with and without group exclusion |
+| `test_pretrain_eval.py` | The evaluation stage's protocol and provenance: feature-cache digest guard, out-of-fold coverage and group disjointness, encoder-spec validation, event-stream axis separation |
 | `test_efficiency.py` | Total vs. active parameters, Top-2 vs. Top-4, FLOPs, latency |
 | `test_evaluation.py` | Prediction dumps, `summary.json`, the comparison CSV, publication figures |
 | `test_runner.py` | Suite definitions, command construction, shared-checkpoint handling |

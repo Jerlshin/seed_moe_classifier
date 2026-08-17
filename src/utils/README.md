@@ -3,14 +3,34 @@
 | File | Contents |
 | --- | --- |
 | `metrics.py` | Every quantity the paper's Section 6 reports, for **one** set of predictions |
+| `representation.py` | Stage-1 metrics: geometry, frozen-feature readouts, unsupervised structure |
 | `efficiency.py` | Parameter accounting, FLOPs, latency, throughput, peak memory |
-| `evaluation.py` | The cross-run layer: prediction dumps, `summary.json`, the comparison CSV |
-| `visualization.py` | Matplotlib figures for the paper's plots |
+| `evaluation.py` | The cross-run layer: prediction dumps, `summary.json`, the comparison CSV, stage-1 event-stream recovery |
+| `visualization.py` | Matplotlib figures for the paper's plots and the stage-1 report |
 | `training/` | Tracker, checkpoints, logging, device selection, attention maps |
 
 The split between `metrics` and `evaluation` is by scope: `metrics.py` scores one
 evaluation pass in memory, `evaluation.py` defines the on-disk contract that lets
 a *later* process compare runs that finished hours apart on different machines.
+
+The split between `metrics` and `representation` is by *what exists*. `metrics.py`
+scores the predictions of a trained classifier. After stage 1 there is no
+classifier — DINO leaves an encoder and a 2,048-way prototype head whose classes
+have no names — and the DINO loss is a cross-entropy against a teacher that moved
+during training, so it is comparable to nothing. `representation.py` is the
+instrument set for that situation:
+
+| Family | Functions | Detects |
+| --- | --- | --- |
+| Label-free geometry | `spectral_report` (RankMe, participation ratio), `feature_statistics`, `alignment_uniformity`, `augmentation_consistency`, `linear_cka` | dimensional collapse, dead channels, whether the trained-for invariance actually holds |
+| Frozen-feature readout | `linear_probe`, `select_regularisation`, `low_shot_probe`, `knn_classifier` | whether the classes are linearly separable, and separable at all under plain cosine distance |
+| Structure without labels | `kmeans_report`, `prototype_report`, `retrieval_report`, `class_separability`, `centroid_similarity_matrix` | whether the taxonomy emerged *before* any label was seen |
+
+They fail independently, which is the point: a probe far above the k-NN says the
+classes are linearly separable but not compactly clustered — the exact gap stage
+2's ArcFace margin and compactness terms exist to close.
+`architecture/08_STAGE1_REPRESENTATION_EVALUATION.md` states each definition and
+why it was chosen.
 
 ## `metrics.py`
 

@@ -2,6 +2,7 @@
 
     python main.py pretrain                   # DINO self-supervised pretraining
     python main.py pretrain --gpus 2          # the same, over 2 GPUs with DDP
+    python main.py eval-pretrain              # evaluate the stage-1 representation
     python main.py finetune                   # hierarchical MoE finetuning
     python main.py ablation                   # flat-classifier ablation
     python main.py smoke                      # 2-batch dry run of both stages
@@ -22,6 +23,12 @@ it, because ``resume=auto`` starts fresh when there is nothing to continue:
 
     python main.py pretrain --gpus 2 experiment.training.resume=auto \\
         experiment.training.max_runtime_minutes=520
+
+``eval-pretrain`` sits between the two stages and needs no extra flags -- it reads
+the milestone encoders the pretraining stage already published:
+
+    python main.py eval-pretrain
+    python main.py eval-pretrain experiment.evaluation.split.protocol=stratified
 
 For the full suites, use the dedicated runners instead, which handle output
 layout, shared-checkpoint reuse and result aggregation:
@@ -45,9 +52,19 @@ from pathlib import Path
 PRETRAIN = [sys.executable, "-m", "src.trainers.contrastive_pretrain", "experiment=pretrain_swinv2_dino"]
 FINETUNE = [sys.executable, "-m", "src.trainers.moe_finetune", "experiment=finetune_hierarchical_moe"]
 ABLATION = [sys.executable, "-m", "src.trainers.moe_finetune", "experiment=ablation_flat_classifier"]
+# Stage-1 evaluation. Not a training stage: it loads finished encoders and scores
+# the representation itself (probe, k-NN, clustering, geometry, invariance,
+# prototypes), so it belongs between the two stages rather than after both.
+EVAL_PRETRAIN = [
+    sys.executable,
+    "-m",
+    "src.trainers.pretrain_eval",
+    "experiment=eval_pretrain_representation",
+]
 
 COMMANDS: dict[str, list[list[str]]] = {
     "pretrain": [PRETRAIN],
+    "eval-pretrain": [EVAL_PRETRAIN],
     "finetune": [FINETUNE],
     "ablation": [ABLATION],
 }
@@ -99,7 +116,8 @@ def main() -> int:
         help=(
             "Processes to launch with DDP: a count, or 'auto' for every visible CUDA "
             "device. Delegates to scripts/launch.py. Not available for 'smoke', which "
-            "is a shape check rather than a training run."
+            "is a shape check rather than a training run, nor for 'eval-pretrain', "
+            "which is one forward pass per encoder and has no gradient to reduce."
         ),
     )
     # `parse_known_args`, not a REMAINDER positional: a REMAINDER swallows
@@ -114,8 +132,8 @@ def main() -> int:
     if multi_gpu:
         if args.stage not in LAUNCHER_STAGES:
             parser.error(
-                f"--gpus is not supported for the {args.stage!r} stage; it runs two short "
-                "single-process passes to check shapes and configuration."
+                f"--gpus is not supported for the {args.stage!r} stage; it is a single-process "
+                "pass over the dataset, not a training run."
             )
         launcher = str(Path(__file__).resolve().parent / "scripts" / "launch.py")
         command = [sys.executable, launcher, args.stage, "--gpus", args.gpus, *overrides]

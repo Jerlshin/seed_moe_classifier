@@ -570,6 +570,201 @@ def save_publication_figures(
     return written
 
 
+# ------------------------------------------------------- stage-1 event stream
+
+
+def load_event_stream(path: str | Path) -> list[dict[str, Any]]:
+    """Parse a run's ``events.jsonl``, skipping malformed lines.
+
+    Every trainer appends to this file unconditionally (``ExperimentTracker``),
+    so it is the one machine-readable record of a finished run that exists even
+    when TensorBoard and W&B were unavailable -- which is exactly the situation a
+    later reviewer is in. Malformed trailing lines are skipped rather than raised
+    on: a run killed mid-write leaves a truncated last line, and refusing to read
+    the other 99.9 % of it would be the wrong trade.
+    """
+    records: list[dict[str, Any]] = []
+    file = Path(path)
+    if not file.exists():
+        return records
+    with file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                records.append(payload)
+    return records
+
+
+@dataclass
+class PretrainDynamics:
+    """Stage-1 training dynamics recovered from one run's event stream.
+
+    ``step_series`` and ``epoch_series`` are ``{metric: (x, y)}`` with ``x`` the
+    global step or the epoch index, so a figure can be redrawn from a finished
+    run without W&B, TensorBoard, or the checkpoint.
+
+    The point of separating the two is that they answer different questions. The
+    epoch series is the *learning curve* -- was the objective still improving when
+    the budget ran out. The step series carries the collapse diagnostics
+    (``train/teacher_entropy``, ``train/prototype_utilization``), which are
+    per-step device tensors and are the only evidence available that the run's
+    representation did not quietly degenerate on its way to a falling loss.
+    """
+
+    run_dir: str = ""
+    step_series: dict[str, tuple[list[float], list[float]]] = field(default_factory=dict)
+    epoch_series: dict[str, tuple[list[float], list[float]]] = field(default_factory=dict)
+    events: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def series(self, key: str) -> tuple[list[float], list[float]]:
+        """``(x, y)`` for ``key``, from whichever stream carries it."""
+        if key in self.epoch_series:
+            return self.epoch_series[key]
+        return self.step_series.get(key, ([], []))
+
+    def final(self, key: str, window: int = 1) -> float:
+        """Mean of the last ``window`` values of ``key``, or NaN."""
+        _, values = self.series(key)
+        if not values:
+            return float("nan")
+        tail = values[-max(int(window), 1) :]
+        return float(sum(tail) / len(tail))
+
+    def initial(self, key: str, window: int = 1) -> float:
+        """Mean of the first ``window`` values of ``key``, or NaN."""
+        _, values = self.series(key)
+        if not values:
+            return float("nan")
+        head = values[: max(int(window), 1)]
+        return float(sum(head) / len(head))
+
+    def summary(self) -> dict[str, Any]:
+        """Scalars a report can quote, plus the two derived judgements.
+
+        ``loss_improvement_last_quarter`` is the number that decides whether the
+        epoch budget was the binding constraint: it is the drop in epoch loss over
+        the final 25 % of training, in the same units as the loss. Near zero means
+        the run converged and more epochs would buy little; still-falling means the
+        schedule ended early, whatever the loss curve looks like at full scale.
+
+        ``teacher_entropy_vs_floor`` is the collapse verdict, and it is reported as
+        a *ratio to the structural floor* rather than as a bare entropy, because
+        ``H`` scales with ``log K`` and an exactly doubly-stochastic Sinkhorn
+        assignment cannot go below ``log(K / B_teacher)`` in the first place.
+        """
+        epochs, losses = self.series("epoch/loss")
+        summary: dict[str, Any] = {
+            "epochs_completed": len(epochs),
+            "steps_logged": len(self.step_series.get("train/loss", ([], []))[0]),
+            "loss_initial": self.initial("epoch/loss"),
+            "loss_final": self.final("epoch/loss"),
+        }
+        if losses:
+            quarter = max(len(losses) // 4, 1)
+            summary["loss_improvement_last_quarter"] = float(losses[-quarter] - losses[-1])
+            summary["loss_improvement_total"] = float(losses[0] - losses[-1])
+            summary["loss_min"] = float(min(losses))
+            summary["loss_min_epoch"] = int(epochs[losses.index(min(losses))]) if epochs else -1
+
+        entropy_final = self.final("train/teacher_entropy", window=20)
+        floor = self.final("train/teacher_entropy_min", window=1)
+        ceiling = self.final("train/teacher_entropy_max", window=1)
+        summary.update(
+            {
+                "teacher_entropy_final": entropy_final,
+                "teacher_entropy_floor": floor,
+                "teacher_entropy_ceiling": ceiling,
+                "teacher_entropy_normalized_final": self.final("train/teacher_entropy_normalized", window=20),
+                "teacher_entropy_vs_floor": (
+                    float(entropy_final / floor) if floor and floor == floor else float("nan")
+                ),
+                "prototype_utilization_final": self.final("train/prototype_utilization", window=20),
+                "prototype_perplexity_final": self.final("train/prototype_perplexity", window=20),
+                "koleo_initial": self.initial("train/koleo", window=20),
+                "koleo_final": self.final("train/koleo", window=20),
+                "gradient_norm_final": self.final("train/gradient_norm", window=20),
+                "images_per_second_mean": _mean_of(self.series("epoch/images_per_second")[1]),
+                "data_wait_fraction_mean": _mean_of(self.series("epoch/data_wait_fraction")[1]),
+                "epoch_duration_seconds_mean": _mean_of(self.series("epoch/duration_seconds")[1]),
+                "peak_memory_mb_max": (
+                    max(self.series("epoch/peak_memory_mb")[1])
+                    if self.series("epoch/peak_memory_mb")[1]
+                    else float("nan")
+                ),
+            }
+        )
+        total = self.series("epoch/duration_seconds")[1]
+        summary["training_hours"] = float(sum(total) / 3600.0) if total else float("nan")
+        return summary
+
+
+def _mean_of(values: Sequence[float]) -> float:
+    finite = [float(value) for value in values if value == value]
+    return float(sum(finite) / len(finite)) if finite else float("nan")
+
+
+def parse_pretrain_dynamics(
+    events_path: str | Path,
+    step_keys: Sequence[str] = (),
+    epoch_keys: Sequence[str] = (),
+) -> PretrainDynamics:
+    """Recover :class:`PretrainDynamics` from a stage-1 ``events.jsonl``.
+
+    ``step_keys`` and ``epoch_keys`` are prefixes; empty tuples take
+    ``train/*`` and ``epoch/*`` respectively, which is what the stage-1 trainer
+    emits. Non-metric events (``stage1_budget``, ``milestone_checkpoint``,
+    ``shared_backbone``, ``learning_rate``, ``model_shapes``) are kept whole under
+    :attr:`PretrainDynamics.events`, because they carry the run's provenance and a
+    report needs to quote it rather than re-derive it.
+    """
+    records = load_event_stream(events_path)
+    step_prefixes = tuple(step_keys) or ("train/",)
+    epoch_prefixes = tuple(epoch_keys) or ("epoch/",)
+
+    step_series: dict[str, tuple[list[float], list[float]]] = {}
+    epoch_series: dict[str, tuple[list[float], list[float]]] = {}
+    events: dict[str, list[dict[str, Any]]] = {}
+
+    for record in records:
+        kind = str(record.get("type", ""))
+        if kind != "metrics":
+            events.setdefault(kind, []).append(record)
+            continue
+        step = float(record.get("step", 0) or 0)
+        for key, value in (record.get("metrics") or {}).items():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if key.startswith(epoch_prefixes):
+                bucket = epoch_series
+            elif key.startswith(step_prefixes):
+                bucket = step_series
+            else:
+                continue
+            x_values, y_values = bucket.setdefault(key, ([], []))
+            x_values.append(step)
+            y_values.append(float(value))
+
+    # Epoch metrics are logged with `step = epoch`, but the trainer also emits a
+    # step-indexed record in the same second; re-index the epoch stream on a
+    # 1..N counter so the two are never plotted against the same x axis by
+    # accident.
+    for key, (_, y_values) in epoch_series.items():
+        epoch_series[key] = ([float(index) for index in range(1, len(y_values) + 1)], y_values)
+
+    return PretrainDynamics(
+        run_dir=str(Path(events_path).parent),
+        step_series=step_series,
+        epoch_series=epoch_series,
+        events=events,
+    )
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}

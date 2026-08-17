@@ -1,0 +1,304 @@
+# @package _global_
+#
+# Stage-1 evaluation: what did DINO self-distillation actually learn?
+#
+#   python main.py eval-pretrain
+#   python -m src.trainers.pretrain_eval experiment=eval_pretrain_representation
+#
+# This is not a training stage. It loads finished stage-1 encoders, caches their
+# frozen features over the whole dataset once, and then runs every measurement
+# that is scientifically appropriate for a *representation* rather than for a
+# classifier. See the module docstring of src/trainers/pretrain_eval.py for what
+# each family of measurements can and cannot support, and architecture/08 for the
+# reasoning behind the choice.
+#
+# Nothing here trains the encoder, so the run is deterministic and cheap enough to
+# repeat: the cost is one forward pass per encoder over the dataset.
+
+defaults:
+  # The DINO head group is selected because the prototype analysis reconstructs
+  # the 2,048-way head from `model.head.*` in order to load `student_head` out of
+  # the milestone checkpoint. The trunk config is unchanged.
+  - override /model/head: dino
+  - override /model/loss: dino
+
+model:
+  backbone:
+    # Every encoder's weights are named per-entry under `encoders` below, so the
+    # shared checkpoint_path must NOT be used -- it would load the published
+    # stage-2 handoff over the top of whichever milestone is being evaluated.
+    checkpoint_path: null
+    pretrained: false
+    # Frozen and without stochastic depth: this is an inference-only stage, and a
+    # DropPath sample would make a cosine similarity depend on an RNG draw.
+    freeze: true
+    drop_path_rate: 0.0
+
+experiment:
+  name: "eval_pretrain_representation"
+  stage: "eval"
+  group: "stage1_evaluation"
+
+  evaluation:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/eval_pretrain"
+
+    # Where the finished stage-1 run wrote its checkpoints. The `encoders` list
+    # below interpolates this, so pointing the evaluation at a different run is a
+    # single override.
+    pretrain_run_dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_swinv2_dino"
+
+    # The file every stage-2 run loads. Compared by SHA-256 against the primary
+    # encoder, so the report can state whether it evaluated the exact bytes stage 2
+    # will consume rather than assuming it. Set to null to skip the check.
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_pretrained.pth"
+
+    # ---------------------------------------------------------------------
+    # What to evaluate, and what each row controls for.
+    #
+    # `role` is load-bearing rather than cosmetic:
+    #   primary          the encoder the report is about; exactly one required
+    #   milestone        an earlier epoch of the same run, for the
+    #                    "did the later epochs earn their cost?" progression
+    #   control_imagenet the initialisation stage 1 started from; the diff
+    #                    against `primary` is the whole contribution of in-domain
+    #                    self-distillation, and the CKA figure is measured
+    #                    against this row
+    #   control          any other reference point
+    #
+    # An entry whose checkpoint file is missing is skipped with a warning: a
+    # pruned epoch-25 encoder should cost one table row, not the whole run.
+    # ---------------------------------------------------------------------
+    encoders:
+      - label: "dino_epoch100"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0100.pth"
+        pretrained: false
+        role: "primary"
+        description: "DINO self-distillation, 100 epochs, in-domain (the shipped encoder)"
+
+      - label: "dino_epoch100_teacher"
+        checkpoint: "${experiment.evaluation.teacher.destination}"
+        pretrained: false
+        role: "control"
+        description: "the EMA teacher at epoch 100 -- what DINO itself ships, against the student this pipeline publishes"
+
+      - label: "dino_epoch50"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0050.pth"
+        pretrained: false
+        role: "milestone"
+        description: "the same run at epoch 50"
+
+      - label: "dino_epoch25"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0025.pth"
+        pretrained: false
+        role: "milestone"
+        description: "the same run at epoch 25"
+
+      - label: "imagenet_init"
+        checkpoint: null
+        pretrained: true
+        role: "control_imagenet"
+        description: "ImageNet-1k initialisation, i.e. the encoder stage 1 started from"
+
+      - label: "random_init"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "untrained trunk; fixes the floor a linear readout gets for free"
+
+    # ---------------------------------------------------------------------
+    # The EMA teacher.
+    #
+    # DINO's teacher is an exponential moving average of the student, and Caron et
+    # al. evaluate and ship the *teacher* -- the averaging is a variance reduction
+    # and normally wins on k-NN by a small consistent margin. This pipeline
+    # publishes the STUDENT, because `save_teacher_in_checkpoints: false` keeps the
+    # teacher out of the milestone artifacts to save disk.
+    #
+    # It does survive in the resume checkpoint, which carries it by necessity. So
+    # "should stage 2 be loading the teacher instead?" is answerable from what is
+    # already on disk, and if the answer is yes the change is free. The trunk is
+    # extracted once to `destination` and then treated as an ordinary encoder row.
+    #
+    # `from_resume: null` takes the newest `dino_resume_step*.pth` under
+    # `pretrain_run_dir`. With no resume checkpoint present the row is skipped with
+    # a log line, not an error.
+    # ---------------------------------------------------------------------
+    teacher:
+      enabled: true
+      from_resume: null
+      destination: "${experiment.evaluation.pretrain_run_dir}/dino_teacher_backbone_epoch_0100.pth"
+
+    # ---------------------------------------------------------------------
+    # Split. Reuses `split_dataset` from the stage-2 trainer, at the same seed,
+    # so a probe number here and a stage-2 number are measured on the SAME
+    # held-out crops and the comparison is meaningful.
+    #
+    # `grouped` keeps every crop of one source photograph on one side. It is not
+    # optional on this dataset: 9,357 crops come from 81 photographs, so crop-level
+    # splitting puts near-duplicates on both sides and the readout score becomes
+    # substantially a memorisation score.
+    #
+    # `also_stratified` runs the primary encoder under the *other* protocol as
+    # well. The delta is the size of that leakage, and reporting it turns a fatal
+    # methodological objection into a measured quantity.
+    # ---------------------------------------------------------------------
+    split:
+      protocol: "grouped"      # "grouped" | "stratified"
+      test_size: 0.2
+      num_folds: 5
+      also_stratified: true
+
+    # ---------------------------------------------------------------------
+    # The primary protocol, and the reason it exists.
+    #
+    # The single held-out split above is a GroupShuffleSplit: 20 % of the 81
+    # photographs, unstratified. Most sub-varieties have crops from only ~3
+    # photographs, so that draw leaves 13 of the 27 sub-varieties entirely absent
+    # from the test side -- a 27-way classifier scored on 14 classes, with a
+    # macro-F1 mechanically capped near 14/27. That is a property of the split.
+    #
+    # StratifiedGroupKFold over every crop fixes it without weakening anything:
+    # each fold's held-out half stays photograph-disjoint, every crop is held out
+    # exactly once, every class appears. Concatenating the folds gives one
+    # out-of-fold prediction per crop, which is what the confusion matrix, the
+    # per-class table and the headline numbers are computed from.
+    #
+    # Both are reported. The single split is the one comparable to a stage-2 run.
+    # ---------------------------------------------------------------------
+    grouped_cv:
+      enabled: true
+      num_folds: 5
+
+    # Reuse `features/<label>.npz` when its recorded checkpoint SHA-256 and row
+    # count still match. Turns a re-run that only changes an analysis or a figure
+    # from ~25 minutes of forward passes into seconds. Keyed on the digest, not the
+    # path, so a retrained checkpoint at the same filename invalidates the cache
+    # instead of silently serving the previous run's features.
+    reuse_cached_features: true
+
+    # Cap for the silhouette / Davies-Bouldin computation, which is O(n^2) in
+    # memory. The spectrum, k-means and retrieval measurements use every sample.
+    geometry_max_samples: 6000
+
+    # ---------------------------------------------------------------------
+    # Linear probe: L-BFGS multinomial logistic regression on L2-normalised
+    # frozen features. Convex, so it converges to the same answer every run --
+    # which is the point of not using a second SGD training loop here. The
+    # SGD-trained counterpart is `experiment=baseline_linear_probe`.
+    #
+    # `C` is chosen on fold 1's validation half and then held fixed for the
+    # cross-validation and the test refit. Choosing it per fold would understate
+    # the CV spread; choosing it on the test split would invalidate the headline.
+    # ---------------------------------------------------------------------
+    probe:
+      regularisation_grid: [0.01, 0.1, 1.0, 10.0, 100.0]
+      max_iterations: 2000
+      # Encoders that additionally get the 5-fold cross-validated probe. Not all
+      # of them, because the CV is 5 extra fits per task per encoder and the
+      # milestones only need the point estimate for the progression figure.
+      cv_encoders: ["dino_epoch100", "imagenet_init"]
+      # Labels per class for the low-shot curve, and how many independent label
+      # draws per point. At 1 shot the draw-to-draw SD exceeds the gap between
+      # encoders, so a single draw would be noise reported as a result.
+      low_shot_shots: [1, 2, 5, 10, 25]
+      low_shot_repeats: 5
+      low_shot_encoders: ["dino_epoch100", "imagenet_init"]
+
+    # DINO's own readout: weighted cosine k-NN, no fitted parameters. A probe far
+    # above the k-NN means the classes are linearly separable but not compactly
+    # clustered, which is exactly the gap stage 2's ArcFace and compactness terms
+    # are designed to close -- so the pair is more informative than either alone.
+    knn:
+      k_values: [1, 5, 10, 20]
+      temperature: 0.07
+
+    # K-means at k = 27 and k = 4, scored against the taxonomy. NMI/AMI/ARI,
+    # purity, and the Hungarian one-to-one cluster accuracy.
+    clustering:
+      enabled: true
+
+    # Nearest-neighbour retrieval, computed twice: once plainly, and once with
+    # same-photograph neighbours excluded. The gap between them is the same
+    # near-duplicate effect the split protocol controls for, measured without any
+    # readout in the way.
+    retrieval:
+      enabled: true
+      k_values: [1, 5, 10]
+
+    # Probe each SwinV2 stage's pooled output at fixed C. Answers "is the useful
+    # signal in the last stage?" -- which decides whether stage 2 reading only the
+    # final feature is leaving accuracy on the table.
+    layerwise:
+      enabled: true
+      encoders: ["dino_epoch100", "imagenet_init"]
+
+    # Alignment/uniformity and augmentation consistency, measured over the STAGE-1
+    # multi-crop augmentation (two global views), because that is the distribution
+    # the objective actually asked for invariance over. A milder transform would
+    # report an easier number for every encoder and would flatter the untrained
+    # control most.
+    invariance:
+      enabled: true
+      encoders: ["dino_epoch100", "imagenet_init"]
+      max_samples: 1500
+
+    # DINO's 2,048-way prototype head, loaded from the full milestone checkpoint
+    # (the bare `dino_backbone_*.pth` files carry the trunk only). Scored against
+    # the taxonomy: active prototype count, usage entropy, NMI and purity.
+    prototypes:
+      enabled: true
+      checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_milestone_epoch_0100.pth"
+
+    tsne:
+      perplexity: 30.0
+      max_samples: 3000
+      # One shared subsample and one shared colour assignment across encoders, so
+      # the comparison panel is actually comparable.
+      encoders: ["dino_epoch100", "imagenet_init", "random_init"]
+
+    # Encoder inference cost, measured on this machine with the repository's own
+    # profiler. Reported next to the accuracy numbers because "how good" and "how
+    # expensive" are the two halves of the stage-1 decision.
+    efficiency:
+      enabled: true
+      batch_sizes: [1, 8, 32]
+      warmup: 3
+      iterations: 20
+      measure_flops: true
+
+    # Stage-1 learning dynamics, recovered from the finished run's events.jsonl.
+    # This is the only record of the per-step collapse diagnostics (teacher
+    # entropy against its structural bounds, prototype utilisation, KoLeo) that
+    # survives without W&B, so the evaluation reads it rather than re-deriving
+    # anything.
+    dynamics:
+      enabled: true
+      events_path: null
+
+    figures:
+      enabled: true
+      dpi: 300
+      retrieval_examples: true
+      retrieval_rows: 6
+      retrieval_neighbours: 5
+
+    # Inference batch for the feature-extraction pass. Larger is faster and
+    # changes nothing: the encoder is frozen and in eval mode, so there is no
+    # batch statistic anywhere in the graph.
+    batch_size: 32
+    num_workers: 2
+
+    # Class-balanced subsample of the dataset, for a plumbing check that exercises
+    # every analysis and every figure in a couple of minutes. 0 (or null) uses
+    # every crop, which is what a reportable run must do -- a subsampled run logs a
+    # warning saying its numbers are not comparable.
+    max_samples: 0
+
+# NOTE on tracking: the `tracking` group is composed *after* `experiment` in
+# conf/config.yaml, so a `tracking:` block here would be silently overwritten by
+# conf/tracking/default.yaml -- and a config key that does nothing is exactly the
+# trap this repository refuses elsewhere. W&B defaults to `offline`, so an
+# evaluation never blocks on credentials; turn it off on the command line if the
+# run list should stay training-only:
+#
+#     python main.py eval-pretrain tracking.wandb.enabled=false

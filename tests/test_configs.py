@@ -19,8 +19,9 @@ from tests.conftest import (
     FIRST_REVISION_DINO_OUT_DIM,
     LR_BASE,
     LR_REFERENCE_BATCH,
-    REVISED_BACKBONE,
     REVISED_BACKBONE_FEATURE_DIM,
+    SHIPPED_BACKBONE,
+    SHIPPED_BACKBONE_FEATURE_DIM,
     REVISED_DINO_BOTTLENECK_DIM,
     REVISED_DINO_HEAD_LAYERS,
     REVISED_DINO_HIDDEN_DIM,
@@ -95,6 +96,7 @@ def finetune_cfg(conf_dir):
 ALL_EXPERIMENTS = [
     "pretrain_swinv2_dino",
     "pretrain_swinv2_base_dino",
+    "eval_pretrain_representation",
     "control_imagenet_frozen",
     "finetune_hierarchical_moe",
     "ablation_flat_classifier",
@@ -169,16 +171,20 @@ def test_dino_pretraining_keeps_the_table_1_values_it_should(pretrain_cfg):
 
 
 def test_stage_one_starts_from_imagenet_and_trains_the_trunk(pretrain_cfg):
-    """ImageNet -> SwinV2-Tiny -> DINO fine-tuning, not ImageNet feature extraction.
+    """ImageNet -> SwinV2-Small -> DINO fine-tuning, not ImageNet feature extraction.
 
     ``freeze=false`` is the assertion that matters. Stage 1 with a frozen trunk
     fits the projection head to fixed features and publishes an unadapted
     encoder, and nothing in the loss curve would say so -- which is why
     ``build_dino`` refuses it outright rather than trusting this config.
+
+    The trunk is ``SHIPPED_BACKBONE`` (Small), not ``REVISED_BACKBONE`` (Tiny):
+    the config moved to Small and the published 100-epoch checkpoint is a Small.
+    Asserting the Tiny name here would make the *test* the thing that is wrong.
     """
     backbone = pretrain_cfg.model.backbone
-    assert backbone.name == REVISED_BACKBONE
-    assert backbone.feature_dim == REVISED_BACKBONE_FEATURE_DIM
+    assert backbone.name == SHIPPED_BACKBONE
+    assert backbone.feature_dim == SHIPPED_BACKBONE_FEATURE_DIM
     assert backbone.pretrained is True
     assert backbone.freeze is False
     assert backbone.drop_path_rate == pytest.approx(REVISED_DROP_PATH_RATE)

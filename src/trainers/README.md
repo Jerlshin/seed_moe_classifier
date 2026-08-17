@@ -1,20 +1,44 @@
 # `src/trainers/` — training entry points
 
-Two Hydra applications, one per paper stage, plus the machinery that drives the
-ablation and baseline suites. They own the loops, the logging, and the
-checkpointing; every model and loss decision lives elsewhere.
+Two Hydra training applications, one per paper stage, an evaluation stage that
+sits between them, plus the machinery that drives the ablation and baseline
+suites. They own the loops, the logging, and the checkpointing; every model and
+loss decision lives elsewhere.
 
 | File | Stage | Paper |
 | --- | --- | --- |
 | `contrastive_pretrain.py` | DINO self-supervised pretraining | Section 4, Table 1 |
+| `pretrain_eval.py` | Stage-1 representation evaluation (no training) | — (revision addition) |
 | `moe_finetune.py` | Hierarchical finetuning, ablations **and** baselines | Section 5, Section 6 |
 | `runner.py` | Suite orchestration for `scripts/run_{ablations,baselines}.py` | — |
 
 ```bash
-python main.py pretrain      # == python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
-python main.py finetune      # == python -m src.trainers.moe_finetune experiment=finetune_hierarchical_moe
-python main.py smoke         # 2-batch dry run of both
+python main.py pretrain       # == python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
+python main.py eval-pretrain  # == python -m src.trainers.pretrain_eval experiment=eval_pretrain_representation
+python main.py finetune       # == python -m src.trainers.moe_finetune experiment=finetune_hierarchical_moe
+python main.py smoke          # 2-batch dry run of both training stages
 ```
+
+## `pretrain_eval.py` is an evaluation stage, not a third training loop
+
+It loads finished stage-1 encoders, caches their frozen features over the whole
+dataset once, and scores the *representation*: linear probe and weighted cosine
+k-NN on the photograph-disjoint split, label-free geometry (RankMe, participation
+ratio, alignment/uniformity), unsupervised structure (k-means, DINO's own
+prototype argmax), low-shot and layer-wise probes, calibration, retrieval,
+inference cost — for the epoch-100 encoder against its epoch-25/50 milestones, the
+ImageNet initialisation it started from, and an untrained trunk.
+
+It is a Hydra module rather than a script because it needs the same `data`,
+`model.backbone` and `seed` config the trainers do, and reuses `split_dataset`,
+`save_split_manifest` and `stratification_labels` from `moe_finetune.py` **by
+import** so a probe number here is measured on the same crops a stage-2 run
+scores. `--gpus` is refused: one forward pass per encoder has no gradient to
+reduce.
+
+See [`../../architecture/08_STAGE1_REPRESENTATION_EVALUATION.md`](../../architecture/08_STAGE1_REPRESENTATION_EVALUATION.md)
+for the protocol and [`../../STAGE1_EVALUATION.md`](../../STAGE1_EVALUATION.md) for
+the results.
 
 Both honour `experiment.training.max_batches`, which caps batches per epoch.
 

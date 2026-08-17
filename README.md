@@ -9,7 +9,7 @@ sub-varieties with a Mixture-of-Experts, cross-attention refinement, and ArcFace
 metric learning.
 
 ```text
-Stage 1   ImageNet-1k → SwinV2-Tiny → DINO self-distillation (trunk unfrozen)
+Stage 1   ImageNet-1k → SwinV2-Small → DINO self-distillation (trunk unfrozen)
 Stage 2   the resulting encoder (frozen) → hierarchical MoE head
 ```
 
@@ -37,7 +37,7 @@ image ──SwinV2──▶ pooled ──proj──▶ z ∈ ℝ³⁸⁴        
 > headline departures from the submitted manuscript: the router activates
 > **2 of 6** experts rather than 4; **SwinV2 is the only encoder** (the
 > comparative ViT-S/14 path has been removed); and stage 1 now runs
-> **SwinV2-Tiny from ImageNet-1k for 100 epochs** rather than SwinV2-Base from
+> **SwinV2-Small from ImageNet-1k for 100 epochs** rather than SwinV2-Base from
 > random initialisation for 300. Almost all of it is reversible by override —
 > `model.head.top_k=4` restores the submitted routing,
 > `experiment=pretrain_swinv2_base_dino` the submitted trunk.
@@ -58,10 +58,11 @@ python -m pip install -e ".[tracking,dev]"
 ### Single stages
 
 ```bash
-python main.py pretrain      # stage 1: DINO self-supervised pretraining
-python main.py finetune      # stage 2: hierarchical MoE finetuning
-python main.py ablation      # flat-classifier ablation
-python main.py smoke         # 2-batch dry run of both stages
+python main.py pretrain       # stage 1: DINO self-supervised pretraining
+python main.py eval-pretrain  # score the stage-1 representation before stage 2
+python main.py finetune       # stage 2: hierarchical MoE finetuning
+python main.py ablation       # flat-classifier ablation
+python main.py smoke          # 2-batch dry run of both stages
 
 python main.py pretrain --gpus 2    # the same, as a 2-rank DDP job
 ```
@@ -69,7 +70,7 @@ python main.py pretrain --gpus 2    # the same, as a 2-rank DDP job
 Stage-1 variants, all config-driven:
 
 ```bash
-# the primary run: SwinV2-Tiny, ImageNet init, unfrozen, 2 global + 4 local
+# the primary run: SwinV2-Small, ImageNet init, unfrozen, 2 global + 4 local
 # crops, physical batch 32 at accumulation 1, 100 epochs, encoders kept at
 # 25 / 50 / 100
 python main.py pretrain
@@ -80,6 +81,38 @@ python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_base_dino
 # the stage-1 control (no stage 1 at all): ImageNet, frozen, straight to stage 2
 python -m src.trainers.moe_finetune experiment=control_imagenet_frozen
 ```
+
+### Evaluating stage 1 before committing to stage 2
+
+Stage 1 produces an encoder, not a classifier, so its loss curve cannot say
+whether the run was worth its 13.5 h. `eval-pretrain` answers that from the
+representation itself, against the controls the repository's design already
+supports:
+
+```bash
+python main.py eval-pretrain                    # the full report, ~35 min on one GPU/MPS
+python main.py eval-pretrain experiment.evaluation.max_samples=270   # 1-min plumbing check
+```
+
+It runs a linear probe and a parameter-free weighted k-NN over frozen features on
+the same **photograph-disjoint** split stage 2 uses, plus label-free geometry
+(RankMe, participation ratio, alignment/uniformity, dead channels), unsupervised
+structure (k-means and DINO's own 2,048-way prototype argmax scored against the
+taxonomy), a low-shot curve, layer-wise probes, calibration, retrieval, and the
+encoder's inference cost — for the epoch-100 encoder *and* for its epoch-25/50
+milestones, the ImageNet-1k initialisation it started from, and an untrained
+trunk. It also recovers the stage-1 collapse diagnostics from the finished run's
+`events.jsonl`.
+
+Everything lands in `outputs/eval_pretrain/` (`summary.json`, `metrics.json`,
+`tables/*.csv`, 22 figures at 300 dpi, cached features, `provenance.json` with
+checkpoint SHA-256s). Results and the parameter/epoch recommendations that follow
+from them: [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md). How it works and why
+these measurements:
+[`architecture/08_STAGE1_REPRESENTATION_EVALUATION.md`](architecture/08_STAGE1_REPRESENTATION_EVALUATION.md).
+
+Re-running after changing only an analysis or a figure is cheap: features are
+cached per encoder and reused when their checkpoint digest still matches.
 
 Measure before changing the batch — physical batch is what Sinkhorn and KoLeo
 estimate from, and accumulation cannot substitute for it:
@@ -103,6 +136,7 @@ python main.py finetune model.backbone.freeze=false        # fine-tune end to en
 python scripts/dry_run.py         # synthetic end-to-end smoke test, no dataset needed
 python scripts/verify_runtime.py  # are the fast paths exact on THIS machine?
 python main.py pretrain           # produces the shared encoder, run once
+python main.py eval-pretrain      # is that encoder worth finetuning on?
 python scripts/run_ablations.py   # six component-wise variants
 python scripts/run_baselines.py   # linear probe, ImageNet frozen/unfrozen, ResNet-50, Swin-T, hierarchical CCE
 python scripts/generate_plots.py  # figures + outputs/reports/summary_metrics.csv
@@ -131,9 +165,15 @@ forwarded to every run as a Hydra override.
 
 ## Stage-1 recipe
 
+The table below is the configured recipe. The **executed** 100-epoch run departed
+from it in three ways, all recorded in
+[`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md) §1: physical batch 64 rather than
+32 (hence lr 1.25e-4 rather than 6.25e-5), and `data.num_workers=0`, which left
+the GPU idle for 91.6 % of the run.
+
 | | Value | Note |
 | --- | --- | --- |
-| Backbone | `swinv2_tiny_window16_256` | 27.58 M params, 13.32 GFLOPs/view @256 — both measured |
+| Backbone | `swinv2_small_window16_256` | 48.96 M params, 25.6 GFLOPs/view @256 — both measured. Tiny (27.58 M, 13.32 GFLOPs) remains a one-token override |
 | Initialisation | ImageNet-1k (`ms_in1k`) | the trunk then **trains**; `build_dino` refuses `freeze=true` |
 | Stochastic depth | 0.1, student only | the teacher copy is silenced — its outputs are the targets |
 | Views | 2 global @256 + 4 local @101 | local crops kept deliberately; whether they earn their cost is an ablation to run |
@@ -239,6 +279,7 @@ index and invalidates existing checkpoints — update
 | [`conf/`](conf/README.md) | Hydra config groups |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | One-page map of both stages and the interface between them |
 | [`architecture/`](architecture/00_OVERVIEW.md) | Per-topic design documents |
+| [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md) | What the stage-1 encoder learned, measured — and what to change next |
 | [`tests/`](tests/README.md) | pytest suite |
 | [`scripts/`](scripts/README.md) | Suite runners, plotting, feature extraction, dry run |
 
@@ -294,6 +335,16 @@ $SEED_OUTPUT_DIR/
     dino_pretrained_final.pth
     dino_backbone_epoch_{0025,0050,0100}.pth   # milestone encoders, never pruned
     dino_milestone_epoch_{0025,0050,0100}.pth
+  eval_pretrain/                   # stage-1 representation evaluation
+    summary.json                   # RunSummary, so the cross-run table reads it too
+    metrics.json                   # every measurement, nested by encoder
+    provenance.json                # checkpoint SHA-256s, git commit, library versions
+    split_manifest.npz
+    test_predictions.npz           # single-split probe predictions
+    out_of_fold_predictions.npz    # the same format over every crop
+    tables/*.csv                   # encoder comparison, per-class, low-shot, layer-wise, ...
+    figures/fig01..fig22*.png      # publication figures at 300 dpi
+    features/{encoder}.npz         # cached frozen features, reused across re-runs
   finetune_hierarchical_moe/
     best_hierarchical_moe.pth
     hierarchical_moe_final.pth
@@ -327,7 +378,7 @@ no teacher weights. Turning these on for a 100-epoch run is how the disk fills.
 ## Testing
 
 ```bash
-python -m pytest tests/ -q          # 458 tests, no network access, ~35s
+python -m pytest tests/ -q          # 518 tests, no network access, ~95s
 python scripts/dry_run.py           # real encoder, synthetic data, full pipeline
 ```
 

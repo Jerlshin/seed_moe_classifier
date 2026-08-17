@@ -15,15 +15,22 @@ files are the code-level narrative.
 | Loss functions | [`architecture/05_LOSS_FUNCTIONS.md`](architecture/05_LOSS_FUNCTIONS.md) |
 | Ablation and baseline engine | [`architecture/06_ABLATION_ENGINE.md`](architecture/06_ABLATION_ENGINE.md) |
 | Efficiency and evaluation | [`architecture/07_EFFICIENCY_AND_EVALUATION.md`](architecture/07_EFFICIENCY_AND_EVALUATION.md) |
+| **Stage-1 representation evaluation** | [`architecture/08_STAGE1_REPRESENTATION_EVALUATION.md`](architecture/08_STAGE1_REPRESENTATION_EVALUATION.md) |
 
 ## The two stages
 
 ```text
 STAGE 1  (src/trainers/contrastive_pretrain.py)
 
-  ImageNet-1k ─▶ SwinV2-Tiny ─▶ DINO self-distillation ─▶ domain-adapted encoder
-                 27.58 M         2 global + 4 local        published once, read
-                 768-d, 8x8      trunk UNFROZEN            by every stage-2 run
+  ImageNet-1k ─▶ SwinV2-Small ─▶ DINO self-distillation ─▶ domain-adapted encoder
+                 48.96 M          2 global + 4 local        published once, read
+                 768-d, 8x8       trunk UNFROZEN            by every stage-2 run
+
+STAGE 1½  (src/trainers/pretrain_eval.py)   -- evaluation only, no training
+
+  the encoder above ─▶ frozen features ─▶ probe / k-NN / geometry / clustering
+  + its 25- and 50-epoch milestones, its ImageNet initialisation, and an
+  untrained trunk, so the numbers have a floor and a baseline to sit between
 
 STAGE 2  (src/trainers/moe_finetune.py)
 
@@ -61,7 +68,7 @@ Four properties, all pinned by tests, all silent if broken:
 | | |
 | --- | --- |
 | Objective | DINO (Caron et al., 2021) + KoLeo + Sinkhorn-Knopp. **Not** DINOv2 — no iBOT, no untied heads |
-| Trunk | SwinV2-Tiny, ImageNet-1k init, unfrozen, `drop_path 0.1` (student only) |
+| Trunk | SwinV2-Small (48.96 M), ImageNet-1k init, unfrozen, `drop_path 0.1` (student only) |
 | Head | 768 → 1024 → 1024 → 256 → L2 → weight-norm 2048, discarded after stage 1 |
 | Batch | 32 physical x 1 accumulation — physical batch is what the collapse guards estimate from |
 | Schedule | 100 epochs, 10 linear warmup then cosine; LR derived as `0.0005 x B_eff/256` |

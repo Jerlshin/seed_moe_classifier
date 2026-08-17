@@ -249,6 +249,41 @@ python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 16
 If 32 does not fit, lower both together (`data.batch_size=16
 experiment.training.effective_batch_size=16`) rather than raising accumulation.
 
+### 3.3b Evaluate the stage-1 encoder before spending stage-2 compute
+
+```bash
+# plumbing check first: ~1 minute, exercises every analysis and figure
+python main.py eval-pretrain experiment.evaluation.max_samples=270
+
+# the real report: one forward pass over the dataset per encoder
+python main.py eval-pretrain
+```
+
+Runs on a single device (there is no gradient to reduce, so `--gpus` is refused)
+and needs no network access **except** for the `imagenet_init` control, which asks
+timm for `swinv2_small_window16_256.ms_in1k`. On a box that will be offline later,
+warm the cache once while it has network:
+
+```bash
+python -c "import timm; timm.create_model('swinv2_small_window16_256', pretrained=True)"
+```
+
+Those are the same weights stage 1 started from, so the download is ~200 MB once
+per machine. Without them the `imagenet_init` row — the control that measures the
+entire contribution of in-domain self-distillation — cannot be produced, and
+`experiment.evaluation.encoders` has to be overridden with a list that omits it.
+
+Cost on one A100/H100: ~4 minutes of forward passes per encoder plus ~5 minutes of
+CPU analysis, so ~25 minutes for the default five encoders. Features are cached
+under `outputs/eval_pretrain/features/`, so a re-run that only changes an analysis
+or a figure takes seconds.
+
+Read `outputs/eval_pretrain/tables/encoder_comparison.csv` first. The two rows that
+decide whether stage 1 earned its cost are `dino_epoch100` against
+`imagenet_init`; the two that decide whether the *epochs* earned theirs are
+`dino_epoch25`/`dino_epoch50` against `dino_epoch100`. Interpretation and the
+recommendations that follow: [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md).
+
 ### 3.4 Stage 2 — single finetune run (smoke-test the head before the full suite)
 
 ```bash
@@ -300,6 +335,11 @@ Re-scores every run from its raw `test_predictions.npz` rather than trusting
 `summary.json`, so the table and the figures are computed by the same code.
 Writes `outputs/reports/summary_metrics.csv`, `summary_metrics_per_run.csv`
 and 300 DPI figures.
+
+The stage-1 evaluation (§3.3b) writes its own `summary.json` and
+`test_predictions.npz` in the same format, so
+`--roots outputs/eval_pretrain` includes it in that table. Its own report lives
+under `outputs/eval_pretrain/` and does not need `generate_plots.py`.
 
 ### 3.8 Running detached (nohup / tmux)
 

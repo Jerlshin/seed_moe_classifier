@@ -12,8 +12,9 @@ conf/
     loss/      arcface_kl.yaml       # combined hierarchical objective
                dino.yaml             # DINO self-distillation
                flat_cce.yaml         # plain CCE at both hierarchy levels
-  experiment/  pretrain_swinv2_dino.yaml       # stage 1, primary (Tiny, ImageNet, unfrozen)
+  experiment/  pretrain_swinv2_dino.yaml       # stage 1, primary (Small, ImageNet, unfrozen)
                pretrain_swinv2_base_dino.yaml  # stage 1, capacity control (Base)
+               eval_pretrain_representation.yaml  # score the stage-1 encoder, no training
                finetune_hierarchical_moe.yaml
                control_imagenet_frozen.yaml    # ImageNet + frozen trunk, no stage 1
                ablation_flat_classifier.yaml
@@ -56,6 +57,19 @@ defaults:
 Every ablation and baseline inherits from `finetune_hierarchical_moe`, so
 anything changed there changes them all — which is the point: the variants must
 differ only in the thing being ablated.
+
+`eval_pretrain_representation.yaml` is the one experiment that inherits from
+neither training experiment: it defines `experiment.evaluation` instead of
+`experiment.training`, selects the DINO head group (the prototype analysis
+reconstructs the 2,048-way head to load `student_head` out of the milestone
+checkpoint), and pins `model.backbone.checkpoint_path: null` because it names its
+encoders individually — a shared `checkpoint_path` would load the published
+stage-2 handoff over whichever milestone is being evaluated.
+
+One thing that group cannot do: set `tracking.*`. `config.yaml` composes
+`tracking` **after** `experiment`, so a `tracking:` block inside an experiment
+file is silently overwritten by `conf/tracking/default.yaml`. Override it on the
+command line instead (`tracking.wandb.enabled=false`).
 
 ## `model/backbone` has exactly one option
 

@@ -20,6 +20,7 @@ python scripts/dry_run.py             # verify the pipeline runs at all
 python scripts/verify_runtime.py      # verify the fast paths are exact HERE
 python scripts/bench_pretrain_step.py --scaling 1,2   # pick the launch geometry
 python main.py pretrain --gpus 2      # produce the shared encoder, once
+python main.py eval-pretrain          # is that encoder worth finetuning on?
 python scripts/run_ablations.py --gpus 0,1   # 18 variants x 5 seeds
 python scripts/run_baselines.py --gpus 0,1   # five baselines
 python scripts/generate_plots.py      # collect everything into outputs/reports/
@@ -204,12 +205,19 @@ data["subvariety_labels"]  # [n]  0..26
 data["paths"]              # [n]  source image paths
 ```
 
-These are the **backbone's** features at its native width (768 for SwinV2-Tiny),
-*not* the paper's `z ∈ ℝ³⁸⁴`. The projection to `z` is a trained layer belonging
-to `DinoV2SwinV2Encoder`, and a freshly-initialised copy of it would project
-through random weights — worse than useless for inspecting what pretraining
-learned. For real 384-D embeddings, read the `embeddings` array from a finished
-run's `test_predictions.npz`.
+These are the **backbone's** features at its native width (768 for SwinV2
+Tiny/Small), *not* the paper's `z ∈ ℝ³⁸⁴`. The projection to `z` is a trained
+layer belonging to `DinoV2SwinV2Encoder`, and a freshly-initialised copy of it
+would project through random weights — worse than useless for inspecting what
+pretraining learned. For real 384-D embeddings, read the `embeddings` array from a
+finished run's `test_predictions.npz`.
+
+**For anything reportable, use `python main.py eval-pretrain` instead.** It caches
+the same features and adds what a claim about the encoder needs: the
+photograph-disjoint protocol, the ImageNet/random/milestone controls, provenance
+digests, and the metrics that detect collapse. This script remains the fastest way
+to get a bare `.npz` for ad-hoc inspection without Hydra. See
+[`../architecture/08_STAGE1_REPRESENTATION_EVALUATION.md`](../architecture/08_STAGE1_REPRESENTATION_EVALUATION.md).
 
 Defaults for `--data-root`, `--checkpoint` and `--output` come from
 `SEED_DATA_ROOT`, `SEED_PRETRAIN_BACKBONE` and `SEED_OUTPUT_DIR`.
