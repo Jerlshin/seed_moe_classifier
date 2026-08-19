@@ -89,7 +89,15 @@ experiment:
     # Dense early milestones: the shipped run's probe curve peaked at epoch 50
     # of 100 and was already within 0.8 pp of its peak at epoch 25, so the
     # interesting region is the first half and the budget question is decided
-    # there. Every probed epoch is forced into this list by the trainer.
+    # there. Three milestones (25/50/100) were too coarse to see the peak at all.
+    #
+    # DISK. Every probed epoch is forced into this list by the trainer -- a best
+    # epoch whose milestone was pruned is not selectable -- so the effective set
+    # is [1, 5, 10, ..., 50], 11 epochs at ~231 MB each (a 110 MB bare encoder
+    # plus a 121 MB student+head milestone) = **2.5 GB**, plus ~1 GB of rolling
+    # resume state. Comfortable on a server, tight on a 16 GB vast.ai root disk:
+    # raise `probe.every_epochs` to 10 there rather than trimming this list, so
+    # the probe and the milestones stay in step.
     save_epochs: [5, 10, 15, 20, 25, 30, 40, 50]
 
     # ---------------------------------------------------- checkpoint selection
