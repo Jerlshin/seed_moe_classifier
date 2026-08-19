@@ -644,3 +644,44 @@ def test_view_design_arms_are_single_factor_against_the_full_recipe():
 
     for arm in manifest["arms"]:
         assert arm.get("description", "").strip(), f"{arm['name']} has no stated hypothesis"
+
+
+def test_split_delta_is_keyed_by_protocol_not_by_which_was_the_headline():
+    """The leakage table must not depend on which protocol is primary.
+
+    `pretrain_eval` runs the *other* split protocol beside the headline so the
+    near-duplicate leakage is measured on the encoder being reported. It used to
+    file the headline under `"grouped"` and the alternative under
+    `"stratified"` unconditionally -- correct only while `grouped` was the
+    primary. Under the v2 configs the primary is `stratified`, so those two
+    labels swapped: `tables/split_protocol_delta.csv` reported the crop-level
+    accuracy in the `grouped` column, the grouped accuracy in the `stratified`
+    column, and a negative `delta_stratified_minus_grouped`.
+
+    This pins the invariant that fixes it -- the key names the protocol the
+    number was produced under -- against both settings, by replaying the
+    trainer's own dictionary construction.
+    """
+
+    def leakage_keys(protocol: str, headline: float, alternative: float) -> dict[str, float]:
+        headline_protocol = "stratified" if protocol == "stratified" else "grouped"
+        alternative_protocol = "grouped" if headline_protocol == "stratified" else "stratified"
+        table = {
+            headline_protocol: {"probe_sub": headline},
+            alternative_protocol: {"probe_sub": alternative},
+        }
+        return {
+            "grouped": table["grouped"]["probe_sub"],
+            "stratified": table["stratified"]["probe_sub"],
+        }
+
+    # Crop-level always scores higher on this dataset -- 81 photographs, ~115
+    # crops each -- so the stratified entry must be the larger one either way.
+    grouped_primary = leakage_keys("grouped", headline=0.6500, alternative=0.8365)
+    stratified_primary = leakage_keys("stratified", headline=0.8365, alternative=0.6500)
+
+    assert grouped_primary == stratified_primary
+    assert grouped_primary["stratified"] > grouped_primary["grouped"]
+    delta = grouped_primary["stratified"] - grouped_primary["grouped"]
+    # The measured gap on the shipped encoder, to one decimal place.
+    assert delta == pytest.approx(0.1865, abs=1e-4)

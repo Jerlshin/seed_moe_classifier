@@ -2914,27 +2914,46 @@ def main(cfg: DictConfig) -> None:
                 k=reports[primary_label]["knn"]["sub_variety"]["best_k"],
                 temperature=settings["knn_temperature"],
             )
+            # Key by the protocol each number was actually produced under, not
+            # by which one happened to be the headline. `alt_report["protocol"]`
+            # is the *other* protocol, so under the v2 configs -- where the
+            # headline is `stratified` -- the headline is the crop-level number
+            # and the alternative is the grouped one. Hardcoding
+            # `{"grouped": headline, "stratified": alt}` labelled them backwards
+            # the moment `split.protocol` stopped being `grouped`, and the wrong
+            # label reached `tables/split_protocol_delta.csv` and `metrics.json`.
+            headline_protocol = "stratified" if protocol == "stratified" else "grouped"
+            alternative_protocol = "grouped" if headline_protocol == "stratified" else "stratified"
             extras["leakage"] = {
-                "grouped": {
+                headline_protocol: {
                     "probe_sub": sub_probe["test_accuracy"],
                     "probe_seed": seed_probe["test_accuracy"],
                     "knn_sub": reports[primary_label]["knn"]["sub_variety"]["best_accuracy"],
                 },
-                "stratified": {
+                alternative_protocol: {
                     "probe_sub": alt_probe_sub["accuracy"],
                     "probe_seed": alt_probe_seed["accuracy"],
                     "knn_sub": alt_knn["accuracy"],
                 },
+                "headline_protocol": headline_protocol,
                 "report": json_safe(alt_report),
             }
+            # Always crop-level minus photograph-disjoint, whichever was the
+            # headline, so the sign means one thing: how much of the crop-level
+            # number is near-duplicate leakage. `delta_probe_sub` keeps its
+            # historical definition (alternative minus headline) so a figure
+            # written against a grouped-primary run still reads correctly.
+            crop_level = extras["leakage"]["stratified"]["probe_sub"]
+            grouped = extras["leakage"]["grouped"]["probe_sub"]
             extras["leakage"]["delta_probe_sub"] = (
                 alt_probe_sub["accuracy"] - sub_probe["test_accuracy"]
             )
+            extras["leakage"]["crop_level_minus_grouped_probe_sub"] = crop_level - grouped
             logger.info(
-                "Split protocol | crop-level probe %.4f vs grouped %.4f: %+.4f of the headline number "
-                "is near-duplicate leakage, not sub-variety discrimination.",
-                alt_probe_sub["accuracy"], sub_probe["test_accuracy"],
-                extras["leakage"]["delta_probe_sub"],
+                "Split protocol | crop-level probe %.4f vs photograph-disjoint %.4f: %+.4f pp of a "
+                "crop-level number is near-duplicate leakage rather than sub-variety "
+                "discrimination. The headline here is the %s split.",
+                crop_level, grouped, 100.0 * (crop_level - grouped), headline_protocol,
             )
 
         # Milestone progression.
