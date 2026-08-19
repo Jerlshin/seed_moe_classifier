@@ -71,10 +71,10 @@ all 9,357 crops through torchvision's own `get_params`:
 
 | view recipe | native px p5/p50/p95 | upsample to 256 | real content |
 | --- | --- | --- | --- |
-| local `(0.05, 0.40)` at 101 px | 132 / **598** / 2,632 | 10.5× / 22.3× | 0.91 % |
-| local `(0.30, 0.70)` at 160 px, ratio `(0.5, 2.0)` | 483 / **1,440** / 4,752 | 6.7× / 11.5× | 2.20 % |
-| global `(0.40, 1.00)`, ratio `(0.75, 1.33)` | 648 / 1,833 / 5,796 | 6.1× | 2.71 % |
-| global `(0.70, 1.00)`, ratio `(0.5, 2.0)` | 930 / 2,307 / 7,656 | 5.3× | 3.52 % |
+| local `(0.05, 0.40)` at 101 px | 132 / **598** / 2,585 | 10.5× | 0.91 % |
+| local `(0.30, 0.70)` at 160 px, ratio `(0.5, 2.0)` | 483 / **1,419** / 4,730 | 6.8× | 2.17 % |
+| global `(0.40, 1.00)`, ratio `(0.75, 1.33)` | 648 / 1,845 / 5,680 | 6.0× | 2.82 % |
+| global `(0.70, 1.00)`, ratio `(0.5, 2.0)` | 928 / 2,484 / 7,564 | 5.1× | 3.79 % |
 
 **80 % of Eq. 1's cross-view terms are anchored on a local view**, so the first
 row is what the objective was mostly being asked to learn from.
@@ -86,15 +86,15 @@ single-factor:
 : The aspect range `RandomResizedCrop` samples. After ten failed (area, aspect)
   draws `get_params` returns a **deterministic centre crop**, and only 3.4 % of
   these crops are square — so raising the scale floor trades randomness for
-  content unless the ratio widens with it. Measured global fallback rates: 3.3 %
-  at `(0.40, 1.00)`/`(0.75, 1.33)`, **21.5 %** at `(0.70, 1.00)`/`(0.75, 1.33)`,
-  9.3 % at `(0.70, 1.00)`/`(0.5, 2.0)`.
+  content unless the ratio widens with it. Measured global fallback rates: 3.5 %
+  at `(0.40, 1.00)`/`(0.75, 1.33)`, **22.0 %** at `(0.70, 1.00)`/`(0.75, 1.33)`,
+  10.2 % at `(0.70, 1.00)`/`(0.5, 2.0)`.
 
 `min_native_pixels`
 : A floor on the source pixels behind a view, raising the lower scale bound *per
   image* to `max(scale_lo, floor / area)`. It never lowers it, so it can only
   make views less destructive, and `0` is a plain `RandomResizedCrop` exactly.
-  At 900 it lifts the local p5 by **+72 %** and the median by 1.7 % — a tail
+  At 900 it lifts the local p5 by **+72 %** and the median by 1.1 % — a tail
   intervention, which is the whole claim.
 
 `rotation90_prob` / `vertical_flip_prob`

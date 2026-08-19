@@ -213,7 +213,7 @@ torchvision's own `RandomResizedCrop.get_params`, so the numbers are what the
 dataloader will produce rather than a model of it. That matters for one result in
 particular: `get_params` retries ten times and then returns a **deterministic
 centre crop**, and on a corpus that is 96.6 % non-square, raising the scale floor
-pushes it into that fallback — 3.3 % at `scale=(0.40, 1.00)` against **21.5 %** at
+pushes it into that fallback — 3.5 % at `scale=(0.40, 1.00)` against **22.0 %** at
 `(0.70, 1.00)`. The rate is reported per view family and is why `crop_ratio` is a
 config key.
 

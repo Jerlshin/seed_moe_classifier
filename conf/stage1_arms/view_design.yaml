@@ -81,7 +81,7 @@ arms:
       ((0.40,1.00)/(0.05,0.40) at 101 px, torchvision's aspect range) with the
       v2 colour policy, dihedral augmentation and KoLeo space intact. This is
       THE arm -- the difference between it and V2-FULL is the entire value of
-      moving local views from a median 598 native pixels to 1,395. Expect
+      moving local views from a median 598 native pixels to 1,419. Expect
       V2-FULL to show a LOWER KL (the correspondence is genuinely easier to
       learn once the two views depict the same object) and, if the hypothesis
       holds, a higher probe.
@@ -141,7 +141,7 @@ arms:
       is a FRACTION, so it shreds a 21x22 crop and an 881x413 crop by the same
       factor; the floor raises the lower bound per image to
       max(scale_lo, 900/area) and never lowers it. Measured effect on the local
-      views: p5 native pixels 483 -> 832 (+72 %), median 1395 -> 1419 (+1.7 %).
+      views: p5 native pixels 483 -> 832 (+72 %), median 1419 -> 1435 (+1.1 %).
       It therefore acts almost entirely on the worst-case views, which is the
       whole claim -- if the tail was hurting, this fixes it for free; if it was
       not, this is a no-op and the arm says so.

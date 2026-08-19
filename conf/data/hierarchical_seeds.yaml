@@ -126,7 +126,7 @@ augmentation:
   # 3.4 % of these crops are square (aspect p5/p95 = 0.52 / 1.98). After 10
   # failed attempts `get_params` returns a DETERMINISTIC centre crop, so raising
   # the scale floor buys content by spending randomness: measured fallback rates
-  # are 3.3 % at scale (0.40, 1.00), 21.5 % at (0.70, 1.00), and 9.3 % at
+  # are 3.5 % at scale (0.40, 1.00), 22.0 % at (0.70, 1.00), and 10.2 % at
   # (0.70, 1.00) with crop_ratio (0.5, 2.0). The trainer measures and logs this
   # at startup and warns above 15 %.
   crop_ratio: [0.75, 1.3333333333333333]

@@ -25,7 +25,7 @@
 #    two-sided decision, not a compromise.
 #
 # 2. VIEWS: see `conf/data/seed_crops_v2.yaml`, which carries the measurements.
-#    Local views go from a median 598 native pixels to 1,395 (2.3x), and their
+#    Local views go from a median 598 native pixels to 1,419 (2.37x), and their
 #    upsample from 10.5x to 6.9x. This is the primary hypothesis of the run.
 #
 # 3. KOLEO: per-view (already the default after the audit's A1) and on the

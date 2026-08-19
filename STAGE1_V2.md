@@ -22,12 +22,15 @@ one of them contradicts the plan it was checking.
 
 Monte-Carlo over all 9,357 crops through torchvision's own
 `RandomResizedCrop.get_params`, against `STAGE1_CHANGES.md` §0.5's independent
-measurement:
+measurement. Every geometry figure in this document is 40,000 draws at seed 7
+and reproducible with `python scripts/report_view_geometry.py`; percentiles move
+by ~1–3 % between seeds, so read the ratios and the orderings, not the last
+digit.
 
 | view | this audit (p5 / p50 / p95) | §0.5 | agreement |
 | --- | --- | --- | --- |
-| global `scale=(0.40, 1.00)` | 648 / **1,833** / 5,796 | 675 / 2,035 / 7,101 | same order, same conclusion |
-| local `scale=(0.05, 0.40)` | 132 / **598** / 2,632 | 130 / 598 / 2,608 | exact |
+| global `scale=(0.40, 1.00)` | 648 / **1,845** / 5,680 | 675 / 2,035 / 7,101 | same order, same conclusion |
+| local `scale=(0.05, 0.40)` | 132 / **598** / 2,585 | 130 / 598 / 2,608 | exact |
 
 The corpus itself: 9,357 files, median **52 × 51 px**, area p5/p50/p95 =
 1,188 / 3,024 / 9,026 px², **3.4 %** square, aspect p5/p95 = 0.52 / 1.98,
@@ -44,9 +47,9 @@ aspect-ratio range at torchvision's default. Measured:
 
 | policy | deterministic-centre-crop fallback |
 | --- | --- |
-| global `(0.40, 1.00)`, ratio `(0.75, 1.33)` — current | **3.3 %** |
-| global `(0.70, 1.00)`, ratio `(0.75, 1.33)` — C1 as written | **21.5 %** |
-| global `(0.70, 1.00)`, ratio `(0.50, 2.00)` — adopted | **9.3 %** |
+| global `(0.40, 1.00)`, ratio `(0.75, 1.33)` — current | **3.5 %** |
+| global `(0.70, 1.00)`, ratio `(0.75, 1.33)` — C1 as written | **22.0 %** |
+| global `(0.70, 1.00)`, ratio `(0.50, 2.00)` — adopted | **10.2 %** |
 
 `get_params` retries the (area, aspect) draw ten times and then returns a
 **fixed centre box**. A high-area crop with aspect in (0.75, 1.33) does not fit
@@ -55,12 +58,12 @@ raising the scale floor buys content by spending randomness, and roughly one
 global view in five would have carried no crop randomness at all.
 
 Widening `crop_ratio` recovers it *and* raises the median content further
-(2,440 vs 2,262 native px). It is therefore strictly better on both axes, and it
+(2,484 vs 2,310 native px). It is therefore strictly better on both axes, and it
 is why `crop_ratio` exists as a config key.
 
 *(A first pass of this measurement counted single-attempt failures rather than
 fallbacks and put the C1 rate near 67 %. Torchvision retries ten times; the
-corrected figure is 21.5 %.)*
+corrected figure is 22.0 %.)*
 
 ### 0.3 The KoLeo fix and the corpus fingerprint are already in place
 
@@ -81,12 +84,12 @@ wrong corpus discoverable afterwards, not impossible beforehand. That is now
 
 | | submitted | v2 | measured effect |
 | --- | --- | --- | --- |
-| `global_crops_scale` | (0.40, 1.00) | **(0.70, 1.00)** | global native px 1,833 → 2,440 |
-| `local_crops_scale` | (0.05, 0.40) | **(0.30, 0.70)** | local native px **598 → 1,440** |
+| `global_crops_scale` | (0.40, 1.00) | **(0.70, 1.00)** | global native px 1,845 → 2,484 (1.35×) |
+| `local_crops_scale` | (0.05, 0.40) | **(0.30, 0.70)** | local native px **598 → 1,419 (2.37×)** |
 | `local_crop_size` | 101 | **160** | removes an intermediate low-pass |
-| `crop_ratio` | (0.75, 1.33) | **(0.50, 2.00)** | global fallback 21.5 % → 9.3 % |
-| local upsample to 256 | 10.5× median, 22.3× p95 | **6.7× / 11.5×** | narrows the local/global resolution cue |
-| real content per local view | 0.91 % | **2.20 %** | 2.4× |
+| `crop_ratio` | (0.75, 1.33) | **(0.50, 2.00)** | global fallback 22.0 % → 10.2 % |
+| local upsample to 256 | 10.5× median | **6.8×** | narrows the local/global resolution cue |
+| real content per local view | 0.91 % | **2.17 %** | 2.4× |
 
 Three new mechanisms, each separately switchable so the arms stay single-factor:
 
@@ -97,7 +100,7 @@ Three new mechanisms, each separately switchable so the arms stay single-factor:
   881 × 413 crop by the same factor. It never lowers the bound, so it can only
   make views less destructive, and at `0` it is a plain `RandomResizedCrop`
   exactly. At 900 px it lifts the local p5 from 483 → 832 (**+72 %**) and moves
-  the median by 1.7 % — a tail intervention. **Off in the primary run**, run as
+  the median by 1.1 % — a tail intervention. **Off in the primary run**, run as
   the `V2-FLOOR` arm.
 * **`rotation90_prob` / `vertical_flip_prob`** — the dihedral group of order 8,
   through `PIL.Image.transpose`. A pixel permutation: no interpolation, no
@@ -275,7 +278,7 @@ rather than quoted from the previous one.
 | --- | --- | --- |
 | **V2-FROZEN** | nothing — no training | the bar. If no arm clears it by more than a fold SD, the objective is not the binding constraint. |
 | **V2-FULL** | — | the recipe's own number |
-| **V2-noVIEW** | the view redesign | **the** arm: V2-FULL − V2-noVIEW is the entire value of 598 → 1,440 native pixels |
+| **V2-noVIEW** | the view redesign | **the** arm: V2-FULL − V2-noVIEW is the entire value of 598 → 1,419 native pixels |
 | **V2-noCOLOUR** | the colour policy | judge on the per-class F1 of Jagnath/Poosa33 and AMT-2/AMT-4, not the 27-class mean |
 | **V2-noDIHEDRAL** | the lossless rotations | whether narrowing the crops needed the diversity back |
 | **V2-KOLEO-BOTTLENECK** | KoLeo's space | whether regularising the shipped space beats regularising a discarded one |

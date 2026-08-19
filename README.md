@@ -87,7 +87,7 @@ Three things worth knowing before running it:
   fraction of the *source* area, and the source is one seed at a median
   52 x 51 px — so the submitted recipe built each local view from a median
   **598 native pixels** rendered into 65,536, and 80 % of Eq. 1's cross-view
-  terms are anchored on one. v2 takes that to 1,440.
+  terms are anchored on one. v2 takes that to 1,419.
 * **The probe, not the loss, chooses the checkpoint.** The DINO loss is a cross
   entropy against a moving teacher (94.8 % irreducible target entropy on the
   shipped run); the *representation* peaked at epoch 50 of 100 and the pipeline

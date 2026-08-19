@@ -249,5 +249,5 @@ budget.
 `test_widening_the_aspect_range_cuts_the_deterministic_fallback` pins the one
 place the implementation **departs from** `STAGE1_CHANGES.md`. C1 proposes the
 narrower crop scales and does not mention the aspect range; measured, that costs
-a 21.5 % deterministic-centre-crop rate on the global views because 96.6 % of
+a 22.0 % deterministic-centre-crop rate on the global views because 96.6 % of
 these crops are non-square. The test is why `crop_ratio` exists.

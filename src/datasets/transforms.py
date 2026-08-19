@@ -34,9 +34,9 @@ this, and ``STAGE1_CHANGES.md`` 0.5 measured it independently):
 ===================================== ============================= =============
 view recipe                           native px behind it p5/50/95  upsample to 256
 ===================================== ============================= =============
-global ``scale=(0.40, 1.00)``         644 / 1,806 / 5,772           5.8x median
-local  ``scale=(0.05, 0.40)``         132 / **598** / 2,597         **10.5x**
-local  ``scale=(0.30, 0.70)`` (v2)    500 / **1,428** / 4,745       6.7x
+global ``scale=(0.40, 1.00)``         648 / 1,845 / 5,680           6.0x median
+local  ``scale=(0.05, 0.40)``         132 / **598** / 2,585         **10.5x**
+local  ``scale=(0.30, 0.70)`` (v2)    483 / **1,419** / 4,730       6.8x
 ===================================== ============================= =============
 
 A local view under the submitted recipe is a median **24x24 px** fragment of a
@@ -54,8 +54,8 @@ stay single-factor:
     only **3.4 %** of these crops are square (aspect p5/p95 = 0.52 / 1.98). After
     10 failed attempts ``get_params`` falls back to a **deterministic centre
     crop**, so raising the scale floor silently trades randomness for content:
-    measured fallback rates are 3.4 % at ``scale=(0.40, 1.00)`` and **21.5 %** at
-    ``(0.70, 1.00)`` with the default ratio, against **9.6 %** at
+    measured fallback rates are 3.5 % at ``scale=(0.40, 1.00)`` and **22.0 %** at
+    ``(0.70, 1.00)`` with the default ratio, against **10.2 %** at
     ``crop_ratio=(0.5, 2.0)``. Widening the ratio is therefore strictly better
     than not widening it -- more native content *and* more diversity.
 
