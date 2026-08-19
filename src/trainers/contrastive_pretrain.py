@@ -1397,18 +1397,25 @@ def update_statistics(
 ) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
     """Median and max ``|dW| / |W|`` across parameter tensors, and the new snapshot.
 
-    The update-to-weight ratio is the one optimisation diagnostic that a
-    gradient norm cannot substitute for: Adam normalises by the second moment, so
-    a large gradient does not imply a large *step*, and the audit's C7 argument
-    ("the patch embedding receives the most gradient, so it is drifting") was
-    refuted by exactly that -- CKA at ``layers.0`` was 0.976, i.e. it had not
-    moved. This measures the step.
+    The update-to-weight ratio is the one optimisation diagnostic a gradient norm
+    cannot substitute for: Adam normalises by the second moment, so a large
+    gradient does not imply a large *step*. The audit's C7 argument -- "the patch
+    embedding receives the most gradient, so its ImageNet filters are drifting"
+    -- was refuted by exactly that: CKA at ``layers.0`` was 0.976, i.e. it had
+    not moved at all. This measures the movement.
 
-    ~1e-3 is the healthy band for AdamW at these rates. Persistently above 1e-2
-    means the trunk is being rewritten; below 1e-5 means it is frozen in all but
-    name.
+    **The interval is the caller's, not one step.** ``previous`` is whatever
+    snapshot the caller last kept, so at
+    ``tracking.intervals.update_ratio_every_steps = 200`` this is the drift over
+    200 optimizer steps, not over the step that just finished. That is the more
+    useful quantity here -- a single AdamW step is ~1e-5 of the weight and mostly
+    noise, while the drift over a logging interval is the number that says
+    whether the trunk is being rewritten -- but it means the value scales with
+    the interval and two runs are comparable only at the same setting.
 
-    Costs a clone of every parameter, so the caller runs it on a rare interval.
+    Costs one device clone per parameter tensor and no host synchronisation,
+    which is why it is affordable at all; the snapshot it returns is ~110 MB for
+    SwinV2-Tiny and is held until the next measurement.
     """
     ratios: list[float] = []
     snapshot: dict[str, torch.Tensor] = {}
@@ -2373,11 +2380,11 @@ def main(cfg: DictConfig) -> None:
                             optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
 
-                        # |dW| / |W| across the trunk, measured across the step
-                        # that just happened. Adam normalises by the second
-                        # moment, so a gradient norm says nothing about step
-                        # size -- this is the quantity that does. Device clones,
-                        # no synchronisation, and off by default.
+                        # |dW| / |W| across the trunk, over the interval since
+                        # the last measurement. Adam normalises by the second
+                        # moment, so a gradient norm says nothing about how far
+                        # the weights moved -- this is the quantity that does.
+                        # Device clones, no host synchronisation.
                         if (
                             update_ratio_every_steps > 0
                             and global_step % update_ratio_every_steps == 0

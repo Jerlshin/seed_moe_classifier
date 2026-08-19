@@ -63,11 +63,14 @@ intervals:
   # every step for free (the clip computes it anyway), so this breakdown runs on
   # its own, much rarer, interval. 0 disables it.
   gradient_norm_every_steps: 200
-  # |dW| / |W| across the trunk. Adam normalises by the second moment, so a
-  # gradient norm says nothing about step size and this is the quantity that
-  # does -- ~1e-3 is healthy at these rates, persistently above 1e-2 means the
-  # trunk is being rewritten. Costs one device clone per parameter tensor and no
-  # host synchronisation. 0 disables it.
+  # |dW| / |W| across the trunk, over the interval BETWEEN measurements (not per
+  # step). Adam normalises by the second moment, so a gradient norm says nothing
+  # about how far the weights actually moved -- this is the quantity that does,
+  # and it is what would have settled the audit's "the patch embedding is
+  # drifting" argument directly instead of by CKA. Because the interval sets the
+  # scale, two runs are comparable only at the same value here. Costs one device
+  # clone per parameter tensor (~110 MB for SwinV2-Tiny, held until the next
+  # measurement) and no host synchronisation. 0 disables it.
   update_ratio_every_steps: 200
   histogram_every_epochs: 5
   gradient_histogram_every_epochs: 5
