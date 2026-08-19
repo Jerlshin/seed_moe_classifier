@@ -299,6 +299,43 @@ resolve anything below ~2 pp, and `--seeds` is what turns a ranking into a claim
 
 ---
 
+## 3a. The frozen reference, measured
+
+`python -m src.trainers.pretrain_eval experiment=eval_frozen_v2`, run on this
+machine over all 9,357 crops (MPS, 12.75 min). This is the bar `V2-FULL` has to
+clear, and it is a real result rather than a placeholder — artifacts under
+`outputs/eval_frozen_v2/` (8 tables, 18 figures).
+
+**Crop-level stratified protocol, 7,485 fit / 1,872 test, frozen trunks:**
+
+| encoder | 27-way probe | macro F1 | k-NN | 4-way | RankMe | within-class photo id |
+| --- | --- | --- | --- | --- | --- | --- |
+| `imagenet_init` (SwinV2-Tiny, IN-1k) | **0.8243** | 0.8234 | 0.7137 | 0.9979 | 324.4 | +11.4 pp |
+| `random_init` | 0.5748 | 0.5683 | 0.4952 | 0.8873 | 27.4 | +11.6 pp |
+| `handcrafted_floor` (10 scalars) | 0.4054 | 0.3367 | 0.4920 | 0.8787 | 1.4 | +8.7 pp |
+
+Four readings:
+
+1. **The bar is 0.8243.** The previous stage-1 run added +0.31 pp over its own
+   initialisation, so an arm that does not clear this by more than a fold SD has
+   not earned its compute.
+2. **`layers.2` beats the output stage on the Tiny trunk too**: 0.8024 / 0.8280 /
+   **0.8638** / 0.7607 across `layers.0..3`, against 0.8243 pooled. That is
+   +3.95 pp available from the readout stage alone, with no training — an
+   independent reproduction of `STAGE1_CHANGES.md` B1 on a different trunk and a
+   different protocol, and the reason `V2-STAGE3` is in the arm suite.
+3. **The leakage figure reproduces on this trunk and this protocol.** Crop-level
+   0.8243 against photograph-disjoint 0.6347 = **+18.95 pp**, next to the audit's
+   +18.65 pp on SwinV2-Small. So the crop-level headline is ~19 pp above what the
+   same encoder scores on an unseen photograph, measured rather than assumed.
+4. **Nuisance is not yet informative.** ImageNet (+11.4 pp) and an *untrained*
+   trunk (+11.6 pp) are indistinguishable, so at this point the number reflects
+   the images, not the encoder. It becomes a discriminator only once in-domain
+   training has run — on the previous trunk it went +10.0 → +3.5 pp — which is
+   exactly why it is the gate on the arms rather than a headline.
+
+---
+
 ## 4. Running it
 
 ```bash
