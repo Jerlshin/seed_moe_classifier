@@ -139,6 +139,41 @@ The trainer cross-checks the discovered class counts against `data.*` and refuse
 to start on a mismatch, which would otherwise surface only as unexplained
 metrics.
 
+## `data` is a group with two members
+
+`hierarchical_seeds` (the default, and the submitted recipe) and `seed_crops_v2`,
+which inherits from it and overrides the augmentation policy. Selecting it is
+`data=seed_crops_v2`, or an experiment that overrides the group —
+`pretrain_v2_swinv2_tiny` does.
+
+The split exists so the v2 view redesign is a **separate file** rather than an
+edit: every published number was produced under `hierarchical_seeds`, and
+changing its defaults would silently re-baseline them. Nothing in
+`hierarchical_seeds.yaml` changed its values; it gained keys (`crop_ratio`,
+`min_native_pixels`, `vertical_flip_prob`, `rotation90_prob`, `blur_radius_*`,
+`expected_num_samples`) whose defaults reproduce the previous behaviour exactly.
+
+`data.expected_num_samples` is worth calling out: an integer makes a
+corpus-size mismatch **fatal at startup**, `null` disables the check. The failure
+it guards against already happened — the shipped encoder was self-distilled on
+8,173 crops while everything downstream used 9,357. `corpus_fingerprint` makes
+that discoverable afterwards; this makes it impossible.
+
+## The v2 experiment files
+
+| File | What it is |
+| --- | --- |
+| `pretrain_v2_swinv2_tiny.yaml` | The v2 stage-1 recipe. Every value carries the measurement that chose it |
+| `eval_pretrain_v2.yaml` | Its evaluation, crop-level headline, Tiny controls |
+| `eval_frozen_v2.yaml` | Frozen SwinV2-Tiny, no in-domain training — the bar stage 1 must clear |
+| `finetune_v2_crop_level.yaml` | Stage 2 under crop-level stratified train/val/test |
+| `finetune_v2_grouped_diagnostic.yaml` | The same, photograph-disjoint. A **diagnostic**, not the primary path |
+
+The evaluation configs carry the *trunk* as well as the protocol, which is why
+there is a `_v2` copy of each rather than an override: an evaluation whose
+`imagenet_init` control is SwinV2-Small cannot score a SwinV2-Tiny arm without
+turning "what did self-distillation add" into an architecture delta.
+
 ## The stage-1 arm manifests are not a Hydra group
 
 `conf/stage1_arms/*.yaml` are **plain YAML**, read by
@@ -153,6 +188,11 @@ list, so adding an arm is adding an entry — but they are not a config group an
 `experiment=phase1` is not a thing. Phases 0-3 of the audit's sequence ship as
 `phase0.yaml` … `phase3.yaml`, and each carries in its comments the rules about
 what may and may not be combined (four genuine confounds; see the manifest).
+`view_design.yaml` is the v2 suite.
+
+A manifest may also name `evaluation:` and `frozen_evaluation:`, which select the
+evaluation experiment every arm is scored with — required whenever the suite's
+trunk differs from the default one.
 
 ## Paper-critical values
 

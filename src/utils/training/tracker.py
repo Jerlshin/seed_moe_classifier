@@ -1,22 +1,31 @@
-"""Dual experiment tracking: Weights & Biases + TensorBoard, over one API.
+"""Experiment tracking over one API: JSONL, CSV, TensorBoard and W&B.
 
-Every call fans out to three sinks:
+Every call fans out to four sinks:
 
 * ``events.jsonl`` in the Hydra run directory -- always on, dependency-free, and
-  the only sink guaranteed to survive a crashed run or an offline machine.
+  the only sink guaranteed to survive a crashed run or an offline machine. It is
+  the *complete* record: it carries the structured events (corpus digests,
+  shapes, budgets, checkpoint paths) that a table cannot hold.
+* ``csv/metrics_*.csv`` -- always on, one wide file per metric family. Same
+  numbers as the event stream, in the shape an analysis loads directly. See
+  :mod:`src.utils.training.csv_metrics` for why both exist.
 * TensorBoard -- opt-in via ``tracking.tensorboard.enabled``.
 * Weights & Biases -- opt-in via ``tracking.wandb.enabled``. ``mode: offline``
   is the default so a run never blocks on network or credentials; sync later
   with ``wandb sync``.
 
 A missing optional dependency degrades to a warning rather than killing a
-training run that is otherwise fine.
+training run that is otherwise fine. The two always-on sinks have no optional
+dependency at all -- they are stdlib ``json`` and ``csv`` -- which is deliberate:
+a run on a machine with no TensorBoard and no W&B credentials still leaves a
+complete, machine-readable trace.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +34,8 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+
+from src.utils.training.csv_metrics import CsvMetricWriter
 
 
 class ExperimentTracker:
@@ -46,17 +57,23 @@ class ExperimentTracker:
         self.enabled = bool(enabled)
         self.output_dir = Path(OmegaConf.select(cfg, "tracking.output_dir", default="outputs/run"))
         self.figure_dir = self.output_dir / "figures"
+        self.csv_dir = Path(
+            OmegaConf.select(cfg, "tracking.csv.directory", default=None)
+            or self.output_dir / "csv"
+        )
         self.events_path = self.output_dir / "events.jsonl"
         self._events_file = None
         self.writer = None
         self.wandb = None
         self.wandb_run = None
+        self.csv = CsvMetricWriter(self.csv_dir, enabled=False, logger=logger)
 
         if not self.enabled:
             return
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._events_file = self.events_path.open("a", encoding="utf-8")
+        self._init_csv()
         self._init_tensorboard()
         self._init_wandb()
 
@@ -66,6 +83,18 @@ class ExperimentTracker:
     def enabled_for_images(self) -> bool:
         """True when at least one sink can receive images or figures."""
         return self.writer is not None or self.wandb_run is not None
+
+    def _init_csv(self) -> None:
+        if not OmegaConf.select(self.cfg, "tracking.csv.enabled", default=True):
+            self.logger.info("CSV metric mirroring is disabled; events.jsonl is the only table.")
+            return
+        self.csv = CsvMetricWriter(
+            self.csv_dir,
+            enabled=True,
+            elapsed_start=time.perf_counter(),
+            logger=self.logger,
+        )
+        self.logger.info("CSV metrics enabled at %s", self.csv_dir)
 
     def _init_tensorboard(self) -> None:
         if not OmegaConf.select(self.cfg, "tracking.tensorboard.enabled", default=False):
@@ -124,6 +153,7 @@ class ExperimentTracker:
         if self.wandb_run is not None:
             self.wandb.finish()
             self.wandb_run = None
+        self.csv.close()
         if self._events_file is not None and not self._events_file.closed:
             self._events_file.close()
 
@@ -158,6 +188,15 @@ class ExperimentTracker:
             return
 
         self.log_event("metrics", {"step": step, "metrics": clean})
+        # The CSV sink keeps the prefix as the *family* and strips it from the
+        # column names, so `metrics_train.csv` has a `loss` column rather than a
+        # `train/loss` one -- the prefix is already the filename.
+        self.csv.log(
+            {key.split("/", 1)[1] if prefix and key.startswith(f"{prefix}/") else key: value
+             for key, value in clean.items()},
+            step,
+            prefix=prefix,
+        )
         if self.writer is not None:
             for key, value in clean.items():
                 self.writer.add_scalar(key, value, step)
@@ -295,6 +334,7 @@ class ExperimentTracker:
             return
         payload = [dict(zip(columns, row)) for row in rows]
         self.log_event("table", {"tag": tag, "step": step, "rows": payload})
+        self.csv.write_table(tag.replace("/", "_"), payload, columns=list(columns))
         if self.wandb_run is not None:
             table = self.wandb.Table(columns=list(columns), data=[list(row) for row in rows])
             self.wandb.log({tag: table}, step=step)
@@ -330,6 +370,25 @@ class ExperimentTracker:
                 ],
             )
             self.wandb.log({tag: table}, step=step)
+
+    def write_csv(
+        self,
+        name: str,
+        rows: Sequence[Mapping[str, Any]],
+        columns: Sequence[str] | None = None,
+    ) -> str | None:
+        """Write one standalone CSV table under ``csv/``.
+
+        For records that are neither a time series nor a step-indexed metric --
+        the view-geometry report, the checkpoint-selection ledger, the per-class
+        probe breakdown. Returns the path, or ``None`` when CSV output is off.
+        """
+        if not self.enabled:
+            return None
+        path = self.csv.write_table(name, rows, columns=columns)
+        if path:
+            self.log_event("csv_table", {"name": name, "path": path, "rows": len(rows)})
+        return path
 
     def log_artifact(self, path: str | Path, name: str, artifact_type: str = "model") -> None:
         """Upload a file to W&B as a versioned artifact when enabled."""

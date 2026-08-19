@@ -91,6 +91,18 @@ cache_limit_mb: 4096
 num_seed_types: 4
 num_sub_varieties: 27
 
+# How many crops the corpus is supposed to contain. `null` disables the check;
+# any integer makes a disagreement FATAL at startup, before a GPU-hour is spent.
+#
+# This is not defensive coding. The shipped 100-epoch encoder was self-distilled
+# on 8,173 crops while the evaluation, stage 2 and every published number use
+# 9,357, nothing on disk recorded it, and it was recoverable only by cross-
+# reading two log lines against `metrics.json`. `corpus_fingerprint` makes that
+# discoverable afterwards; this makes it impossible in the first place. Set it on
+# the experiment that must not drift, leave it null while the corpus is being
+# changed on purpose (e.g. after cropping the 18 unused photographs).
+expected_num_samples: null
+
 # Multi-crop augmentation (paper Section 6.1).
 augmentation:
   # 2 global crops, scale (0.4, 1.0); 4 local crops, scale (0.05, 0.4).
@@ -98,6 +110,42 @@ augmentation:
   local_crops_scale: [0.05, 0.4]
   local_crops_number: 4
   horizontal_flip_prob: 0.5
+
+  # ---------------------------------------------------------------- geometry
+  #
+  # `scale` is a fraction of the SOURCE area, and the source here is one seed at
+  # a median 52 x 51 px. Measured over all 9,357 crops, a local view at
+  # (0.05, 0.40) is built from a median 598 native pixels -- a 24 x 24 fragment
+  # inflated to 65,536 output pixels, 0.9 % real content -- and 8 of the 10
+  # cross-view terms in Eq. 1 are anchored on one. `conf/data/seed_crops_v2.yaml`
+  # is the redesigned policy; the numbers here are the submitted recipe and are
+  # kept so every published result stays reproducible.
+  #
+  # crop_ratio: the aspect-ratio range `RandomResizedCrop` samples. Torchvision's
+  # (0.75, 1.33) cannot fit a high-area box inside a non-square source, and only
+  # 3.4 % of these crops are square (aspect p5/p95 = 0.52 / 1.98). After 10
+  # failed attempts `get_params` returns a DETERMINISTIC centre crop, so raising
+  # the scale floor buys content by spending randomness: measured fallback rates
+  # are 3.3 % at scale (0.40, 1.00), 21.5 % at (0.70, 1.00), and 9.3 % at
+  # (0.70, 1.00) with crop_ratio (0.5, 2.0). The trainer measures and logs this
+  # at startup and warns above 15 %.
+  crop_ratio: [0.75, 1.3333333333333333]
+
+  # Floor on the native source pixels a view may be built from. Raises the
+  # effective lower scale bound per image to max(scale_lo, floor / area) and
+  # never lowers it, so it can only make views less destructive; 0 disables it
+  # and is byte-identical to a plain RandomResizedCrop. Exists because a fixed
+  # *fraction* shreds a 21 x 22 crop and an 881 x 413 crop by the same factor.
+  min_native_pixels: 0
+
+  # Seeds photographed on a tray have no canonical orientation, so the dihedral
+  # group of order 8 is label-preserving here. The 90-degree rotations go
+  # through PIL's `transpose`, which is a pixel permutation -- no interpolation,
+  # no resampling, no black corners -- unlike `T.RandomRotation`. Off by default
+  # because the submitted recipe used the horizontal flip alone; v2 turns them on
+  # to buy back view diversity after the crop ranges narrow.
+  vertical_flip_prob: 0.0
+  rotation90_prob: 0.0
 
   # Colour jitter magnitudes are stated explicitly in the paper: brightness
   # +/-0.4, contrast +/-0.4, saturation +/-0.2, hue +/-0.1.
@@ -114,11 +162,25 @@ augmentation:
   grayscale_prob: 0.2
 
   # Global crop 1: blur p=1.0. Global crop 2: blur p=0.1 + solarization p=0.2.
+  #
+  # Note what the asymmetry costs here specifically. It is what makes the
+  # teacher's two views genuinely different, which is the signal Eq. 1 consumes
+  # -- but 1.0 / 0.1 / 0.5 also *identifies* which family a view came from, on
+  # top of the resolution artefact the local views already carry, and the
+  # student can satisfy part of the objective by detecting the family rather
+  # than the correspondence. A symmetric setting removes that cue; v2 uses one.
   global_blur_prob_1: 1.0
   global_blur_prob_2: 0.1
   solarization_prob: 0.2
   # Local crops: blur p=0.5.
   local_blur_prob: 0.5
+
+  # Blur radius range, in pixels of the *output* view. At a median 5.8x upsample
+  # a 2.0 px blur at 256 removes ~0.35 px of native detail, so the reference
+  # range is milder here than it is on ImageNet -- which is an argument for not
+  # raising it, not for trusting it.
+  blur_radius_min: 0.1
+  blur_radius_max: 2.0
 
   # SwinV2 windows require a fixed input size, so local crops are resized back
   # up to `image_size` after being cropped at `local_crop_size`.

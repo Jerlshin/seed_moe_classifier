@@ -55,6 +55,52 @@ python -m pip install -e ".[tracking,dev]"
 
 ## Run
 
+### The v2 pipeline (current)
+
+[`STAGE1_V2.md`](STAGE1_V2.md) is the specification: what changed, the
+measurement behind each change, and what would falsify it.
+
+```bash
+# 0 -- what the augmentation will actually build, before spending a GPU-hour
+python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
+
+# 1 -- the reference the run must beat (no training at all)
+python -m src.trainers.pretrain_eval experiment=eval_frozen_v2
+
+# 2 -- stage 1: SwinV2-Tiny, views sized for 52 x 51 px crops, probe-selected budget
+python main.py pretrain-v2                    # or --gpus 2
+
+# 3 -- score the milestones, and check the probe picked the right one
+python main.py eval-pretrain-v2
+
+# 4 -- stage 2: crop-level stratified train / validation / test
+SEED_PRETRAIN_BACKBONE=$SEED_OUTPUT_DIR/checkpoints/dino_v2_swinv2_tiny.pth \
+    python main.py finetune-v2
+
+# the arms, which decompose the v2 recipe into single factors
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
+```
+
+Three things worth knowing before running it:
+
+* **The local views were the problem.** `RandomResizedCrop`'s `scale` is a
+  fraction of the *source* area, and the source is one seed at a median
+  52 x 51 px — so the submitted recipe built each local view from a median
+  **598 native pixels** rendered into 65,536, and 80 % of Eq. 1's cross-view
+  terms are anchored on one. v2 takes that to 1,440.
+* **The probe, not the loss, chooses the checkpoint.** The DINO loss is a cross
+  entropy against a moving teacher (94.8 % irreducible target entropy on the
+  shipped run); the *representation* peaked at epoch 50 of 100 and the pipeline
+  published epoch 100. v2 measures the representation at each milestone, keeps
+  the winner as `dino_best_encoder.pth`, and hands **that** to stage 2.
+* **The downstream split is crop-level**, which is a deliberate protocol choice
+  with a measured consequence: ~18 pp above a photograph-disjoint estimate on
+  this dataset, because 9,357 crops come from 81 photographs. Every run reports
+  its own leakage, and `finetune_v2_grouped_diagnostic` measures the gap on this
+  encoder. See `STAGE1_V2.md` §1.8.
+
+The v1 path below is unchanged and still reproduces every published number.
+
 ### Single stages
 
 ```bash

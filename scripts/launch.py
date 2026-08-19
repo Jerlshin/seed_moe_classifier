@@ -64,7 +64,9 @@ if str(PROJECT_ROOT) not in sys.path:
 #: Stage name -> the module that implements it, plus its experiment config.
 STAGES = {
     "pretrain": ("src.trainers.contrastive_pretrain", "experiment=pretrain_swinv2_dino"),
+    "pretrain-v2": ("src.trainers.contrastive_pretrain", "experiment=pretrain_v2_swinv2_tiny"),
     "finetune": ("src.trainers.moe_finetune", "experiment=finetune_hierarchical_moe"),
+    "finetune-v2": ("src.trainers.moe_finetune", "experiment=finetune_v2_crop_level"),
     "ablation": ("src.trainers.moe_finetune", "experiment=ablation_flat_classifier"),
 }
 

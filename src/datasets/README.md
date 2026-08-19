@@ -61,6 +61,67 @@ local/global distinction is carried by the crop *scale*, not the tensor size.
 The teacher sees only the 2 global crops; the student sees all 6. That
 asymmetry is enforced in the trainer, not here.
 
+## The v2 view policy, and how to measure any policy
+
+`conf/data/seed_crops_v2.yaml`. Read `STAGE1_V2.md` §1.1 before changing it.
+
+The problem it solves is that `scale` is a fraction of the **source** area, and
+the source here is one seed at a median 52 × 51 px — not a scene. Measured over
+all 9,357 crops through torchvision's own `get_params`:
+
+| view recipe | native px p5/p50/p95 | upsample to 256 | real content |
+| --- | --- | --- | --- |
+| local `(0.05, 0.40)` at 101 px | 132 / **598** / 2,632 | 10.5× / 22.3× | 0.91 % |
+| local `(0.30, 0.70)` at 160 px, ratio `(0.5, 2.0)` | 483 / **1,440** / 4,752 | 6.7× / 11.5× | 2.20 % |
+| global `(0.40, 1.00)`, ratio `(0.75, 1.33)` | 648 / 1,833 / 5,796 | 6.1× | 2.71 % |
+| global `(0.70, 1.00)`, ratio `(0.5, 2.0)` | 930 / 2,307 / 7,656 | 5.3× | 3.52 % |
+
+**80 % of Eq. 1's cross-view terms are anchored on a local view**, so the first
+row is what the objective was mostly being asked to learn from.
+
+Three keys carry the policy, and each is separately switchable so an arm stays
+single-factor:
+
+`crop_ratio`
+: The aspect range `RandomResizedCrop` samples. After ten failed (area, aspect)
+  draws `get_params` returns a **deterministic centre crop**, and only 3.4 % of
+  these crops are square — so raising the scale floor trades randomness for
+  content unless the ratio widens with it. Measured global fallback rates: 3.3 %
+  at `(0.40, 1.00)`/`(0.75, 1.33)`, **21.5 %** at `(0.70, 1.00)`/`(0.75, 1.33)`,
+  9.3 % at `(0.70, 1.00)`/`(0.5, 2.0)`.
+
+`min_native_pixels`
+: A floor on the source pixels behind a view, raising the lower scale bound *per
+  image* to `max(scale_lo, floor / area)`. It never lowers it, so it can only
+  make views less destructive, and `0` is a plain `RandomResizedCrop` exactly.
+  At 900 it lifts the local p5 by **+72 %** and the median by 1.7 % — a tail
+  intervention, which is the whole claim.
+
+`rotation90_prob` / `vertical_flip_prob`
+: The dihedral group of order 8, via `PIL.Image.transpose` — a pixel
+  permutation, **no interpolation and no black corners**, unlike
+  `T.RandomRotation`. Safe *here* because seeds on a tray have no canonical
+  orientation. This is what buys back the diversity the narrower crop ranges
+  give up.
+
+Colour is treated as signal rather than only as nuisance: brightness and contrast
+(illumination) stay at ±0.4, saturation and hue (pigmentation) drop to ±0.1 and
+±0.02, and grayscale and solarization go to zero. Mean RGB alone scores 0.3169 on
+the 27-way task. Note the audit refuted the naive version of this — the cue
+*survived* the reference jitter — so it is a hypothesis with a control
+(`V2-noCOLOUR`), not a repair.
+
+To measure any policy without training anything:
+
+```bash
+python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
+python scripts/report_view_geometry.py --data seed_crops_v2 \
+    data.augmentation.min_native_pixels=900
+```
+
+`view_geometry_report(transform, sizes)` is the same measurement as a function;
+the trainer runs it at startup and writes `csv/view_geometry.csv`.
+
 ## Sharding across GPUs
 
 `get_pretrain_dataloader(..., world_size=N, rank=r)` attaches a

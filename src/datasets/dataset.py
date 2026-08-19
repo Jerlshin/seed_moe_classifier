@@ -56,6 +56,29 @@ def source_image_id(image_path: str | os.PathLike[str]) -> str:
     return f"{path.parent.name}/{source}"
 
 
+def image_sizes(paths: Sequence[str | os.PathLike[str]]) -> list[tuple[int, int]]:
+    """``(width, height)`` for each path, from the file header only.
+
+    ``PIL.Image.open`` parses the header and defers the pixel decode, so this is
+    ~10 us per file rather than ~1 ms. That matters because the caller is the
+    trainer's startup path and the corpus is 9,357 files: a header read is a
+    second, a decode is a minute.
+
+    Unreadable files are skipped rather than raising. A geometry *report* that
+    fails because one file is corrupt would abort a run that the dataloader is
+    perfectly able to complete, and the count of what was measured is returned
+    alongside the percentiles anyway.
+    """
+    sizes: list[tuple[int, int]] = []
+    for path in paths:
+        try:
+            with Image.open(path) as image:
+                sizes.append((int(image.size[0]), int(image.size[1])))
+        except Exception:  # pragma: no cover - depends on a corrupt file
+            continue
+    return sizes
+
+
 def corpus_fingerprint(
     root: str | os.PathLike[str],
     relative_paths: Sequence[str] | None = None,
@@ -296,6 +319,17 @@ class PretrainImageFolderDataset(ImageFolder):
         keys = [source_image_id(path) for path, _ in self.samples]
         ordering = {key: index for index, key in enumerate(sorted(set(keys)))}
         return np.array([ordering[key] for key in keys], dtype=np.int64)
+
+    def source_sizes(self) -> list[tuple[int, int]]:
+        """``(width, height)`` of every crop, in dataset order.
+
+        Read from the file headers, not by decoding: ``Image.open`` is lazy, so
+        ``.size`` costs a few bytes per file and the whole 9,357-image corpus is
+        a second. The view-geometry report needs the true source dimensions
+        because ``RandomResizedCrop``'s ``scale`` is a *fraction* of them, and a
+        fraction of an unknown quantity is not a measurement.
+        """
+        return image_sizes([path for path, _ in self.samples])
 
     def _build_cache(self, limit_mb: float, logger: logging.Logger) -> None:
         limit_bytes = int(limit_mb * 1024 * 1024)
@@ -667,6 +701,11 @@ class HierarchicalSeedDataset(Dataset):
         keys = [source_image_id(path) for path, _, _ in self.samples]
         ordering = {key: index for index, key in enumerate(sorted(set(keys)))}
         return np.array([ordering[key] for key in keys], dtype=np.int64)
+
+    def source_sizes(self) -> list[tuple[int, int]]:
+        """``(width, height)`` of every crop, in dataset order. See
+        :func:`image_sizes`."""
+        return image_sizes([path for path, _, _ in self.samples])
 
     def corpus_fingerprint(self) -> dict[str, object]:
         """Identity of the corpus this dataset reads. See :func:`corpus_fingerprint`.

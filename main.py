@@ -1,5 +1,9 @@
 """Stage launcher.
 
+    python main.py pretrain-v2                # the v2 stage-1 recipe (SwinV2-Tiny)
+    python main.py eval-pretrain-v2           # evaluate it, crop-level protocol
+    python main.py finetune-v2                # stage 2, crop-level train/val/test
+
     python main.py pretrain                   # DINO self-supervised pretraining
     python main.py pretrain --gpus 2          # the same, over 2 GPUs with DDP
     python main.py eval-pretrain              # evaluate the stage-1 representation
@@ -90,8 +94,30 @@ EVAL_FROZEN = [
     sys.executable, "-m", "src.trainers.pretrain_eval", "experiment=eval_frozen_reference",
 ]
 
+# ---------------------------------------------------------------- the v2 pipeline
+#
+# The stage-1 redesign: SwinV2-Tiny, view geometry sized for 52 x 51 px crops,
+# colour preserved, and an epoch budget chosen by a representation probe rather
+# than by a loss curve. `STAGE1_V2.md` is the specification; the config headers
+# carry the measurements. The downstream split is crop-level stratified
+# throughout, which is a deliberate protocol choice with a measured ~18 pp
+# consequence -- `finetune_v2_crop_level`'s header states it.
+PRETRAIN_V2 = [
+    sys.executable, "-m", "src.trainers.contrastive_pretrain",
+    "experiment=pretrain_v2_swinv2_tiny",
+]
+EVAL_PRETRAIN_V2 = [
+    sys.executable, "-m", "src.trainers.pretrain_eval", "experiment=eval_pretrain_v2",
+]
+FINETUNE_V2 = [
+    sys.executable, "-m", "src.trainers.moe_finetune", "experiment=finetune_v2_crop_level",
+]
+
 COMMANDS: dict[str, list[list[str]]] = {
     "pretrain": [PRETRAIN],
+    "pretrain-v2": [PRETRAIN_V2],
+    "eval-pretrain-v2": [EVAL_PRETRAIN_V2],
+    "finetune-v2": [FINETUNE_V2],
     "eval-pretrain": [EVAL_PRETRAIN],
     "screen-backbones": [SCREEN_BACKBONES],
     "eval-frozen": [EVAL_FROZEN],
@@ -111,7 +137,7 @@ SMOKE_OVERRIDES = [
     "tracking.wandb.enabled=false",
 ]
 #: Stages ``scripts/launch.py`` knows how to run under ``torch.distributed.run``.
-LAUNCHER_STAGES = ("pretrain", "finetune", "ablation")
+LAUNCHER_STAGES = ("pretrain", "pretrain-v2", "finetune", "finetune-v2", "ablation")
 
 COMMANDS["smoke"] = [
     [

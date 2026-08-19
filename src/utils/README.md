@@ -165,7 +165,9 @@ mass, and a mean would drag the label into empty space between clusters.
 
 | File | Contents |
 | --- | --- |
-| `tracker.py` | `ExperimentTracker` — the dual W&B + TensorBoard fan-out |
+| `tracker.py` | `ExperimentTracker` — the JSONL + CSV + TensorBoard + W&B fan-out |
+| `csv_metrics.py` | Wide-format CSV sinks; the artifact an analysis loads directly |
+| `representation_probe.py` | In-training representation diagnostics and the checkpoint choice they drive |
 | `checkpoint.py` | `CheckpointManager` with prefix-based rolling pruning |
 | `experiment_logging.py` | Console + file + JSONL structured logging |
 | `snapshot.py` | Writes the resolved config, CLI args, and environment per run |
@@ -174,13 +176,21 @@ mass, and a mean would drag the label into empty space between clusters.
 
 ### `ExperimentTracker`
 
-One API, three sinks:
+One API, four sinks:
 
 * **`events.jsonl`** — always on, dependency-free, flushed per write. The only
-  sink guaranteed to survive a crashed run or an offline machine.
+  sink guaranteed to survive a crashed run or an offline machine, and the
+  *complete* record: it carries the structured events (corpus digests, shapes,
+  budgets, checkpoint paths) that a table cannot hold.
+* **`csv/metrics_*.csv`** — always on, one wide file per metric family. Same
+  numbers as the event stream, in the shape `pandas.read_csv` expects.
 * **TensorBoard** — `tracking.tensorboard.enabled`.
 * **W&B** — `tracking.wandb.enabled`, `mode: offline` by default so a run never
   blocks on network or credentials.
+
+Both always-on sinks are stdlib (`json`, `csv`), which is deliberate: a run on a
+machine with no TensorBoard and no W&B credentials still leaves a complete,
+machine-readable trace.
 
 A missing optional dependency, or a W&B `init` that fails, degrades to a warning
 rather than killing a training run that is otherwise fine.
@@ -192,7 +202,60 @@ Methods: `log_metrics`, `log_histogram`, `log_figure`, `log_table`,
 trackers, and closes the figure so long runs do not leak canvases.
 
 `log_metrics` silently drops non-scalar values, which is what lets callers pass a
-mixed dict of metrics and metadata without filtering first.
+mixed dict of metrics and metadata without filtering first. `write_csv(name,
+rows)` writes a standalone table under `csv/` for records that are neither a time
+series nor step-indexed — the view-geometry report, the checkpoint-selection
+ledger.
+
+### `csv_metrics.py`
+
+`events.jsonl` is complete but not loadable: recovering "the epoch loss curve"
+means streaming megabytes of JSON, filtering on `type == "metrics"` and re-keying
+by prefix, which is why `src/utils/evaluation.py` carries a 60-line parser for
+exactly that job.
+
+`CsvMetricWriter` mirrors the same numbers as one wide CSV per metric family --
+`metrics_train.csv` per logging step, `metrics_epoch.csv` per epoch,
+`metrics_probe.csv` per probe. The split is by cadence: interleaving them would
+leave a file that is 90 % empty cells.
+
+**The column set is discovered, not declared.** `grad_scale` exists only under
+fp16, `gpu_busy_fraction` only when the run opted in, `aux_*` only with an
+auxiliary head. The sink therefore rewrites the whole file when a new column
+appears and appends when one does not, so the file on disk is always rectangular
+-- including after a crash, which is the property that makes it worth writing.
+That costs a handful of rewrites in the first few hundred steps and none after.
+
+A missing value is an **empty field**, not the literal `nan`: a metric that was
+not logged and a metric that genuinely evaluated to NaN are different facts, and
+NaN is preserved literally when it is the real value.
+
+### `representation_probe.py`
+
+The mechanism that lets stage 1 choose its own checkpoint. Read
+`STAGE1_V2.md` §1.4 for the argument; the short version is that the DINO loss
+cannot rank checkpoints — it is a cross entropy against a moving teacher, 94.8 %
+of the shipped run's final loss was irreducible target entropy, its minimum was
+at epoch 90, and the *representation* peaked at epoch 50 of 100.
+
+* `RepresentationProbe.run(...)` extracts frozen features on an
+  augmentation-free pass and scores three independently-failing families: the
+  frozen readout (linear probe + parameter-free k-NN), label-free geometry
+  (RankMe, participation ratio, stable rank, ‖mean unit vector‖, dead dims), and
+  **nuisance** — within-sub-variety photograph decodability, which is the gate an
+  arm must not win by re-learning the confound.
+* `CheckpointSelector` tracks the best under `min_delta`, writes the ledger, and
+  reports `should_stop()` after `patience` flat probes.
+* `publish_best_encoder` copies the winner atomically (a plain `shutil.copy`
+  truncates first, so a kill mid-copy destroys the previous best).
+
+Three properties that are load-bearing: the trunk's train/eval mode is
+**restored** after the pass (leaving it in `eval()` would disable stochastic depth
+for the rest of the run); the RNG is **forked** (a diagnostic must not shift the
+augmentation stream); and a failing probe **warns and returns no metrics** rather
+than raising into the training loop. `max_samples` subsets the *dataset*, not the
+extracted features, and the subset is random — truncating the loader would take
+the first N images, which under `ImageFolder` is the first few classes.
 
 ### `CheckpointManager`
 

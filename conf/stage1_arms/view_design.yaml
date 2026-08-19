@@ -1,0 +1,179 @@
+# V2 arms: decompose the v2 recipe into single factors, and test the two knobs
+# the primary run deliberately left alone.
+#
+#     python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
+#     python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --dry-run
+#
+# `pretrain_v2_swinv2_tiny` bundles four changes (trunk, view geometry, colour
+# policy, KoLeo space) because a first run should be the best guess available,
+# not a factorial design. That makes the bundle's *total* measurable and its
+# *decomposition* not. These arms recover the decomposition.
+#
+# Read every arm on:
+#
+#   1. `oof_probe_sub_accuracy` at the readout stage -- the headline.
+#   2. `nuisance_above_chance` -- the GATE. An arm that wins (1) while raising
+#      this has learned source-photograph identity, which is exactly the confound
+#      a new acquisition session punishes. Stage 1's one demonstrated effect on
+#      the shipped run was driving this from +10.0 pp to +3.5 pp.
+#   3. `train/teacher_student_kl` -- NOT `train/loss`. The reported loss is
+#      ~95 % target entropy, and any arm that changes the centering or the
+#      prototype count moves that entropy directly, so its raw loss is not
+#      comparable to any other arm's.
+#   4. `spectrum/rankme` and `participation_ratio` -- the counter-signal for the
+#      view arms specifically. Narrower crop ranges reduce augmentation
+#      diversity, and on 81 scenes the failure mode is pretext-task
+#      memorisation: RankMe falling sharply *together with* the KL is that
+#      failure, not success.
+#
+# Each arm publishes to its own `save_path`, `shared_backbone_path` and
+# evaluation directory -- the runner pins all three, because without that the
+# arms overwrite each other's encoders and each other's eval output.
+
+experiment: pretrain_v2_swinv2_tiny
+
+# The evaluation carries the TRUNK and the PROTOCOL, so it has to match the
+# training experiment: scoring a SwinV2-Tiny arm against an evaluation whose
+# `imagenet_init` control is SwinV2-Small would turn "what did self-distillation
+# add" into an architecture delta.
+evaluation: eval_pretrain_v2
+frozen_evaluation: eval_frozen_v2
+
+common:
+  # 25 epochs, not 50. These arms rank recipes against each other; they are not
+  # the production run. The shipped 100-epoch run's own milestone curve was
+  # within 0.8 pp of its peak at epoch 25, and the probe keeps the best
+  # checkpoint of each arm anyway, so paying 50 epochs per arm buys resolution
+  # the fold SD (+-0.10 on the 27-way probe) cannot use.
+  - experiment.training.epochs=25
+  - experiment.training.save_epochs=[5,10,15,20,25]
+  - experiment.training.probe.every_epochs=5
+  # Patience off: an arm that stops early has been measured over a different
+  # budget from its peers, which is exactly the confound an arm suite exists to
+  # avoid. Selection still runs; only the stopping does not.
+  - experiment.training.probe.patience=0
+  - data.num_workers=16
+
+arms:
+  # ------------------------------------------------------- the two references
+  - name: V2-FROZEN
+    description: >-
+      SwinV2-Tiny ImageNet-1k, frozen, NO in-domain training. The bar every arm
+      must clear. It is not a formality: on the previous trunk a frozen IN-22k
+      trunk already matched what a 13.34-hour DINO run reached, and the whole
+      question stage 1 has to answer is whether self-distillation adds anything
+      on top of a strong prior given only 81 scenes. If no arm beats this by more
+      than a fold SD, the honest conclusion is that the objective is not the
+      binding constraint and the effort belongs in data acquisition.
+    train: false
+    evaluate_frozen: true
+
+  - name: V2-FULL
+    description: >-
+      The v2 recipe exactly as `pretrain_v2_swinv2_tiny` ships it. Reference for
+      every ablation below, and the arm whose number is the pipeline's claim.
+    overrides: []
+
+  # ------------------------------------------------- decompose the v2 bundle
+  - name: V2-noVIEW
+    description: >-
+      v2 minus the view redesign: the submitted crop geometry
+      ((0.40,1.00)/(0.05,0.40) at 101 px, torchvision's aspect range) with the
+      v2 colour policy, dihedral augmentation and KoLeo space intact. This is
+      THE arm -- the difference between it and V2-FULL is the entire value of
+      moving local views from a median 598 native pixels to 1,395. Expect
+      V2-FULL to show a LOWER KL (the correspondence is genuinely easier to
+      learn once the two views depict the same object) and, if the hypothesis
+      holds, a higher probe.
+    overrides:
+      - data.local_crop_size=101
+      - data.augmentation.global_crops_scale=[0.40,1.00]
+      - data.augmentation.local_crops_scale=[0.05,0.40]
+      - data.augmentation.crop_ratio=[0.75,1.3333333333333333]
+
+  - name: V2-noCOLOUR
+    description: >-
+      v2 minus the colour-preservation policy: the reference DINO photometry
+      (saturation 0.2, hue 0.1, grayscale 0.2, solarization 0.2) with the v2
+      geometry intact. Tests whether preserving pigmentation is worth anything.
+      Judge it on the PER-CLASS F1 of the classes that currently confuse --
+      Jagnath vs Poosa33 (0.40/0.46), AMT-2 vs AMT-4 (0.46/0.37) -- not on the
+      27-class mean, because a hue cue that matters for three classes is
+      invisible in an average over 27. Note the audit refuted the naive version
+      of this hypothesis: mean RGB was MORE decodable after the shipped run than
+      before, so the jitter did not destroy the cue and this arm is about where
+      capacity goes, not about damage.
+    overrides:
+      - data.augmentation.color_jitter_saturation=0.2
+      - data.augmentation.color_jitter_hue=0.1
+      - data.augmentation.grayscale_prob=0.2
+      - data.augmentation.solarization_prob=0.2
+      - data.augmentation.global_blur_prob_1=1.0
+      - data.augmentation.global_blur_prob_2=0.1
+
+  - name: V2-noDIHEDRAL
+    description: >-
+      v2 minus the vertical flip and the 90-degree rotations, i.e. the
+      horizontal flip alone. The dihedral elements are lossless index
+      permutations and are what buys back the diversity the narrower crop ranges
+      give up, so this arm is the check on whether the narrowing is safe on 81
+      scenes. If V2-FULL beats this AND V2-noVIEW, the two changes are
+      complementary and the narrowing needed the diversity; if V2-noDIHEDRAL
+      matches V2-FULL, the rotations are free but idle.
+    overrides:
+      - data.augmentation.vertical_flip_prob=0.0
+      - data.augmentation.rotation90_prob=0.0
+
+  - name: V2-KOLEO-BOTTLENECK
+    description: >-
+      v2 with KoLeo back on the head's 256-D bottleneck instead of the pooled
+      trunk feature. The bottleneck is discarded at the end of stage 1 and the
+      trunk feature is the only thing stage 2 sees, so regularising the former
+      is regularising a space nothing downstream reads; DINOv2 applies KoLeo to
+      the backbone output for exactly this reason. Single factor.
+    overrides:
+      - model.loss.koleo_space=bottleneck
+
+  # ----------------------------------------- the knobs v2 deliberately fixed
+  - name: V2-FLOOR
+    description: >-
+      v2 plus a native-pixel floor of 900 on both view families. The scale range
+      is a FRACTION, so it shreds a 21x22 crop and an 881x413 crop by the same
+      factor; the floor raises the lower bound per image to
+      max(scale_lo, 900/area) and never lowers it. Measured effect on the local
+      views: p5 native pixels 483 -> 832 (+72 %), median 1395 -> 1419 (+1.7 %).
+      It therefore acts almost entirely on the worst-case views, which is the
+      whole claim -- if the tail was hurting, this fixes it for free; if it was
+      not, this is a no-op and the arm says so.
+    overrides:
+      - data.augmentation.min_native_pixels=900
+
+  - name: V2-EMA
+    description: >-
+      v2 with EMA centering instead of Sinkhorn. Sinkhorn was adopted when the
+      EMA centre was noise-dominated (K=65,536, m=0.9, 32 vectors/step = 0.005
+      samples per dimension); at K=2,048, m=0.99 and 128 vectors/step it is 6.25
+      per dimension, 20x better than DINO's own ImageNet setting, so that
+      justification has expired. What remains is Sinkhorn's entropy floor
+      log(K/B_teacher) and a target spread over ~215 prototypes, which carries
+      little instance identity for the student to match. FAILURE MODE: EMA
+      centering is the collapse-prone path -- watch prototype_perplexity falling
+      from ~2,030 toward tens. This arm moves H(teacher) directly, so its raw
+      loss is not comparable with any other arm's; read the KL.
+    overrides:
+      - model.loss.centering=ema
+      - model.loss.center_momentum=0.99
+
+  - name: V2-STAGE3
+    description: >-
+      v2 published and read at `layers.2` (16x16x384, 2x2-pooled to a 64-token
+      grid) instead of the final stage. Linear CKA between the shipped DINO
+      encoder and its ImageNet initialisation was 0.976/0.960/0.390/0.103 across
+      layers.0..3: self-distillation rewrote the last stage to serve its
+      2,048-prototype head, and that is the stage stage 2 reads. On the frozen
+      probe `layers.2` was +3.25 pp linear and +3.90 pp with an MLP, and the
+      ordering held for the plain ImageNet weights too. Runs LAST, because it
+      changes what is read rather than what is learned and would confound any
+      simultaneous objective change.
+    overrides:
+      - model.backbone.feature_stage=stage3_pooled_2x2

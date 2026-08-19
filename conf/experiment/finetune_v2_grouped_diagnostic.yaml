@@ -1,0 +1,47 @@
+# @package _global_
+#
+# The v2 stage-2 configuration under photograph-disjoint splitting.
+#
+#     SEED_PRETRAIN_BACKBONE=$SEED_OUTPUT_DIR/checkpoints/dino_v2_swinv2_tiny.pth \
+#         python -m src.trainers.moe_finetune experiment=finetune_v2_grouped_diagnostic
+#
+# This is a **secondary diagnostic, not the primary pipeline.** The primary
+# pipeline is `finetune_v2_crop_level`, and nothing in it depends on this file
+# existing or having been run.
+#
+# It exists for one reason: the crop-level headline is ~18 pp above a
+# photograph-disjoint estimate, that gap was measured on the *old* encoder
+# (`split_protocol_delta.csv`), and quoting an old encoder's leakage figure next
+# to a new encoder's accuracy is quoting a number that was not measured on the
+# thing being reported. Running the identical configuration under `grouped_cv`
+# makes the delta a property of this pipeline.
+#
+# `grouped_cv` rather than `grouped`, because `grouped`'s `GroupShuffleSplit`
+# takes 20 % of the 81 photographs unstratified and the resulting test side holds
+# only 14 of the 27 classes -- a 27-way macro-F1 on it is mechanically capped
+# near 14/27 for reasons unrelated to the model. `grouped_cv` partitions every
+# crop into photograph-disjoint folds and concatenates the out-of-fold
+# predictions, so every class is scored.
+#
+# Two things this number is not. It is an estimate of the *recipe* -- K different
+# models contributed predictions -- rather than any single shipped model's test
+# score; and it is not comparable with the crop-level number as a "better" or
+# "worse" result, only as a measurement of the gap between two questions.
+#
+# Note also that five sub-varieties have crops from exactly one photograph
+# (Baryard, Browntop, FingerMillet, PearlMillet, ProsaMillet -- 1,387 crops,
+# 14.8 % of the dataset). Under any photograph-disjoint split they are
+# unpredictable, identically for every encoder including an untrained one. That
+# is a property of the dataset and the fix is a camera, not a splitter.
+
+defaults:
+  - finetune_v2_crop_level
+
+experiment:
+  name: "finetune_v2_grouped_diagnostic"
+  group: "stage2_v2_diagnostic"
+  training:
+    split_protocol: "grouped_cv"
+    num_folds: 5
+    test_size: 0.0        # grouped_cv holds out no separate test split
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/finetune_v2_grouped_diagnostic"

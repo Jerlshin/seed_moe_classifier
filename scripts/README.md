@@ -160,11 +160,20 @@ arm is adding an entry.
 | `phase1.yaml` | 1 | The frozen reference plus five 50-epoch arms (baseline, KoLeo per view, `lambda_koleo=0`, crop scales, EMA centering) |
 | `phase2.yaml` | 2 | Template: the Phase-1 winner, plus `match_view_lowpass`, the auxiliary stage head, and a 100-epoch re-run |
 | `phase3.yaml` | 3 | The winner and the baseline at three seeds each, plus the frozen reference |
+| `view_design.yaml` | v2 | The v2 recipe decomposed into single factors: the view redesign, the colour policy, the dihedral augmentation, KoLeo's space, plus the native-pixel floor, EMA centering and the stage-3 readout it deliberately left fixed |
 
 Three arm shapes: `train: true` (train then evaluate), `train: false` with
 `evaluate_frozen: true` (the reference — the chosen trunk, frozen, no in-domain
 training), and `train: false` with an explicit `eval_experiment` (a Phase-0
 screen).
+
+**A suite on a different trunk must name its own evaluation.** The manifest's
+`evaluation:` and `frozen_evaluation:` keys select which evaluation experiment
+scores every arm, because the evaluation config carries the *trunk* and the
+*protocol*: scoring a SwinV2-Tiny arm against an evaluation whose `imagenet_init`
+control is SwinV2-Small turns "what did self-distillation add" into an
+architecture delta. `view_design.yaml` sets them to `eval_pretrain_v2` /
+`eval_frozen_v2`; a per-arm `eval_experiment` still wins over both.
 
 **Only `data.*` overrides carry into the evaluation.** They describe the corpus
 and the augmentation, both of which the alignment measurement must reproduce;
@@ -181,6 +190,52 @@ carries `final_teacher_student_kl` (the **learnable** half of the objective — 
 raw DINO loss is ~95 % target entropy and is not comparable across arms that move
 the centering) and `nuisance_photo_above_chance` (an arm that *raises* it may have
 won the probe by re-learning the photograph confound the protocol punishes).
+
+## `report_view_geometry.py`
+
+```bash
+python scripts/report_view_geometry.py
+python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
+python scripts/report_view_geometry.py --data seed_crops_v2 --csv outputs/reports/geometry.csv \
+    data.augmentation.min_native_pixels=900
+```
+
+**What each DINO view is actually built from, before spending a GPU-hour on it.**
+`RandomResizedCrop`'s `scale` is a fraction of the *source* area, so a config
+does not say how much of a seed a view contains — only the product of the scale
+range and the source-size distribution does, and nothing was measuring it. On
+this corpus the submitted recipe builds each local view from a median **598
+native pixels** rendered into 65,536, with 80 % of Eq. 1's cross-view terms
+anchored on one.
+
+It reads the real file headers (~2 s for 9,357 files, no decode) and drives
+torchvision's own `RandomResizedCrop.get_params`, so the numbers are what the
+dataloader will produce rather than a model of it. That matters for one result in
+particular: `get_params` retries ten times and then returns a **deterministic
+centre crop**, and on a corpus that is 96.6 % non-square, raising the scale floor
+pushes it into that fallback — 3.3 % at `scale=(0.40, 1.00)` against **21.5 %** at
+`(0.70, 1.00)`. The rate is reported per view family and is why `crop_ratio` is a
+config key.
+
+Reads nothing but the dataset and the config; never touches a checkpoint. The
+trainer runs the same measurement at startup into `csv/view_geometry.csv`.
+
+## `plot_stage1_run.py`
+
+```bash
+python scripts/plot_stage1_run.py outputs/hydra/2026-08-19/12-08-26
+python scripts/plot_stage1_run.py <run dir> --output figures/ --dpi 600
+```
+
+Regenerates a stage-1 run's five publication figures from `<run dir>/csv/*.csv`
+and nothing else — no checkpoint, no GPU, no event parser, no W&B. The trainer
+already writes them at the end of a run (including an interrupted one); this
+exists for rebuilding them after editing a figure, on a laptop, or from a run
+directory copied off a server.
+
+The CSV-only constraint is what makes a figure and its table the same numbers by
+construction, which is why the trainer generates them the same way rather than
+from the values it still holds in memory.
 
 ## `report_raw_photographs.py`
 

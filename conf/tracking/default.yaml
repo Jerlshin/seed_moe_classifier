@@ -27,6 +27,19 @@ snapshot:
     - "PASS"
     - "CREDENTIAL"
 
+# Wide-format CSV mirrors of every logged metric, one file per family, written
+# to `<run dir>/csv/`. Always on: it has no optional dependency, it survives a
+# crash, and it is the artifact an automated analysis loads directly --
+# `events.jsonl` is the complete record but needs a parser to become a table.
+csv:
+  enabled: true
+  directory: null      # null -> `${hydra:runtime.output_dir}/csv`
+
+# Figures written to `<run dir>/figures/`. `dpi` applies to the stage-1
+# publication suite (`src/utils/stage1_figures.py`), which writes PNG and PDF.
+figures:
+  dpi: 300
+
 tensorboard:
   enabled: true
   log_dir: "${hydra:runtime.output_dir}/tensorboard"
@@ -50,6 +63,12 @@ intervals:
   # every step for free (the clip computes it anyway), so this breakdown runs on
   # its own, much rarer, interval. 0 disables it.
   gradient_norm_every_steps: 200
+  # |dW| / |W| across the trunk. Adam normalises by the second moment, so a
+  # gradient norm says nothing about step size and this is the quantity that
+  # does -- ~1e-3 is healthy at these rates, persistently above 1e-2 means the
+  # trunk is being rewritten. Costs one device clone per parameter tensor and no
+  # host synchronisation. 0 disables it.
+  update_ratio_every_steps: 200
   histogram_every_epochs: 5
   gradient_histogram_every_epochs: 5
   embedding_every_epochs: 5

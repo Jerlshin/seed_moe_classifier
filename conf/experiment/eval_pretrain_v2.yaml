@@ -1,0 +1,155 @@
+# @package _global_
+#
+# Stage-1 evaluation for the v2 run, under the primary crop-level protocol.
+#
+#     python main.py eval-pretrain-v2
+#
+# Differs from `eval_pretrain_representation` in three ways and no others:
+#
+# 1. It reads the v2 run's milestones, including `dino_best_encoder.pth` -- the
+#    encoder the in-training probe selected and the one stage 2 is handed. That
+#    row is the headline; the numbered milestones are what make "did the probe
+#    pick the right one" checkable rather than assumed.
+# 2. The headline split is **crop-level stratified**, matching the primary
+#    pipeline, and `grouped_cv` is off. The photograph-disjoint estimate lives in
+#    `finetune_v2_grouped_diagnostic` and in this file's own
+#    `split.also_stratified` counterpart -- here `also_stratified` is inverted:
+#    the grouped single split is reported *beside* the headline so the delta
+#    stays visible, but it is not what any headline number is computed from.
+# 3. The trunk is SwinV2-Tiny, so `random_init` and `imagenet_init` are Tiny
+#    too. Comparing a Tiny DINO encoder against a Small ImageNet control would
+#    make the "+X pp from self-distillation" figure partly an architecture delta.
+#
+# Everything else -- the handcrafted floor, the layerwise readout, the nuisance
+# measurement, the prototype and invariance blocks -- is unchanged, because those
+# are instruments rather than protocol choices.
+
+defaults:
+  - override /model/head: dino
+  - override /model/loss: dino
+
+model:
+  backbone:
+    name: "swinv2_tiny_window16_256"
+    feature_dim: 768
+    checkpoint_path: null
+    pretrained: false
+    freeze: true
+    drop_path_rate: 0.0
+
+data:
+  expected_num_samples: 9357
+
+experiment:
+  name: "eval_pretrain_v2"
+  stage: "eval"
+  group: "stage1_v2_evaluation"
+  evaluation:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/eval_pretrain_v2"
+    pretrain_run_dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_v2_swinv2_tiny"
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_v2_swinv2_tiny.pth"
+    encoders:
+      - label: "dino_v2_best"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_best_encoder.pth"
+        pretrained: false
+        role: "primary"
+        description: "the probe-selected encoder -- the weights stage 2 is handed"
+      - label: "dino_v2_epoch10"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0010.pth"
+        pretrained: false
+        role: "milestone"
+        description: "10 epochs of v2 self-distillation"
+      - label: "dino_v2_epoch25"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0025.pth"
+        pretrained: false
+        role: "milestone"
+        description: "25 epochs"
+      - label: "dino_v2_epoch50"
+        checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0050.pth"
+        pretrained: false
+        role: "milestone"
+        description: "50 epochs -- the configured budget, reached only if the probe did not plateau first"
+      - label: "imagenet_init"
+        checkpoint: null
+        pretrained: true
+        role: "control_imagenet"
+        description: "SwinV2-Tiny ImageNet-1k weights -- what stage 1 started from, and the bar it must clear"
+      - label: "random_init"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "untrained SwinV2-Tiny; the floor a linear readout gets from architecture alone"
+      - label: "handcrafted_floor"
+        kind: "handcrafted"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "10 image statistics -- the floor a reviewer asks about first"
+    teacher:
+      enabled: false
+    split:
+      # Crop-level is the primary protocol for this pipeline.
+      protocol: "stratified"
+      test_size: 0.2
+      num_folds: 5
+      # Report the photograph-disjoint single split alongside, so the ~18 pp gap
+      # is measured on THIS encoder rather than quoted from the previous one.
+      # It is a reported diagnostic, never an input to a headline number.
+      also_stratified: true
+    grouped_cv:
+      enabled: false
+    reuse_cached_features: true
+    geometry_max_samples: 6000
+    probe:
+      regularisation_grid: [0.01, 0.1, 1.0, 10.0, 100.0]
+      max_iterations: 2000
+      cv_encoders: ["dino_v2_best", "imagenet_init"]
+      low_shot_shots: [1, 2, 5, 10, 25]
+      low_shot_repeats: 5
+      low_shot_encoders: ["dino_v2_best", "imagenet_init"]
+    knn:
+      k_values: [1, 5, 10, 20]
+      temperature: 0.07
+    clustering:
+      enabled: true
+    retrieval:
+      enabled: true
+      k_values: [1, 5, 10]
+    readout:
+      stages: ["pooled", "stage3"]
+    layerwise:
+      enabled: true
+      all_encoders: true
+      encoders: ["dino_v2_best", "imagenet_init"]
+    nuisance:
+      enabled: true
+      folds: 3
+    invariance:
+      enabled: true
+      encoders: ["dino_v2_best", "imagenet_init"]
+      max_samples: 1500
+    prototypes:
+      enabled: false
+      probe_bottleneck: false
+    tsne:
+      perplexity: 30.0
+      max_samples: 3000
+      encoders: ["dino_v2_best", "imagenet_init", "random_init"]
+    efficiency:
+      enabled: true
+      batch_sizes: [1, 8, 32]
+      warmup: 3
+      iterations: 20
+      measure_flops: true
+    dynamics:
+      enabled: true
+      events_path: null
+    figures:
+      enabled: true
+      dpi: 300
+      retrieval_examples: true
+      retrieval_rows: 6
+      retrieval_neighbours: 5
+    batch_size: 32
+    num_workers: 2
+    max_samples: 0

@@ -1,0 +1,69 @@
+# @package _global_
+#
+# The frozen reference for the v2 pipeline: SwinV2-Tiny ImageNet-1k, no
+# in-domain training at all, scored under the crop-level protocol.
+#
+#     python -m src.trainers.pretrain_eval experiment=eval_frozen_v2
+#
+# This is the number every v2 stage-1 arm has to beat, and it is not a
+# formality. The stage-1 evaluation's own decomposition of the previous run was
+# `random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO`: the initialisation
+# supplied 79x what the 13.34-hour self-distillation supplied. If an arm does not
+# clear this row by more than the fold SD, the honest claim is that the objective
+# is not the binding constraint on 81 scenes -- and that is a publishable result,
+# not a failure to hide.
+#
+# Identical to `eval_frozen_reference` except for the trunk and the protocol,
+# both of which have to match `eval_pretrain_v2` or the comparison is between two
+# different measurements.
+
+defaults:
+  - eval_pretrain_v2
+
+model:
+  backbone:
+    name: "swinv2_tiny_window16_256"
+    feature_dim: 768
+
+experiment:
+  name: "eval_frozen_v2"
+  group: "stage1_v2_reference"
+  evaluation:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/eval_frozen_v2"
+    shared_backbone_path: null
+    pretrain_run_dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_v2_swinv2_tiny"
+    teacher:
+      enabled: false
+    prototypes:
+      enabled: false
+    dynamics:
+      enabled: false
+    encoders:
+      - label: "imagenet_init"
+        checkpoint: null
+        pretrained: true
+        role: "primary"
+        description: "frozen SwinV2-Tiny ImageNet-1k, NO in-domain training -- the bar stage 1 must clear"
+      - label: "random_init"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "untrained SwinV2-Tiny; the architecture-only floor"
+      - label: "handcrafted_floor"
+        kind: "handcrafted"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "10 image statistics -- 0.5360 under the photograph-disjoint protocol in the audit"
+    probe:
+      cv_encoders: ["imagenet_init"]
+      low_shot_encoders: ["imagenet_init"]
+    layerwise:
+      enabled: true
+      all_encoders: true
+      encoders: ["imagenet_init"]
+    invariance:
+      enabled: true
+      encoders: ["imagenet_init"]
+    tsne:
+      encoders: ["imagenet_init", "random_init"]

@@ -1,0 +1,129 @@
+# The v2 stage-1 augmentation policy: a view recipe designed for 52 x 51 px crops.
+#
+# Selected with `data: seed_crops_v2`, or by an experiment that overrides the
+# `data` group. Everything not restated here is inherited from
+# `hierarchical_seeds.yaml`, which remains the submitted recipe and reproduces
+# every published number.
+#
+# WHY THIS FILE EXISTS
+# ====================
+#
+# `RandomResizedCrop`'s `scale` is a fraction of the SOURCE area. On ImageNet the
+# source is a whole scene and a 5 % crop is still a recognisable object part.
+# Here the source is already a tight crop of ONE SEED at a median 52 x 51 px, so
+# the same recipe is not sampling part of a scene -- it is shredding the object.
+#
+# Measured over all 9,357 crops with torchvision's own `get_params`
+# (`scripts/report_view_geometry.py` reproduces every row):
+#
+#   view recipe                            native px p5/50/95    upsample  real content
+#   -------------------------------------  --------------------  --------  ------------
+#   global (0.40, 1.00) r=(0.75, 1.33)       648 / 1833 / 5796      6.0x        2.80 %
+#   local  (0.05, 0.40) r=(0.75, 1.33)       132 /  598 / 2632     10.5x        0.91 %   <-- submitted
+#   global (0.70, 1.00) r=(0.50, 2.00)       936 / 2440 / 7650      5.2x        3.72 %   <-- v2
+#   local  (0.30, 0.70) r=(0.50, 2.00)       483 / 1395 / 4752      6.9x        2.13 %   <-- v2
+#
+# A local view under the submitted recipe is a median 24 x 24 px fragment of one
+# seed inflated to 65,536 output pixels, and 8 of the 10 cross-view terms in
+# Eq. 1 are anchored on such a view. v2 gives the local views 2.3x the content
+# and cuts their upsample from 10.5x to 6.9x, which also narrows the
+# local-vs-global resolution gap the student can use as a shortcut.
+#
+# ONE MEASURED CORRECTION TO THE AUDIT'S PROPOSAL
+# ===============================================
+#
+# `STAGE1_CHANGES.md` C1 proposes (0.70, 1.00) / (0.30, 0.70) and leaves the
+# aspect range alone. Measured, that costs a **21.5 %** deterministic-centre-crop
+# fallback rate on the global views, against 3.3 % today: torchvision retries the
+# (area, aspect) draw ten times and then returns a fixed centre box, and a
+# high-area box in (0.75, 1.33) does not fit inside a non-square source -- only
+# 3.4 % of these crops are square. Widening `crop_ratio` to (0.5, 2.0) brings it
+# to 9.3 % AND raises the median content further (2440 vs 2262 native px). So the
+# wider ratio is strictly better on both axes, and it is why this file changes a
+# knob C1 did not mention.
+#
+# COLOUR IS SIGNAL HERE
+# =====================
+#
+# Mean RGB alone scores 0.3169 on the 27-way task and explains 78.5 % of the
+# between-sub-variety variance; only ~26.6 % of the within-class colour variance
+# is photograph-specific, so most of the cue transfers. The jitter is therefore
+# split by what it attacks rather than turned down uniformly:
+#
+#   * brightness / contrast  = illumination = photograph nuisance -> keep at 0.4
+#   * saturation / hue       = pigmentation = class signal        -> cut hard
+#   * grayscale, solarize    = delete / invert the cue            -> off
+#
+# What this is NOT claiming: the audit refuted the obvious version of the
+# argument. Mean RGB is *more* linearly decodable after the shipped DINO run than
+# before (pooled R^2 0.864 -> 0.908), so the jitter did not destroy the cue. This
+# is about where capacity goes, it is a hypothesis, and
+# `conf/stage1_arms/view_design.yaml` runs the control that tests it.
+
+defaults:
+  - hierarchical_seeds
+
+# 160, not 101. The local crop is emitted at this size and upsampled to
+# `image_size` on the GPU; raising it only matters when the native content
+# exceeds it, which at these scales it rarely does -- but it removes the
+# intermediate as a second low-pass and costs 2.5x the collate bandwidth of a
+# 101 px view, which is still 2.6x cheaper than emitting at 256.
+local_crop_size: 160
+
+# The corpus is 9,357 crops. Declared, so a run against the wrong root dies at
+# startup instead of 13 GPU-hours later -- the failure that actually happened.
+expected_num_samples: 9357
+
+augmentation:
+  # --------------------------------------------------------------- geometry
+  global_crops_scale: [0.70, 1.00]
+  local_crops_scale: [0.30, 0.70]
+  local_crops_number: 4
+  crop_ratio: [0.5, 2.0]
+
+  # No floor by default: at (0.30, 0.70) the p5 local view already carries 483
+  # native px, and adding a second mechanism to the primary arm would confound
+  # it with the scale change. `conf/stage1_arms/view_design.yaml` runs
+  # min_native_pixels=900 as its own arm, which lifts the p5 to 832 (+72 %) and
+  # moves the median by 1.7 % -- i.e. it acts only on the worst views, which is
+  # the entire claim being tested.
+  min_native_pixels: 0
+
+  # The full dihedral group, losslessly. This is what buys back the augmentation
+  # diversity the narrower crop ranges give up, and it is the reason narrowing
+  # them is not simply a step toward pretext-task memorisation on 81 scenes.
+  horizontal_flip_prob: 0.5
+  vertical_flip_prob: 0.5
+  rotation90_prob: 0.75
+
+  # --------------------------------------------------------------- photometry
+  color_jitter_prob: 0.8
+  color_jitter_brightness: 0.4    # illumination: nuisance, keep
+  color_jitter_contrast: 0.4      # illumination: nuisance, keep
+  color_jitter_saturation: 0.1    # pigmentation: signal, halved
+  color_jitter_hue: 0.02          # pigmentation: signal. 0.1 is +-36 degrees of hue
+  grayscale_prob: 0.0             # deletes the colour cue outright
+  solarization_prob: 0.0          # inverts it, which is worse
+
+  # Symmetric across the three view families, so blur no longer identifies which
+  # family a view came from. The submitted 1.0 / 0.1 / 0.5 gave the student a
+  # second family cue on top of the resolution artefact, and a cue it can use to
+  # predict the family's marginal is a cue that substitutes for learning the
+  # local-to-global correspondence Eq. 1 exists to teach.
+  global_blur_prob_1: 0.5
+  global_blur_prob_2: 0.5
+  local_blur_prob: 0.5
+  # These images carry essentially no content above ~52 px and are then upsampled
+  # ~5x, so a wide blur radius removes real structure rather than a nuisance
+  # frequency band.
+  blur_radius_min: 0.1
+  blur_radius_max: 1.0
+
+  # Unchanged from the base policy, restated because they are load-bearing:
+  # uint8 collate + GPU-side upsample is a 4x cut in collate/pin/PCIe cost for
+  # arithmetic identical up to float association.
+  resize_local_to_global: true
+  output_uint8: true
+  defer_local_upsample: true
+  match_view_lowpass: false
+  same_photo_local_views: 0

@@ -936,6 +936,12 @@ def test_stage1_summary_round_trips_and_carries_the_corpus(tmp_path, corpus_root
         view_ids = [0, 1, 2, 3, 4, 5]
         global_view_ids = [0, 1]
 
+        def describe(self):
+            # `write_stage1_summary` records the resolved augmentation policy
+            # from the transform itself, not from the config node, so this
+            # double has to carry the same interface the real one does.
+            return {"local_crops_number": 4, "crop_ratio": [0.75, 1.3333333333333333]}
+
     class _Model:
         drop_path_rate = 0.1
         aux_stage = None

@@ -206,7 +206,7 @@ import random
 import shutil
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -229,7 +229,7 @@ from src.datasets.dataset import (
     get_pretrain_dataloader,
     raw_photograph_coverage,
 )
-from src.datasets.transforms import get_dino_transforms
+from src.datasets.transforms import get_dino_transforms, view_geometry_report
 from src.losses.dino import CustomDINOLoss
 from src.models.backbones.swinv2_dino import DINO, build_dino
 from src.utils.training import (
@@ -268,6 +268,13 @@ from src.utils.training import (
     to_cpu_state_dict,
 )
 from src.utils.evaluation import RunSummary
+from src.utils.stage1_figures import generate_stage1_figures
+from src.utils.training.representation_probe import (
+    CheckpointSelector,
+    RepresentationProbe,
+    milestone_table,
+    publish_best_encoder,
+)
 from src.utils.visualization import plot_loss_curves
 
 #: Rolling resume checkpoints. Two, not one: on a preempted instance the newest
@@ -1030,6 +1037,8 @@ def write_stage1_summary(
     artifacts: Mapping[str, str],
     context: DistributedContext,
     logger,
+    view_geometry: Mapping[str, Any] | None = None,
+    selection: Mapping[str, Any] | None = None,
 ) -> str:
     """Write ``summary.json`` beside the stage-1 checkpoints.
 
@@ -1052,6 +1061,13 @@ def write_stage1_summary(
       caught the shipped encoder having been trained on 8,173 of 9,357 crops.
     * ``metrics`` -- the final ``KL(q||p)`` and teacher entropy with its bounds,
       not the raw loss alone; see A4.
+    * ``config.view_geometry`` -- the **measured** native-pixel content of each
+      view family, not just the scale range that produced it. A configuration
+      records what was asked for; this records what the augmentation actually
+      built, which is the quantity a view-design arm is moving.
+    * ``config.selection`` -- which epoch the representation probe chose and on
+      what metric, so "why does this arm's encoder come from epoch 30" is
+      answerable from the one file the arm suite reads.
     """
     summary = RunSummary(
         name=str(cfg.experiment.name),
@@ -1113,6 +1129,15 @@ def write_stage1_summary(
             "epochs": int(cfg.experiment.training.epochs),
             "seed": int(cfg.seed),
             "augmentation": OmegaConf.to_container(cfg.data.augmentation, resolve=True),
+            # The resolved policy as the transform itself sees it. Not redundant
+            # with `augmentation` above: overrides the trainer passes (notably
+            # `return_original=False`) never appear in the config node, and an
+            # arm that reaches the same policy through a different YAML file
+            # produces an identical dictionary here, which is what a provenance
+            # record should do.
+            "augmentation_resolved": transform.describe(),
+            "view_geometry": dict(view_geometry or {}),
+            "selection": dict(selection or {}),
             "budget": budget.as_dict(),
         },
         artifacts=dict(artifacts),
@@ -1144,6 +1169,273 @@ def publish_shared_backbone(cfg: DictConfig, backbone_file: Path, logger) -> Pat
 
     logger.info("Published shared backbone for downstream runs: %s", target)
     return target
+
+
+def report_view_geometry(
+    cfg: DictConfig,
+    transform,
+    dataset: Any,
+    tracker: ExperimentTracker,
+    logger,
+) -> dict[str, Any]:
+    """Measure and record what each view family is actually built from.
+
+    ``RandomResizedCrop``'s ``scale`` is a *fraction of the source area*, and on
+    this corpus the source is one seed at a median 52x51 px. A configuration
+    therefore does not say how much of a seed a view contains -- only the
+    *product* of the scale range and the source-size distribution does, and
+    nothing was measuring it. Under the submitted recipe the answer is a median
+    **598 native pixels** per local view rendered into 65,536, with **8 of the 10
+    cross-view terms** in Eq. 1 anchored on one.
+
+    Runs at startup against the real file headers, costs ~2 s for 9,357 files,
+    and writes ``csv/view_geometry.csv`` plus a ``view_geometry`` event. Returns
+    ``{}`` when the dataset cannot report its source sizes (the ``pickle_batches``
+    format has no per-image files), which is a skipped diagnostic, not an error.
+    """
+    if not bool(OmegaConf.select(cfg, "experiment.training.view_geometry.enabled", default=True)):
+        return {}
+    getter = getattr(dataset, "source_sizes", None)
+    if getter is None:
+        logger.info(
+            "View-geometry report skipped: %s does not expose per-image sizes.",
+            type(dataset).__name__,
+        )
+        return {}
+
+    try:
+        sizes = getter()
+        report = view_geometry_report(
+            transform,
+            sizes,
+            samples=int(
+                OmegaConf.select(cfg, "experiment.training.view_geometry.samples", default=20000)
+            ),
+            seed=int(cfg.seed),
+        )
+    except Exception as exc:  # pragma: no cover - a report must not abort a run
+        logger.warning("View-geometry report failed: %s", exc, exc_info=True)
+        return {}
+
+    rows = [
+        {"family": family, **report[family]}
+        for family in ("global", "local")
+    ]
+    tracker.write_csv("view_geometry", rows)
+    tracker.log_event("view_geometry", report)
+    for family in ("global", "local"):
+        block = report[family]
+        logger.info(
+            "View geometry | %-6s scale=%.2f-%.2f ratio=%.2f-%.2f -> native px "
+            "p5/p50/p95 = %.0f/%.0f/%.0f, median upsample %.1fx to %d px, %.2f%% real "
+            "content, %.1f%% deterministic-centre-crop fallback",
+            family,
+            block["scale_low"], block["scale_high"], block["ratio_low"], block["ratio_high"],
+            block["native_pixels_p5"], block["native_pixels_p50"], block["native_pixels_p95"],
+            block["upsample_factor_median"], int(block["output_size"]),
+            block["real_content_fraction_median"] * 100.0,
+            block["deterministic_fallback_rate"] * 100.0,
+        )
+    logger.info(
+        "View geometry | %.0f%% of Eq. 1's cross-view terms are anchored on a local view. "
+        "A local view's information content is its native pixel count, not its tensor size.",
+        report["local_anchored_loss_term_fraction"] * 100.0,
+    )
+    if report["global"]["deterministic_fallback_rate"] > 0.15:
+        logger.warning(
+            "RandomResizedCrop falls back to a DETERMINISTIC centre crop on %.1f%% of global "
+            "draws. The fallback box is identical every time, so that share of the global views "
+            "carries no crop randomness at all and the teacher's two views frequently differ "
+            "only by flip and jitter. Widen data.augmentation.crop_ratio -- only %.1f%% of these "
+            "crops are square, so the default (0.75, 1.33) cannot fit a high-area box inside "
+            "most of them.",
+            report["global"]["deterministic_fallback_rate"] * 100.0,
+            report["source"]["square_fraction"] * 100.0,
+        )
+    return report
+
+
+def check_corpus_size(cfg: DictConfig, fingerprint: Mapping[str, Any], logger) -> None:
+    """Refuse to train on a corpus of an unexpected size, when one is declared.
+
+    ``corpus_fingerprint`` makes a mismatch *discoverable after the fact*; this
+    makes it fatal *before* the run. The distinction matters because the failure
+    it guards against already happened once: the shipped encoder was
+    self-distilled on 8,173 crops while everything downstream used 9,357, and
+    13 hours of H100 time went into an encoder that was answering a different
+    question from the one the evaluation asked.
+
+    ``data.expected_num_samples: null`` (the default) disables the check, so this
+    is opt-in per experiment rather than a number baked into the loader.
+    """
+    expected = OmegaConf.select(cfg, "data.expected_num_samples", default=None)
+    if not expected or not fingerprint:
+        return
+    actual = int(fingerprint.get("num_samples", 0))
+    if actual == int(expected):
+        logger.info(
+            "Corpus size verified: %s images, exactly as data.expected_num_samples declares.",
+            actual,
+        )
+        return
+    raise RuntimeError(
+        f"Corpus size mismatch: data.expected_num_samples={int(expected)} but the loader found "
+        f"{actual} images under {fingerprint.get('root')}. Stage 1 has silently trained on the "
+        "wrong corpus before -- 8,173 crops against the 9,357 everything downstream uses -- so "
+        "this is fatal rather than a warning. Fix the dataset root, or set "
+        "data.expected_num_samples=null if the change is intended."
+    )
+
+
+def build_representation_probe(
+    cfg: DictConfig,
+    logger,
+) -> tuple[RepresentationProbe | None, CheckpointSelector | None, list[int]]:
+    """The in-training probe, its checkpoint selector, and the epochs to run it at.
+
+    Returns ``(None, None, [])`` when probing is off, which is what every caller
+    branches on. Building the evaluation dataset here rather than lazily is
+    deliberate: a probe that fails at epoch 25 because the dataset root is wrong
+    should fail at startup instead.
+    """
+    from src.datasets.dataset import get_finetune_dataset
+    from src.datasets.transforms import get_supervised_transforms
+
+    node = OmegaConf.select(cfg, "experiment.training.probe", default=None)
+    options = dict(node or {})
+    if not options.get("enabled", False):
+        return None, None, []
+
+    dataset = get_finetune_dataset(
+        data_dir=str(cfg.data.root_path),
+        # Evaluation transforms: a deterministic resize and normalisation, no
+        # augmentation. The probe measures the representation, and an augmented
+        # pass would measure the representation *plus* the augmentation policy --
+        # which is the variable the arms are changing.
+        transform=get_supervised_transforms(
+            int(cfg.data.image_size),
+            train=False,
+            normalize_mean=list(cfg.data.augmentation.normalize_mean),
+            normalize_std=list(cfg.data.augmentation.normalize_std),
+        ),
+    )
+    batch_size = int(options.get("batch_size", 64) or 64)
+    workers = int(options.get("num_workers", 2) or 0)
+
+    # `max_samples` subsets the DATASET, not the extracted features, so the
+    # forward pass itself gets cheaper -- which is the only way the knob does
+    # what it says. Truncating the loader instead would be wrong rather than
+    # merely crude: `ImageFolder` enumerates in class order, so the first N
+    # images are the first few sub-varieties.
+    #
+    # The subset is a fixed permutation of a fixed seed, so every probe of every
+    # run scores the same images and two milestones differ by the encoder alone.
+    groups = dataset.source_groups()
+    indices: np.ndarray | None = None
+    max_samples = int(options.get("max_samples", 0) or 0)
+    if max_samples and max_samples < len(dataset):
+        rng = np.random.default_rng(int(options.get("seed", 42) or 42))
+        indices = np.sort(rng.choice(len(dataset), size=max_samples, replace=False))
+        # The nuisance measurement pairs each feature with its source
+        # photograph; a full-corpus group array beside a subset of features
+        # would pair each one with a different image's provenance.
+        groups = groups[indices]
+
+    def loader_factory():
+        from torch.utils.data import DataLoader, Subset
+
+        return DataLoader(
+            dataset if indices is None else Subset(dataset, indices.tolist()),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=False,
+            drop_last=False,
+        )
+
+    probe = RepresentationProbe(
+        loader_factory,
+        num_classes=int(cfg.data.num_sub_varieties),
+        source_groups=groups,
+        config=options,
+        logger=logger,
+    )
+    selector = CheckpointSelector(
+        metric=str(options.get("selection_metric", "probe_accuracy")),
+        patience=int(options.get("patience", 0) or 0),
+        min_delta=float(options.get("min_delta", 0.0) or 0.0),
+        logger=logger,
+    )
+    epochs = int(cfg.experiment.training.epochs)
+    every = int(options.get("every_epochs", 0) or 0)
+    at_epochs = {int(value) for value in (options.get("at_epochs") or []) if 0 < int(value) <= epochs}
+    if every > 0:
+        at_epochs.update(range(every, epochs + 1, every))
+    # The last epoch is always probed: without it the selector could end a run
+    # holding a "best" it never compared against the encoder actually shipped.
+    at_epochs.add(epochs)
+    schedule = sorted(at_epochs)
+    logger.info(
+        "Representation probe ON | %s of %s images, %s-fold crop-level stratified readout, "
+        "selecting on %s (patience %s, min_delta %.4g). Probing at epochs: %s.",
+        len(dataset) if indices is None else len(indices), len(dataset),
+        probe.folds, selector.metric, selector.patience, selector.min_delta,
+        ", ".join(str(value) for value in schedule),
+    )
+    logger.info(
+        "Probe protocol note | the readout is CROP-LEVEL stratified, matching the primary "
+        "pipeline. Crops of one source photograph appear on both sides, so its absolute value "
+        "runs ~18 pp above a photograph-disjoint estimate. It ranks checkpoints of one run, "
+        "where that offset is common to every candidate; it is not a generalisation estimate."
+    )
+    return probe, selector, schedule
+
+
+def update_statistics(
+    named_parameters: Sequence[tuple[str, torch.nn.Parameter]],
+    previous: dict[str, torch.Tensor],
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    """Median and max ``|dW| / |W|`` across parameter tensors, and the new snapshot.
+
+    The update-to-weight ratio is the one optimisation diagnostic that a
+    gradient norm cannot substitute for: Adam normalises by the second moment, so
+    a large gradient does not imply a large *step*, and the audit's C7 argument
+    ("the patch embedding receives the most gradient, so it is drifting") was
+    refuted by exactly that -- CKA at ``layers.0`` was 0.976, i.e. it had not
+    moved. This measures the step.
+
+    ~1e-3 is the healthy band for AdamW at these rates. Persistently above 1e-2
+    means the trunk is being rewritten; below 1e-5 means it is frozen in all but
+    name.
+
+    Costs a clone of every parameter, so the caller runs it on a rare interval.
+    """
+    ratios: list[float] = []
+    snapshot: dict[str, torch.Tensor] = {}
+    for name, parameter in named_parameters:
+        if not parameter.requires_grad or parameter.numel() == 0:
+            continue
+        current = parameter.detach()
+        snapshot[name] = current.clone()
+        before = previous.get(name)
+        if before is None or before.shape != current.shape:
+            continue
+        weight_norm = float(before.norm(2))
+        if weight_norm <= 0:
+            continue
+        ratios.append(float((current - before).norm(2)) / weight_norm)
+    if not ratios:
+        return {}, snapshot
+    ordered = sorted(ratios)
+    return (
+        {
+            "update_ratio_median": ordered[len(ordered) // 2],
+            "update_ratio_max": ordered[-1],
+            "update_ratio_min": ordered[0],
+            "update_ratio_tensors": float(len(ordered)),
+        },
+        snapshot,
+    )
 
 
 # ------------------------------------------------------------------- main loop
@@ -1308,6 +1600,11 @@ def main(cfg: DictConfig) -> None:
             )
             tracker.log_event("corpus", {**fingerprint, "raw_photograph_coverage": coverage})
             _check_corpus(cfg, fingerprint, logger)
+            # Fatal, unlike the digest comparison above: `expected_num_samples`
+            # is the run declaring how big the corpus is supposed to be, and a
+            # disagreement means the next 13 GPU-hours would answer a different
+            # question from the one the evaluation asks.
+            check_corpus_size(cfg, fingerprint, logger)
         if coverage:
             logger.warning(
                 "Raw photographs | %s of %s source photographs under %s were never cropped, so "
@@ -1343,6 +1640,9 @@ def main(cfg: DictConfig) -> None:
             "uint8" if transform.output_uint8 else "float32",
             "device" if transform.upsample_locals_on_device else "CPU",
         )
+        # What each view is actually built from, measured against the real file
+        # headers rather than inferred from the scale range. See the function.
+        geometry = report_view_geometry(cfg, transform, dataloader.dataset, tracker, logger)
         batcher = ViewBatcher(
             image_size=int(cfg.data.image_size),
             mean=transform.normalize_mean,
@@ -1732,6 +2032,29 @@ def main(cfg: DictConfig) -> None:
                 if 0 < int(epoch) <= epochs
             }
         )
+        # The representation probe and the checkpoint choice it drives. Built
+        # before the loop so a wrong dataset root fails at startup rather than at
+        # epoch 25, and only on rank 0: the ranks hold identical weights, so a
+        # second rank would compute the same numbers and race it to the same
+        # files. The stop decision is broadcast, not recomputed.
+        probe, selector, probe_epochs = (
+            build_representation_probe(cfg, logger) if context.is_main else (None, None, [])
+        )
+        probe_schedule = broadcast_object(list(probe_epochs), context) or []
+        # A probed epoch must have an encoder on disk to select, so probing
+        # implies a milestone. Merged rather than validated, because "you probed
+        # at 30 but only saved at 25 and 50" is a configuration mistake with a
+        # silent failure mode -- the selector would name a best epoch whose
+        # weights no longer exist.
+        if probe_schedule:
+            merged = sorted(set(save_epochs) | {int(value) for value in probe_schedule})
+            if merged != save_epochs:
+                logger.info(
+                    "Milestone epochs extended from %s to %s so every probed epoch has an "
+                    "encoder the selector can publish.",
+                    save_epochs or "[]", merged,
+                )
+            save_epochs = merged
         if save_epochs:
             logger.info(
                 "Milestone checkpoints (kept permanently) at epochs: %s",
@@ -1754,9 +2077,27 @@ def main(cfg: DictConfig) -> None:
         gradient_norm_every_steps = int(
             OmegaConf.select(cfg, "tracking.intervals.gradient_norm_every_steps", default=200)
         )
+        # `update_statistics` needs the previous step's weights, and the interval
+        # is separate from the gradient-norm one because the two cost different
+        # things: a per-tensor gradient norm is ~440 host synchronisations, a
+        # weight snapshot is ~440 device clones and no synchronisation at all.
+        update_ratio_every_steps = int(
+            OmegaConf.select(cfg, "tracking.intervals.update_ratio_every_steps", default=0) or 0
+        )
+        weight_snapshot: dict[str, torch.Tensor] = {}
         global_step = resume.progress.global_step
         loss_history: list[float] = []
         kl_history: list[float] = []
+        #: Epoch -> the bare-encoder file written for it, so the selector can
+        #: publish the winner by copying rather than by re-serialising weights
+        #: that have since moved on.
+        milestone_encoders: dict[int, Path] = {}
+        best_encoder_path: str | None = None
+        stop_for_plateau = False
+        #: Epochs the run actually executed. Diverges from the configured
+        #: `epochs` only when the probe ends the run early, and `summary.json`
+        #: has to report the budget that was spent rather than the one requested.
+        epochs_run = epochs
 
         momentum = momentum_start
         logger.info(
@@ -1989,6 +2330,7 @@ def main(cfg: DictConfig) -> None:
 
                     gradient_norm = None
                     clipped_norm = None
+                    update_metrics: dict[str, float] = {}
 
                     if is_step:
                         if scaler is not None:
@@ -2030,6 +2372,19 @@ def main(cfg: DictConfig) -> None:
                         else:
                             optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
+
+                        # |dW| / |W| across the trunk, measured across the step
+                        # that just happened. Adam normalises by the second
+                        # moment, so a gradient norm says nothing about step
+                        # size -- this is the quantity that does. Device clones,
+                        # no synchronisation, and off by default.
+                        if (
+                            update_ratio_every_steps > 0
+                            and global_step % update_ratio_every_steps == 0
+                        ):
+                            update_metrics, weight_snapshot = update_statistics(
+                                list(model.student_backbone.named_parameters()), weight_snapshot
+                            )
 
                         # EMA teacher update, cosine-scheduled 0.996 -> 1.0
                         # (DINO). Every rank runs it on identical students, so
@@ -2101,6 +2456,7 @@ def main(cfg: DictConfig) -> None:
                             step_metrics.update(
                                 {f"aux_{key}": value for key, value in aux_criterion.last_metrics.items()}
                             )
+                        step_metrics.update(update_metrics)
                         if gradient_norm is not None:
                             step_metrics["gradient_norm"] = gradient_norm
                         if clipped_norm is not None:
@@ -2393,6 +2749,80 @@ def main(cfg: DictConfig) -> None:
                         "Milestone checkpoint at epoch %s (kept permanently): %s | encoder: %s",
                         epoch + 1, milestone_file, milestone_backbone,
                     )
+                    milestone_encoders[epoch + 1] = milestone_backbone
+
+                # ------------------------------------------ representation probe
+                #
+                # The one thing the training loop cannot learn from its own loss.
+                # The loss is a cross entropy against a teacher that moved, so it
+                # cannot rank checkpoints -- on the shipped run the *best* encoder
+                # was epoch 50 of 100 and the loss minimum was epoch 90. This
+                # measures the representation directly, keeps the winner under a
+                # stable name, and can end the run when the measurement plateaus.
+                #
+                # Rank 0 measures; every rank obeys the broadcast stop flag. The
+                # ranks hold identical weights, so a second measurement would be
+                # the same numbers at the cost of a second full forward pass, and
+                # a locally-taken stop decision would leave the job half-stopped
+                # inside the next collective.
+                if (epoch + 1) in probe_schedule:
+                    if probe is not None and selector is not None:
+                        result = probe.run(
+                            model.student_backbone,
+                            device,
+                            epoch=epoch + 1,
+                            global_step=global_step,
+                            amp_context=lambda: autocast_context(amp),
+                        )
+                        improved = selector.consider(result)
+                        tracker.log_metrics(result.metrics, epoch + 1, prefix="probe")
+                        tracker.log_event(
+                            "representation_probe",
+                            {
+                                "epoch": epoch + 1,
+                                "global_step": global_step,
+                                "is_best": improved,
+                                "seconds": result.seconds,
+                                **selector.summary(),
+                                **result.metrics,
+                            },
+                        )
+                        logger.info(
+                            "Probe epoch %s | probe=%.4f knn=%.4f f1=%.4f rankme=%.1f "
+                            "nuisance=%+.4f above chance | %s (best %s=%.4f at epoch %s, "
+                            "%s probe(s) since) | %.1fs",
+                            epoch + 1,
+                            result.value("probe_accuracy"),
+                            result.value("knn_accuracy"),
+                            result.value("probe_f1_macro"),
+                            result.value("rankme"),
+                            result.value("nuisance_above_chance"),
+                            "NEW BEST" if improved else "no improvement",
+                            selector.metric, selector.best_value, selector.best_epoch,
+                            selector.since_improvement,
+                            result.seconds,
+                        )
+                        if improved and (epoch + 1) in milestone_encoders:
+                            best_encoder_path = publish_best_encoder(
+                                milestone_encoders[epoch + 1],
+                                save_path / "dino_best_encoder.pth",
+                                logger=logger,
+                            )
+                        stop_for_plateau = selector.should_stop()
+                        if stop_for_plateau:
+                            logger.warning(
+                                "Stopping after epoch %s: %s has not improved by more than %.4g "
+                                "for %s consecutive probes. The best encoder is epoch %s "
+                                "(%s = %.4f) and is already published at %s. This is a "
+                                "representation plateau, not a loss plateau -- the objective's "
+                                "own loss keeps improving well past this point.",
+                                epoch + 1, selector.metric, selector.min_delta,
+                                selector.patience, selector.best_epoch,
+                                selector.metric, selector.best_value, best_encoder_path,
+                            )
+                    # Every rank learns the decision from rank 0; deciding
+                    # locally would be deciding on numbers only rank 0 has.
+                    stop_for_plateau = bool(broadcast_object(bool(stop_for_plateau), context))
 
                 # End-of-epoch resume point. `micro_step=0` means the next epoch
                 # starts from its first batch with nothing to fast-forward.
@@ -2412,6 +2842,24 @@ def main(cfg: DictConfig) -> None:
                     extra={"effective_batch_size": effective_batch},
                 )
                 periodic.mark()
+
+                if stop_for_plateau:
+                    # NOT `interrupted`. An interrupted run is one that has more
+                    # to do and should be relaunched with `resume=auto`; this run
+                    # decided it was finished, so it falls through to the normal
+                    # completion path and writes its final artifacts. The epoch
+                    # budget it actually used is recorded in `summary.json`.
+                    epochs_run = epoch + 1
+                    tracker.log_event(
+                        "early_stop",
+                        {
+                            "epoch": epochs_run,
+                            "configured_epochs": epochs,
+                            "reason": "representation plateau",
+                            **(selector.summary() if selector is not None else {}),
+                        },
+                    )
+                    break
 
         if interrupted:
             logger.warning(
@@ -2474,8 +2922,33 @@ def main(cfg: DictConfig) -> None:
                             "executed, not the configured schedule."
                         ),
                     },
-                    artifacts={"events": str(Path(output_dir) / "events.jsonl")},
+                    artifacts={
+                        "events": str(Path(output_dir) / "events.jsonl"),
+                        "csv": str(tracker.csv_dir),
+                        "best_encoder": best_encoder_path or "",
+                    },
                     context=context,
+                    logger=logger,
+                    view_geometry=geometry,
+                    selection=selector.summary() if selector is not None else None,
+                )
+                # On a preemptible platform this is the only path that ever runs,
+                # so the probe ledger and the figures have to be written here too
+                # or a Kaggle/vast.ai run would leave none of them.
+                if probe is not None and probe.history:
+                    tracker.write_csv("probe_history", milestone_table(probe.history))
+                if selector is not None and selector.rows:
+                    tracker.write_csv("checkpoint_selection", selector.rows)
+                tracker.csv.close()
+                generate_stage1_figures(
+                    tracker.csv_dir,
+                    Path(output_dir) / "figures" / "stage1",
+                    dpi=int(OmegaConf.select(cfg, "tracking.figures.dpi", default=300)),
+                    best_epoch=(
+                        float(selector.best_epoch)
+                        if selector is not None and selector.best_epoch >= 0
+                        else None
+                    ),
                     logger=logger,
                 )
             return
@@ -2484,23 +2957,66 @@ def main(cfg: DictConfig) -> None:
         # Rank 0 alone writes the artifacts; the barrier keeps the others from
         # tearing down the process group while it is still writing.
         final_file = save_dino_checkpoint(
-            model=model, optimizer=optimizer, scheduler=scheduler, epoch=epochs,
+            model=model, optimizer=optimizer, scheduler=scheduler, epoch=epochs_run,
             checkpoint_manager=checkpoint_manager, filename="dino_pretrained_final.pth",
             include_optimizer=save_full_checkpoints, include_teacher=save_teacher,
         )
         backbone_file = save_path / "dino_pretrained_backbone.pth"
+        published_source = "final"
         if context.is_main:
             # The bare backbone state dict is the handoff to stage 2.
             torch.save(to_cpu_state_dict(model.student_backbone.state_dict()), backbone_file)
+
+            # ------------------------------------------- which encoder ships
+            #
+            # `publish: best` hands stage 2 the checkpoint that scored highest on
+            # the representation probe, not the last one the schedule produced.
+            # On the shipped 100-epoch run those differed: epoch 50 probed 0.6358
+            # and epoch 100 probed 0.6284, so publishing the final weights shipped
+            # a measurably worse encoder and the 100-epoch budget was a net loss.
+            #
+            # `publish: final` is the pre-probe behaviour and stays available,
+            # because "the last epoch" is the reproducible choice when there is no
+            # probe to select on -- and selecting on a probe that was fitted on the
+            # whole corpus is a mild form of selection on the evaluation, which a
+            # paper has to disclose either way.
+            publish_choice = str(
+                OmegaConf.select(cfg, "experiment.training.publish", default="best")
+            ).lower()
+            if publish_choice not in {"best", "final"}:
+                raise ValueError(
+                    f"experiment.training.publish must be 'best' or 'final', got {publish_choice!r}"
+                )
+            handoff = backbone_file
+            if publish_choice == "best" and best_encoder_path:
+                handoff = Path(best_encoder_path)
+                published_source = f"best (epoch {selector.best_epoch})" if selector else "best"
+                logger.info(
+                    "Publishing the PROBE-SELECTED encoder: epoch %s scored %s = %.4f, against "
+                    "epoch %s at the end of the run. Set experiment.training.publish=final to "
+                    "hand stage 2 the last epoch's weights instead.",
+                    selector.best_epoch if selector else "?",
+                    selector.metric if selector else "?",
+                    selector.best_value if selector else float("nan"),
+                    epochs_run,
+                )
+            elif publish_choice == "best":
+                logger.info(
+                    "experiment.training.publish=best but no probe selected an encoder "
+                    "(probing off, or every probe returned NaN); publishing the final weights."
+                )
 
             # Publish the same weights at the shared, stage-independent path that
             # every downstream run reads. The ablation and baseline suites compare
             # architectures, so they must all start from *one* set of encoder
             # weights; a per-run pretraining stage would make each variant's
             # result partly a function of its own self-supervised seed.
-            shared_file = publish_shared_backbone(cfg, backbone_file, logger)
+            shared_file = publish_shared_backbone(cfg, handoff, logger)
             if shared_file is not None:
-                tracker.log_event("shared_backbone", {"path": str(shared_file)})
+                tracker.log_event(
+                    "shared_backbone",
+                    {"path": str(shared_file), "source": str(handoff), "selected": published_source},
+                )
 
             if loss_history:
                 tracker.log_figure(
@@ -2512,9 +3028,18 @@ def main(cfg: DictConfig) -> None:
                         },
                         title="DINO pretraining: cross entropy and its learnable part",
                     ),
-                    epochs,
+                    epochs_run,
                 )
             tracker.log_artifact(backbone_file, name="dino_pretrained_backbone", artifact_type="model")
+
+            # The probe ledger, as two tables. `probe_history` is every
+            # measurement; `checkpoint_selection` adds the running best and the
+            # plateau counter, which is what makes "why did it stop at epoch 30"
+            # answerable from the artifacts alone.
+            if probe is not None and probe.history:
+                tracker.write_csv("probe_history", milestone_table(probe.history))
+            if selector is not None and selector.rows:
+                tracker.write_csv("checkpoint_selection", selector.rows)
         barrier(context)
 
         # ---------------------------------------------------- run artifacts
@@ -2570,11 +3095,31 @@ def main(cfg: DictConfig) -> None:
                     "initial_loss": loss_history[0] if loss_history else float("nan"),
                     "teacher_entropy_floor": entropy_min,
                     "teacher_entropy_ceiling": entropy_max,
-                    "epochs_completed": float(epochs),
+                    "epochs_completed": float(epochs_run),
+                    "epochs_configured": float(epochs),
                     "global_step": float(global_step),
                     "wall_clock_seconds": total_seconds,
                     "peak_allocated_gb": run_peak_allocated_gb,
                     "learning_rate": learning_rate,
+                    # The probe's verdict, so an arm suite can rank encoders from
+                    # `summary.json` alone -- which is the only file
+                    # `run_stage1_ablations.py` reads.
+                    **(
+                        {
+                            f"probe_{key}": value
+                            for key, value in (
+                                probe.history[-1].metrics if probe and probe.history else {}
+                            ).items()
+                        }
+                    ),
+                    **(
+                        {
+                            "best_probe_value": selector.best_value,
+                            "best_probe_epoch": float(selector.best_epoch),
+                        }
+                        if selector is not None and selector.best_epoch >= 0
+                        else {}
+                    ),
                 },
                 runtime={
                     "amp": amp.label,
@@ -2590,16 +3135,43 @@ def main(cfg: DictConfig) -> None:
                 artifacts={
                     "final_checkpoint": str(final_file),
                     "student_backbone": str(backbone_file),
+                    "best_encoder": best_encoder_path or "",
+                    "published_encoder": published_source,
                     "events": str(Path(output_dir) / "events.jsonl"),
+                    "csv": str(tracker.csv_dir),
+                    **{f"csv_{key or 'run'}": value for key, value in tracker.csv.paths.items()},
                 },
                 context=context,
                 logger=logger,
+                view_geometry=geometry,
+                selection=selector.summary() if selector is not None else None,
             )
             tracker.log_event("stage1_summary", {"path": summary_path})
 
+            # Figures last, and from the CSVs rather than from memory: the suite
+            # then produces byte-identical output whether it runs here or from
+            # `scripts/plot_stage1_run.py` against a finished directory, so a
+            # figure and its table can never disagree.
+            tracker.csv.close()
+            figures = generate_stage1_figures(
+                tracker.csv_dir,
+                Path(output_dir) / "figures" / "stage1",
+                dpi=int(OmegaConf.select(cfg, "tracking.figures.dpi", default=300)),
+                best_epoch=(
+                    float(selector.best_epoch)
+                    if selector is not None and selector.best_epoch >= 0
+                    else None
+                ),
+                logger=logger,
+            )
+            tracker.log_event("stage1_figures", {name: paths for name, paths in figures.items()})
+
         logger.info(
-            "Pretraining complete in %.2fs. Final: %s. Backbone for stage 2: %s",
-            total_seconds, final_file, backbone_file,
+            "Pretraining complete in %.2fs (%s of %s configured epochs). Final: %s. "
+            "Backbone for stage 2: %s (%s).",
+            total_seconds, epochs_run, epochs, final_file,
+            best_encoder_path if published_source.startswith("best") else backbone_file,
+            published_source,
         )
 
     except Exception:

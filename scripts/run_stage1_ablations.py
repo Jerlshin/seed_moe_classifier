@@ -109,19 +109,30 @@ class ArmSpec:
 
 @dataclass
 class ArmSuite:
-    """A parsed manifest: the base experiment, the shared overrides and the arms."""
+    """A parsed manifest: the base experiment, the shared overrides and the arms.
+
+    ``evaluation`` and ``frozen_evaluation`` name the evaluation experiment each
+    arm is scored with. They exist because the evaluation config carries the
+    *trunk* and the *protocol*, so a suite built on a different trunk cannot
+    reuse the default one: scoring a SwinV2-Tiny arm against an evaluation whose
+    `imagenet_init` control is SwinV2-Small turns "what did self-distillation
+    add" into an architecture delta. A per-arm ``eval_experiment`` still wins
+    over both.
+    """
 
     experiment: str
     common: list[str]
     arms: list[ArmSpec]
     path: Path
+    evaluation: str = "eval_pretrain_representation"
+    frozen_evaluation: str = "eval_frozen_reference"
 
 
 def load_suite(path: str | Path, experiment: str | None = None) -> ArmSuite:
     """Parse an arm manifest. Unknown keys are an error, not a silent no-op."""
     manifest_path = Path(path)
     payload = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
-    known = {"experiment", "common", "arms"}
+    known = {"experiment", "common", "arms", "evaluation", "frozen_evaluation"}
     unexpected = set(payload) - known
     if unexpected:
         raise ValueError(
@@ -159,6 +170,8 @@ def load_suite(path: str | Path, experiment: str | None = None) -> ArmSuite:
         common=[str(item) for item in payload.get("common") or []],
         arms=arms,
         path=manifest_path,
+        evaluation=str(payload.get("evaluation") or "eval_pretrain_representation"),
+        frozen_evaluation=str(payload.get("frozen_evaluation") or "eval_frozen_reference"),
     )
 
 
@@ -202,9 +215,9 @@ def eval_command(arm: ArmSpec, suite: ArmSuite, directory: Path, extra: list[str
         # frozen reference has to remove every row that reads a stage-1 artifact,
         # and expressing that on the command line is exactly the sort of thing
         # that goes wrong silently.
-        evaluation = "eval_frozen_reference"
+        evaluation = suite.frozen_evaluation
     else:
-        evaluation = "eval_pretrain_representation"
+        evaluation = suite.evaluation
 
     save_path = directory / "eval"
     overrides = [

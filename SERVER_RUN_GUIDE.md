@@ -125,6 +125,79 @@ mkdir -p "${SEED_OUTPUT_DIR}"
 defaults (`/workspace/...`) if you don't export them yourself, and dispatches
 single- or multi-GPU depending on `GPUS`.
 
+### 3.2a The v2 pipeline, end to end
+
+The current stage-1 recipe. [`STAGE1_V2.md`](STAGE1_V2.md) carries the reasoning
+and the measurements; this is the command sequence. The v1 commands in the rest
+of this section are unchanged and still reproduce every published number.
+
+```bash
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_OUTPUT_DIR=/workspace/outputs
+mkdir -p "${SEED_OUTPUT_DIR}"
+
+# --- pre-flight, no GPU needed, ~3 minutes total ---------------------------
+python -m pytest tests/ -q                          # 644 tests
+python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
+python main.py pretrain-v2 \
+    data.batch_size=4 data.num_workers=0 experiment.training.effective_batch_size=4 \
+    experiment.training.epochs=2 experiment.training.max_batches=3 \
+    'experiment.training.save_epochs=[1,2]' \
+    experiment.training.probe.every_epochs=1 experiment.training.probe.max_samples=270 \
+    model.backbone.pretrained=false device=cpu      # end-to-end on the real corpus
+
+# --- the reference the run must beat (no training) -------------------------
+python -m src.trainers.pretrain_eval experiment=eval_frozen_v2
+
+# --- stage 1 ---------------------------------------------------------------
+python main.py pretrain-v2 --gpus 2                 # ~50 epochs, probe may stop earlier
+#   on a preemptible instance, the same line resumes:
+python main.py pretrain-v2 --gpus 2 experiment.training.resume=auto \
+    experiment.training.max_runtime_minutes=520
+
+# --- score the milestones, confirm the probe chose correctly ---------------
+python main.py eval-pretrain-v2
+
+# --- stage 2, crop-level train / validation / test -------------------------
+export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dino_v2_swinv2_tiny.pth"
+python main.py finetune-v2 --gpus 2
+
+# --- the photograph-disjoint diagnostic, for the leakage delta -------------
+python -m src.trainers.moe_finetune experiment=finetune_v2_grouped_diagnostic
+
+# --- the arms, if the budget allows ---------------------------------------
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
+```
+
+**Five things to check in the first two minutes of the stage-1 log**, in order:
+
+1. `Corpus size verified: 9357 images` — if this raises instead, the dataset root
+   is wrong and the run stops before spending anything. That is the intent.
+2. `View geometry | local ... native px p5/p50/p95 = 493/1462/4704` — what the
+   augmentation is actually building. A local median near 600 means the v2 data
+   group did not take effect.
+3. `deterministic-centre-crop fallback` under 15 % on the global views. Above it
+   the trainer warns and names the fix (`crop_ratio`).
+4. `Representation probe ON | 9357 of 9357 images ... Probing at epochs: ...`
+5. `epoch/loop_blocked_fraction` under ~0.3 by the end of epoch 1. Above that the
+   loader is the bottleneck; raise `data.num_workers`.
+
+**Where the artifacts land.** `${SEED_OUTPUT_DIR}/pretrain_v2_swinv2_tiny/` holds
+the milestones, `dino_best_encoder.pth` (the probe-selected weights, and what
+gets published) and `summary.json`. The Hydra run directory holds
+`events.jsonl`, `csv/` (seven wide CSVs including `probe_history.csv`,
+`checkpoint_selection.csv` and `view_geometry.csv`), `tensorboard/`, the W&B
+offline run, and `figures/stage1/` (five figures, PNG + PDF). Rebuild the figures
+anywhere with `python scripts/plot_stage1_run.py <run dir>`.
+
+**Batch geometry.** `data.batch_size: 64` with `gradient_accumulation_steps: 1`.
+Sinkhorn and KoLeo are per-**micro**-batch statistics, so if the card cannot hold
+64, lower `data.batch_size` **and** `experiment.training.effective_batch_size`
+together rather than raising accumulation — the learning rate follows
+automatically through `resolve_learning_rate`. SwinV2-Tiny at 6 views leaves
+substantial headroom on a 24 GB card;
+`python scripts/bench_pretrain_step.py --find-batch-size 32,48,64,96` measures it.
+
 ### 3.3 Stage 1 — DINO self-supervised pretraining (run once)
 
 ```bash

@@ -1,0 +1,195 @@
+# @package _global_
+#
+# The v2 stage-1 recipe: SwinV2-Tiny, the redesigned view geometry, colour
+# preserved, and an epoch budget decided by a representation probe instead of by
+# a loss curve.
+#
+#     python main.py pretrain-v2
+#     python main.py pretrain-v2 --gpus 2
+#
+# WHAT THIS CHANGES, AND ON WHAT EVIDENCE
+# =======================================
+#
+# The reference point is the shipped 100-epoch run: 13.34 h on an H100 for
+# **+0.31 pp** of 27-way accuracy over the ImageNet-1k weights it started from
+# (0.6284 vs 0.6253, `outputs/eval_pretrain/tables/encoder_comparison.csv`).
+# Every change below targets one of the reasons that number is so small.
+#
+# 1. TRUNK: SwinV2-Small -> SwinV2-Tiny.
+#    Frozen-feature screen (`STAGE1_CHANGES.md` Appendix 2): Tiny scores 0.6021
+#    pooled / 0.6243 at `layers.2`, Small 0.6053 / 0.6174 -- i.e. Tiny is
+#    -0.32 pp pooled and **+0.69 pp** at the better readout stage, for **half the
+#    FLOPs** (13.32 vs 25.56 GFLOPs/view) and 27.6 M vs 49.0 M parameters. D6 is
+#    explicit that capacity is not the binding constraint here; scene diversity
+#    is. Small is dominated on both axes, so this is the cheap half of a
+#    two-sided decision, not a compromise.
+#
+# 2. VIEWS: see `conf/data/seed_crops_v2.yaml`, which carries the measurements.
+#    Local views go from a median 598 native pixels to 1,395 (2.3x), and their
+#    upsample from 10.5x to 6.9x. This is the primary hypothesis of the run.
+#
+# 3. KOLEO: per-view (already the default after the audit's A1) and on the
+#    **backbone** feature rather than the head's discarded 256-D bottleneck.
+#    DINOv2 applies KoLeo to `x_norm_clstoken`, i.e. the trunk output, and the
+#    trunk output is the only thing stage 2 ever sees. Regularising a space that
+#    is thrown away at the end of stage 1 is the weaker of the two options.
+#
+# 4. BUDGET: 50 epochs configured, probed every 5, stopped when the probe
+#    plateaus, and the encoder that **ships is the one that probed best** rather
+#    than the last one. On the shipped run epoch 50 probed 0.6358 and epoch 100
+#    probed 0.6284 -- so publishing the final weights shipped a worse encoder and
+#    the second half of the budget was a net loss. `experiment.training.publish`
+#    is the switch; `final` is the pre-probe behaviour.
+#
+# 5. BATCH: 64 physical, accumulation 1. Sinkhorn and KoLeo are per-micro-batch
+#    statistics, so the physical batch -- not the effective one -- is what they
+#    estimate from, and Tiny leaves the headroom for it. This lowers the teacher
+#    entropy's structural floor log(K / B_teacher) from log(2048/64) = 3.47 to
+#    log(2048/128) = 2.77 nats, opening ~9 % more of the nominal range. Lower it
+#    together with `effective_batch_size` if the card cannot hold it; never trade
+#    it for accumulation.
+#
+# WHAT IT DELIBERATELY DOES NOT CHANGE
+# ====================================
+#
+# `centering` stays `sinkhorn`, `out_dim` stays 2,048, `feature_stage` stays
+# `final`, and there is no auxiliary head. Each of those is a real hypothesis
+# with its own arm in `conf/stage1_arms/view_design.yaml`; folding them into the
+# primary recipe would make the whole run uninterpretable. The view geometry is
+# the hypothesis this experiment is testing.
+
+defaults:
+  - override /data: seed_crops_v2
+  - override /model/head: dino
+  - override /model/loss: dino
+
+model:
+  backbone:
+    # Half the FLOPs of Small and better at `layers.2`. See (1) above.
+    name: "swinv2_tiny_window16_256"
+    feature_dim: 768
+    pretrained: true      # ImageNet-1k (timm `ms_in1k`), verified at startup
+    freeze: false         # the trunk is fine-tuned; this is the whole stage
+    drop_path_rate: 0.1
+  loss:
+    koleo_scope: "per_view"   # the A1 fix; `all_views` is the control
+    koleo_space: "backbone"   # the space stage 2 reads, and DINOv2's own choice
+    lambda_koleo: 0.1
+
+data:
+  batch_size: 64
+
+experiment:
+  name: "pretrain_v2_swinv2_tiny"
+  stage: "pretrain"
+  group: "stage1_v2"
+  training:
+    epochs: 50
+    max_batches: null
+    # Dense early milestones: the shipped run's probe curve peaked at epoch 50
+    # of 100 and was already within 0.8 pp of its peak at epoch 25, so the
+    # interesting region is the first half and the budget question is decided
+    # there. Every probed epoch is forced into this list by the trainer.
+    save_epochs: [5, 10, 15, 20, 25, 30, 40, 50]
+
+    # ---------------------------------------------------- checkpoint selection
+    #
+    # The loop cannot rank its own checkpoints from the loss: the loss is a cross
+    # entropy against a teacher that moved, 94.8 % of it was irreducible target
+    # entropy on the shipped run, and its minimum was at epoch 90 while the best
+    # encoder was at epoch 50. This measures the representation directly.
+    probe:
+      enabled: true
+      every_epochs: 5
+      at_epochs: [1]          # a baseline before the trunk has moved
+      # The readout stage 2 consumes. `knn_accuracy` is the parameter-free
+      # alternative and `probe_plus_knn` the composite; `teacher_student_kl` is
+      # available as an explicit control, not as a recommendation.
+      selection_metric: "probe_accuracy"
+      # Three probes (15 epochs) without a gain above `min_delta` ends the run.
+      # 0.002 is below the probe's fold-to-fold spread on purpose -- it is a
+      # guard against stopping on noise, not a target effect size.
+      patience: 3
+      min_delta: 0.002
+      folds: 3                # crop-level stratified, matching the primary protocol
+      regularisation: 10.0
+      max_iterations: 500
+      knn_k: 10
+      max_samples: 0          # 0 = every crop
+      geometry: true          # RankMe, participation ratio, collapse guards
+      nuisance: true          # the gate: within-class photograph decodability
+      nuisance_folds: 3
+      batch_size: 64
+      num_workers: 2
+      seed: 42
+
+    # `best` hands stage 2 the probe-selected encoder; `final` is the pre-probe
+    # behaviour and is the honest choice if the probe is disabled.
+    publish: "best"
+
+    view_geometry:
+      enabled: true
+      samples: 20000
+
+    learning_rate: null
+    lr_base: 0.0005                # DINO's rate at its reference batch of 256
+    lr_reference_batch_size: 256
+    lr_scaling: "linear"           # -> 0.0005 x 64/256 = 1.25e-4
+    warmup_epochs: 5               # 10 % of the budget, as at 100 epochs
+    clip_grad: 3.0
+    freeze_last_layer_epochs: 1
+    momentum_teacher: 0.996
+    momentum_teacher_final: 1.0
+    weight_decay: 0.04
+    weight_decay_final: 0.4
+    effective_batch_size: 64
+    gradient_accumulation_steps: 1
+    corpus_check: "error"          # the corpus is declared; a mismatch is fatal
+
+    amp: "auto"
+    sdpa_attention: true
+    compile:
+      enabled: "auto"
+      mode: "default"
+    grad_checkpointing: false
+    channels_last: false
+    fused_optimizer: true
+    forward_chunk_size: null
+    # cuDNN autotuning picks a different algorithm per shape and is not
+    # bit-reproducible; stage 1 runs one job per configuration, so the trade is
+    # worth taking here and `deterministic: true` is one override away for a
+    # reproducibility check.
+    deterministic: false
+    cudnn_benchmark: true
+    allow_tf32: true
+    matmul_precision: "high"
+    ddp:
+      timeout_minutes: 30
+      gradient_as_bucket_view: true
+      static_graph: false
+      find_unused_parameters: false
+      bucket_cap_mb: null
+    resume: false
+    resume_every_minutes: 30
+    resume_check_every_steps: 20
+    resume_fast_forward: true
+    max_runtime_minutes: null
+    save_interval: 0
+    # >= 2 on a preemptible platform: the newest resume file is the one a kill is
+    # most likely to have interrupted. Milestones carry no rolling prefix and are
+    # never pruned by this.
+    keep_last_n_checkpoints: 2
+    save_full_checkpoints: false
+    save_teacher_in_checkpoints: false
+    measure_gpu_busy: false
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_v2_swinv2_tiny"
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_v2_swinv2_tiny.pth"
+    optimizer:
+      name: "AdamW"
+    scheduler:
+      name: "cosine"
+      t_max: null
+      eta_min: 0.0
+  budget:
+    enabled: true
+    measure_flops: true

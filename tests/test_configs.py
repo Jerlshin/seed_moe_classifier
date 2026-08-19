@@ -114,6 +114,16 @@ ALL_EXPERIMENTS = [
     "baseline_hierarchical_cce",
     "baseline_linear_probe",
     "baseline_swinv2_supervised",
+    # The v2 pipeline: SwinV2-Tiny, the redesigned view geometry, and crop-level
+    # stratified splitting downstream. `eval_frozen_v2` is the reference the
+    # stage-1 arms must clear and `finetune_v2_grouped_diagnostic` is the
+    # photograph-disjoint counterpart kept for the leakage delta -- neither is on
+    # the primary path, and both must still compose.
+    "pretrain_v2_swinv2_tiny",
+    "eval_pretrain_v2",
+    "eval_frozen_v2",
+    "finetune_v2_crop_level",
+    "finetune_v2_grouped_diagnostic",
 ]
 
 

@@ -90,12 +90,54 @@ Per step:
 Order matters in step 5: gradient cancelling must happen after clipping and
 before `step()`, or the frozen layer still moves.
 
-Logged: loss, learning rate, current teacher temperature (so the Eq. 2 schedule
-is visible in the run), gradient norms, and a loss curve figure (paper Fig. 6).
+Logged: the loss **decomposed** (`CE = KL(q||p) + H(teacher)`, and read the KL —
+the raw loss is ~95 % target entropy), the learning rate, the current teacher
+temperature (so the Eq. 2 schedule is visible in the run), gradient norms, the
+update-to-weight ratio `|dW|/|W|`, the collapse diagnostics with their structural
+bounds, and throughput. Everything lands in `events.jsonl`, in
+`csv/metrics_*.csv`, in TensorBoard and in W&B.
+
+At startup the trainer also measures **what the augmentation will actually
+build** — the native source pixels behind each view family, against the real file
+headers — into `csv/view_geometry.csv`, and warns when
+`RandomResizedCrop`'s deterministic centre-crop fallback exceeds 15 % of the
+global draws. At the end it writes five publication figures from those CSVs
+(`src/utils/stage1_figures.py`), including on the interrupted path.
 
 `publish_shared_backbone()` failing is a warning, not an error — the per-stage
 copy is already safely on disk, and discarding a completed 100-epoch pretraining
 run over a file-copy failure would be indefensible.
+
+### The representation probe and the checkpoint it chooses
+
+At each epoch in `experiment.training.probe`'s schedule, rank 0 extracts frozen
+features on an augmentation-free pass and scores the readout, the geometry and
+the nuisance decodability (`src/utils/training/representation_probe.py`).
+`CheckpointSelector` keeps the winner as `dino_best_encoder.pth`, and
+`experiment.training.publish: best` hands **that** to stage 2 rather than the
+last epoch's weights.
+
+This exists because the loss cannot rank checkpoints. It is a cross entropy
+against a moving teacher — 94.8 % irreducible target entropy on the shipped run,
+minimum at epoch 90 — while the representation peaked at epoch 50 of 100 (0.6358
+against 0.6284). The pipeline published epoch 100.
+
+Four details in the loop:
+
+* **A probed epoch is forced into `save_epochs`.** A best epoch whose milestone
+  was pruned is not selectable, and the failure would be silent — the selector
+  would name an epoch whose weights no longer exist.
+* **Only rank 0 probes, and the stop decision is broadcast.** The ranks hold
+  identical weights, so a second probe is a second full forward pass for the same
+  numbers; and a locally-taken stop would leave one rank inside the next
+  collective alone, hanging the job at the timeout.
+* **A plateau stop is not an interruption.** `stop_for_plateau` falls through to
+  the normal completion path and writes the final artifacts, because the run
+  decided it was finished. An *interrupted* run is one with work left, and it is
+  the one that should be relaunched with `resume=auto`. `summary.json` reports
+  `epochs_completed` beside `epochs_configured`.
+* **A failing probe warns and continues.** It is a diagnostic; it must never take
+  a training run down.
 
 ### Running it on more than one GPU
 
