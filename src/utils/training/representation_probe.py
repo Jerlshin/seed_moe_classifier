@@ -133,7 +133,6 @@ def extract_features(
     loader: Any,
     device: torch.device,
     amp_context: Any = None,
-    max_batches: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Frozen features, labels and source groups over an evaluation loader.
 
@@ -154,9 +153,7 @@ def extract_features(
     sub_labels: list[np.ndarray] = []
     seed_labels: list[np.ndarray] = []
     try:
-        for index, batch in enumerate(loader):
-            if max_batches is not None and index >= max_batches:
-                break
+        for batch in loader:
             images, seed_target, sub_target = batch[0], batch[1], batch[2]
             images = images.to(device, non_blocking=True)
             with (amp_context() if amp_context is not None else nullcontext()):
@@ -351,7 +348,6 @@ class RepresentationProbe:
         self.max_iterations = int(options.get("max_iterations", 500) or 500)
         self.knn_k = int(options.get("knn_k", 10) or 10)
         self.seed = int(options.get("seed", 42) or 42)
-        self.max_samples = int(options.get("max_samples", 0) or 0)
         self.geometry = bool(options.get("geometry", True))
         self.nuisance = bool(options.get("nuisance", True))
         self.nuisance_folds = int(options.get("nuisance_folds", 3) or 3)
