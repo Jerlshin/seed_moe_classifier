@@ -26,6 +26,14 @@ requires (see :func:`~src.trainers.moe_finetune.split_dataset`); a crop-level
 split would let near-duplicate crops of one photograph sit on both sides and
 turn either number into a memorisation score.
 
+**Nuisance decodability.** :func:`nuisance_decodability` asks the mirror-image
+question of the readout: with class identity held constant, how well can the
+*source photograph* be recovered? That is the exact confound the
+photograph-disjoint protocol punishes, and it is the one axis on which the
+shipped stage-1 run demonstrably worked -- +10.0 pp above chance from the
+ImageNet weights, +3.5 pp after in-domain self-distillation. Read jointly with
+the readout, never alone: an encoder that discards everything scores chance.
+
 **Structure recovered without labels.** :func:`kmeans_report` and
 :func:`prototype_report` ask whether the *unsupervised* partition already lines
 up with the taxonomy -- k-means over the features, and the argmax over DINO's own
@@ -315,6 +323,160 @@ def augmentation_consistency(
         "self_retrieval_top1": self_retrieval,
         "samples": float(clean_matrix.shape[0]),
     }
+
+
+def nuisance_decodability(
+    features: Any,
+    labels: Any,
+    groups: Any,
+    min_groups_per_class: int = 2,
+    folds: int = 3,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """How much **source-photograph identity** survives, with class held constant.
+
+    Every other measurement in this module asks how much *signal* a representation
+    carries. This one asks how much *nuisance* it carries -- and the nuisance is
+    named: the photograph-disjoint protocol exists precisely because crops of one
+    photograph share lighting, background and sensor noise, so an encoder that
+    encodes "which photograph" is an encoder whose readout will not transfer to a
+    new acquisition session.
+
+    The measurement is restricted to photographs **of the same sub-variety**, one
+    class at a time, so class identity is held out of it by construction -- an
+    encoder that separates the classes perfectly and the photographs not at all
+    scores exactly chance here. Classes with fewer than
+    ``min_groups_per_class`` photographs are skipped because there is nothing to
+    discriminate.
+
+    Nearest-class-mean in cosine space over stratified folds: no fitted
+    hyperparameter, so the number cannot be moved by regularisation choices, and
+    it is comparable across encoders of different width.
+
+    **Read it jointly with the sub-variety readout, never alone.** Low nuisance
+    decodability is not automatically good -- an encoder that discards everything
+    scores exactly chance. What it does is give an arm a second, independent axis:
+    on the shipped encoders, ImageNet-1k sits at +10.0 pp above chance and 100
+    epochs of in-domain DINO cut that to +3.5 pp, a 65 % reduction that is the
+    clearest thing stage 1 demonstrably achieved and that no other metric in the
+    evaluation reported. It is also the mandatory falsifier for the
+    provenance-derived-positives arm, which can win the probe by re-learning the
+    confound.
+
+    Returns the mean accuracy, the mean chance level, their difference, and a
+    per-class breakdown.
+    """
+    from sklearn.model_selection import StratifiedKFold
+
+    matrix = l2_normalize(features)
+    class_labels = as_float_array(labels).reshape(-1).astype(np.int64)
+    photo_groups = as_float_array(groups).reshape(-1).astype(np.int64)
+    if not (matrix.shape[0] == class_labels.size == photo_groups.size):
+        raise ValueError("features, labels and groups must have one entry per sample")
+
+    per_class: dict[str, dict[str, float]] = {}
+    accuracies: list[float] = []
+    chances: list[float] = []
+
+    for label in np.unique(class_labels):
+        mask = class_labels == label
+        members = photo_groups[mask]
+        unique_groups, counts = np.unique(members, return_counts=True)
+        if unique_groups.size < int(min_groups_per_class):
+            continue
+        # A fold count above the smallest photograph's crop count would leave a
+        # fold with no example of it, which is a split failure rather than a
+        # property of the encoder.
+        splits = int(min(int(folds), int(counts.min())))
+        if splits < 2:
+            continue
+
+        block = matrix[mask]
+        remap = {int(value): index for index, value in enumerate(unique_groups)}
+        targets = np.array([remap[int(value)] for value in members], dtype=np.int64)
+        splitter = StratifiedKFold(n_splits=splits, shuffle=True, random_state=int(seed))
+        correct = 0
+        total = 0
+        for train_index, test_index in splitter.split(np.zeros(targets.size), targets):
+            centroids = np.stack(
+                [
+                    block[train_index][targets[train_index] == group].mean(axis=0)
+                    for group in range(unique_groups.size)
+                ]
+            )
+            centroids = l2_normalize(centroids)
+            predictions = (block[test_index] @ centroids.T).argmax(axis=1)
+            correct += int((predictions == targets[test_index]).sum())
+            total += int(test_index.size)
+        if not total:
+            continue
+
+        accuracy = correct / total
+        chance = 1.0 / float(unique_groups.size)
+        accuracies.append(accuracy)
+        chances.append(chance)
+        per_class[str(int(label))] = {
+            "accuracy": float(accuracy),
+            "chance": float(chance),
+            "above_chance": float(accuracy - chance),
+            "photographs": float(unique_groups.size),
+            "crops": float(int(mask.sum())),
+        }
+
+    if not accuracies:
+        return {
+            "classes_scored": 0.0,
+            "within_class_photo_accuracy": float("nan"),
+            "chance": float("nan"),
+            "above_chance": float("nan"),
+            "per_class": {},
+        }
+    mean_accuracy = float(np.mean(accuracies))
+    mean_chance = float(np.mean(chances))
+    return {
+        "classes_scored": float(len(accuracies)),
+        "within_class_photo_accuracy": mean_accuracy,
+        "chance": mean_chance,
+        "above_chance": mean_accuracy - mean_chance,
+        "min_groups_per_class": float(min_groups_per_class),
+        "folds": float(folds),
+        "per_class": per_class,
+    }
+
+
+def handcrafted_image_features(paths: Sequence[str]) -> np.ndarray:
+    """Ten numbers per crop: log area, log aspect ratio, mean/std RGB, mean/std grey.
+
+    The floor a reviewer of a fine-grained-classification paper asks about first.
+    ``random_init`` fixes what a linear readout gets from *architecture* alone;
+    it does not answer "how much does a deep encoder add over trivial image
+    statistics?", and on this dataset the answer is uncomfortable: these ten
+    scalars score **0.5360** 27-way out-of-fold under the identical
+    photograph-disjoint protocol -- 15.6 pp *above* an untrained 48.96 M-parameter
+    trunk and 9.2 pp below the shipped DINO encoder, which cost 13.34 GPU-hours.
+
+    Computed from the file on disk at its native resolution, deliberately: the
+    absolute crop size is part of what these features encode, and reading the
+    resized tensor the encoders see would throw exactly that away.
+    """
+    from PIL import Image
+
+    rows = np.zeros((len(paths), 10), dtype=np.float64)
+    for index, path in enumerate(paths):
+        with Image.open(path) as handle:
+            image = handle.convert("RGB")
+            width, height = image.size
+            array = np.asarray(image, dtype=np.float64) / 255.0
+        grey = array.mean(axis=2)
+        rows[index] = [
+            np.log(max(width * height, 1)),
+            np.log(max(width, 1) / max(height, 1)),
+            *array.mean(axis=(0, 1)),
+            *array.std(axis=(0, 1)),
+            grey.mean(),
+            grey.std(),
+        ]
+    return rows.astype(np.float32)
 
 
 def class_separability(features: Any, labels: Any, class_names: Sequence[str] | None = None) -> dict[str, Any]:

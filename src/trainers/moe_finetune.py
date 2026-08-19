@@ -33,6 +33,7 @@ import random
 import sys
 import time
 from contextlib import nullcontext
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -167,7 +168,7 @@ def make_worker_init_fn(seed: int) -> WorkerSeeder:
 # --------------------------------------------------------------------- splits
 
 #: How the held-out partition is drawn.
-SPLIT_PROTOCOLS = ("grouped", "stratified")
+SPLIT_PROTOCOLS = ("grouped", "stratified", "grouped_cv")
 
 
 def stratification_labels(dataset: HierarchicalSeedDataset) -> np.ndarray:
@@ -212,6 +213,27 @@ def split_dataset(
     delta turns a fatal methodological objection into a measured result. See
     ``scripts/run_ablations.py``'s ``leakage_ungrouped`` variant.
 
+    ``protocol="grouped_cv"`` takes **no held-out test split at all**. Instead
+    ``StratifiedGroupKFold`` partitions every crop into ``num_folds``
+    photograph-disjoint folds, each crop is held out exactly once, and the
+    trainer concatenates the per-fold validation predictions into one
+    out-of-fold prediction set covering the whole dataset.
+
+    The reason is a property of this dataset rather than a preference. The
+    ``grouped`` protocol's ``GroupShuffleSplit`` takes 20 % of the 81
+    photographs *unstratified*, and most sub-varieties have crops from only ~3 --
+    so the test side holds **14 of the 27 classes**, and a macro-F1 on it is
+    mechanically capped near 14/27 for reasons that have nothing to do with the
+    model. ``grouped_cv`` keeps every fold photograph-disjoint, scores every
+    class, and is the same thing ``grouped_cv_readout`` already does in
+    ``pretrain_eval.py`` -- which is what makes the stage-1 and stage-2 headline
+    numbers directly comparable.
+
+    It is **not** the default, because every published stage-2 number was
+    produced under ``grouped`` and switching silently would make the new table
+    incomparable with the old one. ``classes_present_in_test`` is reported next
+    to every split so the cap is visible either way.
+
     **A limit the protocol cannot fix.** Five of the 27 sub-varieties have crops
     from exactly one source photograph, so no grouped split can put any of their
     crops in both train and test. Grouped stratification therefore degrades to
@@ -227,8 +249,37 @@ def split_dataset(
 
     labels = stratification_labels(dataset)
     indices = np.arange(len(dataset))
-    groups = dataset.source_groups() if protocol == "grouped" else None
+    groups = dataset.source_groups() if protocol in {"grouped", "grouped_cv"} else None
     report: dict[str, Any] = {"protocol": protocol, "seed": int(seed), "num_folds": int(num_folds)}
+
+    if protocol == "grouped_cv":
+        if int(num_folds) < 2:
+            raise ValueError(
+                "grouped_cv needs num_folds >= 2: the folds ARE the evaluation, so a single fold "
+                "would leave most crops unscored."
+            )
+        splitter = StratifiedGroupKFold(
+            n_splits=int(num_folds), shuffle=True, random_state=seed
+        )
+        splits = [
+            (indices[train_idx], indices[val_idx])
+            for train_idx, val_idx in splitter.split(np.zeros(len(labels)), labels, groups)
+        ]
+        test_indices = np.array([], dtype=np.int64)
+        report.update(leakage_report(dataset, splits, test_indices, protocol))
+        # There is no test split, so `classes_present_in_test` would read 0 and
+        # look like the pathology this protocol exists to remove. The comparable
+        # quantity is how many classes appear in the union of the folds'
+        # held-out halves -- which is every class, and is exactly the point.
+        report["classes_present_in_test"] = int(
+            len({int(dataset.samples[index][2]) for _, validation in splits for index in validation})
+        )
+        report["out_of_fold"] = True
+        report["out_of_fold_note"] = (
+            "No held-out test split: every crop is held out exactly once across the folds, and "
+            "the headline metrics are computed from the concatenated out-of-fold predictions."
+        )
+        return splits, test_indices, report
 
     if test_size > 0:
         if protocol == "grouped":
@@ -300,6 +351,11 @@ def leakage_report(
     return {
         "num_source_groups": int(len(set(groups.tolist()))),
         "test_size": int(test_indices.size),
+        # E5: quoted next to every macro-F1, because a 27-way macro-F1 scored on
+        # a test split that holds 14 classes is mechanically capped near 14/27
+        # for reasons unrelated to the model. `grouped_cv` makes this 27.
+        "classes_present_in_test": int(len(test_classes)),
+        "num_classes": int(len(sub_names)),
         "shared_source_groups": len(shared),
         "leaked_test_fraction": (
             float(np.isin(groups[test_indices], list(shared)).mean()) if test_indices.size else 0.0
@@ -895,6 +951,83 @@ def run_epoch(
 # --------------------------------------------------------------------- figures
 
 
+def merge_out_of_fold(
+    parts: Sequence[tuple[np.ndarray, EpochAccumulator]],
+    dataset: HierarchicalSeedDataset,
+    num_samples: int,
+) -> tuple[HierarchicalEvaluation, EpochAccumulator]:
+    """Concatenate per-fold held-out predictions into one out-of-fold evaluation.
+
+    Under ``split_protocol: grouped_cv`` there is no held-out test split: each of
+    the ``num_folds`` photograph-disjoint folds scores its own validation half
+    with the model that fold trained, and every crop is therefore predicted
+    exactly once by a model that never saw it. Concatenating gives one prediction
+    per crop over the whole dataset, all 27 classes present -- which is what the
+    confusion matrix, the per-class table and the headline number are computed
+    from, and the same protocol ``pretrain_eval``'s ``grouped_cv_readout`` uses.
+
+    **What this is and is not.** It is an estimate of the *recipe*: K different
+    models contributed, so it is not any single shipped model's test score, and
+    the two must not be quoted interchangeably. It is also not comparable with a
+    ``grouped`` number, whose test split holds 14 of the 27 classes -- the whole
+    reason this protocol exists.
+
+    The parts are re-ordered into dataset order before scoring, so the arrays
+    line up with ``dataset.samples`` and a downstream consumer can join them
+    against the labels or the source groups by index.
+    """
+    seed_names, sub_names = dataset.get_ordered_class_names()
+    merged = EpochAccumulator()
+    order: list[int] = []
+    for indices, accumulator in parts:
+        order.extend(int(value) for value in np.asarray(indices).reshape(-1).tolist())
+        merged.seed_true.extend(accumulator.seed_true)
+        merged.seed_pred.extend(accumulator.seed_pred)
+        merged.sub_true.extend(accumulator.sub_true)
+        merged.sub_pred.extend(accumulator.sub_pred)
+        merged.sub_scores.extend(accumulator.sub_scores)
+        merged.logits.extend(accumulator.logits)
+        merged.expert_indices.extend(accumulator.expert_indices)
+        merged.embeddings.extend(accumulator.embeddings)
+        merged.total_loss += accumulator.total_loss
+        merged.batches += accumulator.batches
+        merged.tokens_per_sample = accumulator.tokens_per_sample
+        for key, value in accumulator.loss_sums.items():
+            merged.loss_sums[key] = merged.loss_sums.get(key, 0.0) + value
+
+    if len(order) != len(merged.sub_true):
+        raise RuntimeError(
+            f"Out-of-fold assembly saw {len(order)} fold indices against "
+            f"{len(merged.sub_true)} predictions; a fold's loader did not cover its split."
+        )
+    # Dataset order, so index i is sample i.
+    permutation = np.argsort(np.asarray(order, dtype=np.int64), kind="stable")
+    for name in ("seed_true", "seed_pred", "sub_true", "sub_pred"):
+        values = np.asarray(getattr(merged, name), dtype=np.int64)[permutation]
+        setattr(merged, name, values.tolist())
+    for name in ("sub_scores", "logits", "expert_indices"):
+        chunks = getattr(merged, name)
+        if chunks:
+            setattr(merged, name, [np.concatenate(chunks, axis=0)[permutation]])
+
+    evaluation = evaluate_hierarchical(
+        seed_true=merged.seed_true,
+        seed_pred=merged.seed_pred,
+        sub_true=merged.sub_true,
+        sub_pred=merged.sub_pred,
+        subvariety_to_seed_type=dataset.get_subvariety_to_seed_type(),
+        num_seed_types=len(seed_names),
+        num_sub_varieties=len(sub_names),
+        seed_type_names=seed_names,
+        sub_variety_names=sub_names,
+        sub_scores=merged.stacked_scores(),
+        top_k_indices=merged.stacked_experts(),
+        num_experts=int(np.max(merged.stacked_experts()) + 1) if merged.expert_indices else 1,
+        tokens_per_sample=merged.tokens_per_sample,
+    )
+    return evaluation, merged
+
+
 def log_evaluation_artifacts(
     tracker: ExperimentTracker,
     evaluation: HierarchicalEvaluation,
@@ -1282,6 +1415,25 @@ def main(cfg: DictConfig) -> None:
             protocol=split_protocol,
         )
         split_report.update(group_report)
+        split_report["corpus"] = dataset.corpus_fingerprint()
+        logger.info(
+            "Split | protocol=%s, %d of %d sub-varieties present in the %s. A macro-F1 scored on "
+            "fewer classes than the taxonomy has is capped below 1 by the split, not by the model.",
+            split_protocol,
+            int(split_report.get("classes_present_in_test", 0)),
+            int(split_report.get("num_classes", len(sub_names))),
+            "union of the held-out folds" if split_protocol == "grouped_cv" else "test split",
+        )
+        if split_protocol == "grouped_cv":
+            logger.info(
+                "grouped_cv | no held-out test split: %d photograph-disjoint folds, every crop "
+                "held out exactly once, headline metrics computed from the concatenated "
+                "out-of-fold predictions over all %d crops. This is the same protocol "
+                "pretrain_eval's grouped_cv_readout uses, so the stage-1 and stage-2 numbers are "
+                "directly comparable -- and it is NOT the protocol any previously published "
+                "number here was produced under.",
+                len(splits), len(dataset),
+            )
         if split_report["shared_source_groups"]:
             logger.warning(
                 "Split protocol %r leaves %s source photographs on both sides of the test "
@@ -1309,7 +1461,10 @@ def main(cfg: DictConfig) -> None:
 
         pin_memory = bool(cfg.data.pin_memory) and device.type == "cuda"
         num_workers = resolve_num_workers(
-            OmegaConf.select(cfg, "data.num_workers", default=4), context, logger=logger
+            OmegaConf.select(cfg, "data.num_workers", default=4),
+            context,
+            auto_cap=int(OmegaConf.select(cfg, "data.num_workers_auto_cap", default=16) or 16),
+            logger=logger,
         )
         batch_size = int(cfg.data.batch_size)
         epochs = int(cfg.experiment.training.epochs)
@@ -1435,6 +1590,9 @@ def main(cfg: DictConfig) -> None:
         history = LossHistory()
         num_experts = 1
         fold_test_metrics: list[dict[str, float]] = []
+        #: (val_indices, accumulator) per fold under `grouped_cv`, concatenated
+        #: after the fold loop into one out-of-fold prediction set.
+        out_of_fold_parts: list[tuple[np.ndarray, EpochAccumulator]] = []
 
         # ------------------------------------------------------------- resume
         #
@@ -1767,6 +1925,29 @@ def main(cfg: DictConfig) -> None:
                 )
                 fold_test_metrics.append(dict(fold_test_evaluation.scalar_metrics()))
 
+            # E5: under `grouped_cv` there is no held-out test split -- the folds
+            # ARE the evaluation. Each fold's final model scores its own
+            # photograph-disjoint held-out half, and the predictions are
+            # concatenated below into one out-of-fold set covering every crop and
+            # every class. Collected after the epoch loop so the model is this
+            # fold's finished one, and only on the fold's OWN validation indices,
+            # which the fold never trained on.
+            if split_protocol == "grouped_cv" and context.is_main:
+                _, _, oof_accumulator, _ = run_epoch(
+                    encoder, model, criterion, val_loader,
+                    device, tracker, logger, epoch=fold, global_step=global_step,
+                    phase=f"fold_{fold}/out_of_fold", dataset=dataset,
+                    # NOT `max_batches`. Full coverage of the fold IS the
+                    # protocol -- every crop held out exactly once -- so a
+                    # truncated pass would leave the assembly with fewer
+                    # predictions than indices. `max_batches` is a smoke knob
+                    # and honouring it here would turn the smoke run's failure
+                    # mode from "fast" into "incoherent".
+                    max_batches=None,
+                    amp=AMP_DISABLED, num_experts=num_experts, max_tsne_samples=max_tsne,
+                )
+                out_of_fold_parts.append((val_indices, oof_accumulator))
+
             logger.info("Fold %s complete.", fold)
             barrier(context)
 
@@ -1792,7 +1973,32 @@ def main(cfg: DictConfig) -> None:
         final_path = str(output_dir / "hierarchical_moe_final.pth")
 
         if context.is_main:
-            if len(test_indices) > 0:
+            if out_of_fold_parts:
+                # E5. `grouped_cv` has no held-out split, so the reported
+                # evaluation is the concatenation of the folds' own
+                # photograph-disjoint held-out halves: every crop scored exactly
+                # once, by a model that never trained on it, and all 27 classes
+                # present. Each fold contributed a DIFFERENT model, which is the
+                # honest price of covering the whole dataset -- so this is a
+                # protocol-level estimate of the recipe, not a single shipped
+                # model's test score, and `summary.json` says so.
+                test_evaluation, test_accumulator = merge_out_of_fold(
+                    out_of_fold_parts, dataset, len(dataset)
+                )
+                log_evaluation_artifacts(
+                    tracker, test_evaluation, test_accumulator, dataset, 1, "out_of_fold", logger
+                )
+                logger.info(
+                    "Out-of-fold (%d folds, %d crops, all %d classes) | seed_acc=%.4f "
+                    "sub_acc=%.4f sub_f1_macro=%.4f kl_alignment=%.4f",
+                    len(out_of_fold_parts), len(test_accumulator.sub_true),
+                    len(sub_names),
+                    test_evaluation.seed_type.get("accuracy", float("nan")),
+                    test_evaluation.sub_variety.get("accuracy", float("nan")),
+                    test_evaluation.sub_variety.get("f1_macro", float("nan")),
+                    test_evaluation.alignment.overall,
+                )
+            elif len(test_indices) > 0:
                 logger.info("Evaluating best checkpoint (fold %s, epoch %s) on %s held-out samples.",
                             best_state["fold"], best_state["epoch"], len(test_indices))
                 _, test_evaluation, test_accumulator, _ = run_epoch(
@@ -1970,6 +2176,17 @@ def write_run_summary(
             "num_experts": OmegaConf.select(cfg, "model.head.num_experts", default=None),
             "top_k": OmegaConf.select(cfg, "model.head.top_k", default=None),
             "token_mode": OmegaConf.select(cfg, "model.head.token_mode", default=None),
+            # Which trunk stage the encoder reads. `final` is what every
+            # published number was produced under; `stage3` reads `layers.2`,
+            # which the stage-1 audit measured as the better frozen readout. It
+            # belongs here rather than only in the log because the two are not
+            # comparable and a table row must say which one it is.
+            "feature_stage": OmegaConf.select(
+                cfg, "model.backbone.feature_stage", default="final"
+            ),
+            "split_protocol": OmegaConf.select(
+                cfg, "experiment.training.split_protocol", default="grouped"
+            ),
             "epochs": OmegaConf.select(cfg, "experiment.training.epochs", default=None),
             "num_folds": OmegaConf.select(cfg, "experiment.training.num_folds", default=None),
             "learning_rate": OmegaConf.select(cfg, "experiment.training.learning_rate", default=None),

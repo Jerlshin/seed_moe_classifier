@@ -672,6 +672,38 @@ class PretrainDynamics:
             summary["loss_min"] = float(min(losses))
             summary["loss_min_epoch"] = int(epochs[losses.index(min(losses))]) if epochs else -1
 
+        # A4: the reported loss is a cross entropy, so `loss = H(teacher) +
+        # KL(teacher||student)` and only the second term is the student
+        # learning. On the shipped 100-epoch run 80 % of the total loss drop was
+        # `H` falling, the final loss was 94.8 % irreducible target entropy, and
+        # the KL was still improving at epoch 93 while the raw curve had been
+        # flat since epoch 20. These keys are absent from runs recorded before
+        # the decomposition was logged, in which case they come back as NaN
+        # rather than as a silently wrong number.
+        kl_epochs, kl_values = self.series("epoch/teacher_student_kl")
+        summary.update(
+            {
+                "teacher_student_kl_initial": self.initial("epoch/teacher_student_kl"),
+                "teacher_student_kl_final": self.final("epoch/teacher_student_kl"),
+                "teacher_student_kl_min": float(min(kl_values)) if kl_values else float("nan"),
+                "teacher_student_kl_min_epoch": (
+                    int(kl_epochs[kl_values.index(min(kl_values))]) if kl_values else -1
+                ),
+            }
+        )
+        if kl_values and losses:
+            summary["teacher_entropy_share_of_loss_final"] = float(
+                1.0 - kl_values[-1] / losses[-1]
+            ) if losses[-1] else float("nan")
+            summary["teacher_entropy_share_of_loss_improvement"] = (
+                float(
+                    1.0
+                    - (kl_values[0] - kl_values[-1]) / (losses[0] - losses[-1])
+                )
+                if len(losses) > 1 and losses[0] != losses[-1]
+                else float("nan")
+            )
+
         entropy_final = self.final("train/teacher_entropy", window=20)
         floor = self.final("train/teacher_entropy_min", window=1)
         ceiling = self.final("train/teacher_entropy_max", window=1)
@@ -690,6 +722,18 @@ class PretrainDynamics:
                 "koleo_final": self.final("train/koleo", window=20),
                 "gradient_norm_final": self.final("train/gradient_norm", window=20),
                 "images_per_second_mean": _mean_of(self.series("epoch/images_per_second")[1]),
+                # The share of wall clock the training LOOP spent blocked in
+                # the dataloader. It upper-bounds GPU idleness rather than
+                # measuring it -- nothing synchronises inside the step, so the
+                # queued work drains during that window. Do not turn
+                # `1 - this` into a GPU-busy time; that is the CPU enqueue time.
+                # `gpu_busy_fraction_mean` is the synchronised measurement, and
+                # is NaN unless the run opted into it.
+                "loop_blocked_fraction_mean": _mean_of(
+                    self.series("epoch/loop_blocked_fraction")[1]
+                    or self.series("epoch/data_wait_fraction")[1]
+                ),
+                "gpu_busy_fraction_mean": _mean_of(self.series("epoch/gpu_busy_fraction")[1]),
                 "data_wait_fraction_mean": _mean_of(self.series("epoch/data_wait_fraction")[1]),
                 "epoch_duration_seconds_mean": _mean_of(self.series("epoch/duration_seconds")[1]),
                 "peak_memory_mb_max": (

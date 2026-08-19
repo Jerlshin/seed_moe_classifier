@@ -119,6 +119,38 @@ SWINV2_PREFIX = "swinv2"
 #: Routing granularities. See the module docstring.
 TOKEN_MODES = ("grid", "pooled")
 
+#: Which trunk stage :class:`BackboneFeatureExtractor` reads.
+#:
+#: ``final`` is ``forward_features`` -- ``layers.3`` after the trunk's own
+#: ``norm``, an ``8x8`` grid of 768 channels on Tiny/Small at 256 px. It is what
+#: this repository has always emitted and what every existing checkpoint's
+#: downstream numbers were measured on.
+#:
+#: ``stage3`` reads ``layers.2`` instead: a ``16x16`` grid of **384** channels,
+#: which is natively the paper's ``z in R^384`` (Eq. 4). The stage-1 audit
+#: measured linear CKA 0.103 between the DINO encoder's ``layers.3`` and its
+#: ImageNet initialisation against 0.390 at ``layers.2`` -- the self-distillation
+#: objective rewrote the last stage to serve its 2,048-prototype head, and that
+#: is the stage stage 2 currently consumes. On a photograph-disjoint 27-way
+#: out-of-fold probe ``layers.2`` scored +3.25 pp (linear) / +3.90 pp (512-unit
+#: MLP) over the pooled final stage, and the ordering held for the ImageNet
+#: weights too, so it is not an artefact of one checkpoint.
+#:
+#: ``stage3_pooled_2x2`` is ``stage3`` with a 2x2 average pool, which restores the
+#: 8x8 = 64-token budget stage 2's grid routing and Eq. 11 cross-attention are
+#: sized for. Reading ``stage3`` in grid mode quadruples the MoE's routing slots
+#: and makes the cross-attention 256x256 -- 16x its current cost -- so this is
+#: the variant to try first downstream.
+FEATURE_STAGES = ("final", "stage3", "stage3_pooled_2x2")
+
+#: ``feature_info`` index of the stage each :data:`FEATURE_STAGES` entry reads.
+#: ``None`` means "the trunk's own final output", i.e. ``forward_features``.
+_FEATURE_STAGE_INDEX: dict[str, int | None] = {
+    "final": None,
+    "stage3": 2,
+    "stage3_pooled_2x2": 2,
+}
+
 #: Sub-variety head variants, and what each one isolates.
 SUB_HEAD_VARIANTS = ("arcface", "normface", "linear")
 
@@ -649,6 +681,12 @@ class BackboneFeatureExtractor(nn.Module):
             you also set ``freeze: false`` to fine-tune the trunk.
         strict: Strict ``load_state_dict``.
         freeze: Disable gradients and force eval mode.
+        feature_stage: Which trunk stage to read; see :data:`FEATURE_STAGES`.
+            ``"final"`` (the default) preserves every existing number. The
+            ``stage3`` variants read ``layers.2``, which the stage-1 audit
+            measured as the better frozen readout for every encoder tested --
+            see :data:`FEATURE_STAGES` for the numbers and the routing-cost
+            caveat.
     """
 
     def __init__(
@@ -660,10 +698,16 @@ class BackboneFeatureExtractor(nn.Module):
         strict: bool = False,
         freeze: bool = True,
         drop_path_rate: float = 0.0,
+        feature_stage: str = "final",
     ):
         super().__init__()
         self.model_name = validate_swinv2_name(model_name)
         self.frozen = bool(freeze)
+        if feature_stage not in FEATURE_STAGES:
+            raise ValueError(
+                f"feature_stage must be one of {FEATURE_STAGES}, got {feature_stage!r}"
+            )
+        self.feature_stage = str(feature_stage)
 
         self.backbone = timm.create_model(
             self.model_name,
@@ -672,6 +716,8 @@ class BackboneFeatureExtractor(nn.Module):
             dynamic_img_size=dynamic_img_size,
             drop_path_rate=float(drop_path_rate),
         )
+        self._stage_index = _FEATURE_STAGE_INDEX[self.feature_stage]
+        self._stage_dim = self._resolve_stage_dim(self._stage_index)
 
         self.load_report: dict[str, list[str]] | None = None
         if checkpoint_path:
@@ -684,8 +730,42 @@ class BackboneFeatureExtractor(nn.Module):
 
     @property
     def feature_dim(self) -> int | None:
-        """Backbone output width, or ``None`` if the backbone does not expose it."""
+        """Width of the features this extractor **emits**, or ``None`` if unknown.
+
+        Not necessarily ``backbone.num_features``: under ``feature_stage="stage3"``
+        this is ``layers.2``'s 384 channels (512 on Base), which is what
+        :class:`DinoV2SwinV2Encoder` must project from. Reporting the trunk's
+        final width here would build a projection with the wrong input size and
+        the error would surface as a shape mismatch several modules downstream.
+        """
+        if self._stage_dim is not None:
+            return int(self._stage_dim)
         return getattr(self.backbone, "num_features", getattr(self.backbone, "embed_dim", None))
+
+    @property
+    def backbone_feature_dim(self) -> int | None:
+        """The trunk's own final width, whatever stage is being read."""
+        return getattr(self.backbone, "num_features", getattr(self.backbone, "embed_dim", None))
+
+    def _resolve_stage_dim(self, index: int | None) -> int | None:
+        """Channel count of ``feature_info[index]``, or ``None`` for the final stage."""
+        if index is None:
+            return None
+        info = getattr(self.backbone, "feature_info", None)
+        if info is None:
+            raise AttributeError(
+                f"{self.model_name!r} exposes no `feature_info`, so feature_stage="
+                f"{self.feature_stage!r} cannot resolve the stage width."
+            )
+        channels = info.channels() if hasattr(info, "channels") else [
+            entry["num_chs"] for entry in info
+        ]
+        if index >= len(channels):
+            raise ValueError(
+                f"{self.model_name!r} has {len(channels)} stages; feature_stage="
+                f"{self.feature_stage!r} needs index {index}."
+            )
+        return int(channels[index])
 
     def train(self, mode: bool = True):
         # A frozen backbone must never leave eval mode; otherwise BatchNorm running
@@ -719,9 +799,76 @@ class BackboneFeatureExtractor(nn.Module):
         return self._extract(x, return_tokens)
 
     def _extract(self, x: torch.Tensor, return_tokens: bool) -> torch.Tensor:
+        if self._stage_index is not None:
+            grid = self._stage_features(x)
+            if return_tokens:
+                return self._flatten_tokens(grid)
+            return self._pool(grid)
         if return_tokens:
             return self._flatten_tokens(self.backbone.forward_features(x))
         return self._pool(self.backbone(x))
+
+    def _stage_features(self, x: torch.Tensor) -> torch.Tensor:
+        """``[batch, H, W, channels]`` for the configured intermediate stage.
+
+        Uses timm's ``forward_intermediates`` with ``stop_early=True``, so the
+        blocks after the requested stage are not executed at all -- reading
+        ``layers.2`` is genuinely cheaper than reading the final stage, not the
+        same forward with a hook on it. A build whose SwinV2 lacks that method
+        falls back to a forward hook, which costs the full trunk but produces
+        the identical tensor.
+
+        Returned channels-last (``NHWC``) to match what ``forward_features``
+        emits for Swin, so :meth:`_flatten_tokens` and :meth:`_pool` need no
+        stage-specific branch and the token order is the trunk's own raster
+        order in both cases.
+        """
+        index = int(self._stage_index)
+        forward_intermediates = getattr(self.backbone, "forward_intermediates", None)
+        if forward_intermediates is not None:
+            grids = forward_intermediates(
+                x, indices=[index], norm=False, stop_early=True, intermediates_only=True
+            )
+            grid = grids[-1]
+            # timm emits NCHW here; the rest of this class speaks NHWC.
+            if grid.ndim == 4:
+                grid = grid.permute(0, 2, 3, 1)
+        else:  # pragma: no cover - only on a timm without forward_intermediates
+            grid = self._stage_features_via_hook(x, index)
+        if self.feature_stage == "stage3_pooled_2x2":
+            grid = self._pool_2x2(grid)
+        return grid
+
+    def _stage_features_via_hook(self, x: torch.Tensor, index: int) -> torch.Tensor:
+        layers = getattr(self.backbone, "layers", None)
+        if layers is None or index >= len(layers):
+            raise AttributeError(
+                f"{self.model_name!r} exposes neither `forward_intermediates` nor a `layers[{index}]`, "
+                f"so feature_stage={self.feature_stage!r} cannot be read."
+            )
+        captured: list[torch.Tensor] = []
+        handle = layers[index].register_forward_hook(
+            lambda _module, _inputs, output: captured.append(output)
+        )
+        try:
+            self.backbone.forward_features(x)
+        finally:
+            handle.remove()
+        return captured[-1]
+
+    @staticmethod
+    def _pool_2x2(grid: torch.Tensor) -> torch.Tensor:
+        """2x2 average pool of an ``[B, H, W, C]`` grid, so 16x16 becomes 8x8.
+
+        Restores the 64-token budget stage 2's grid routing and Eq. 11
+        cross-attention are sized for. An odd side is left untouched rather than
+        cropped: silently dropping a row would be a different feature map with no
+        error anywhere.
+        """
+        if grid.ndim != 4 or grid.shape[1] % 2 or grid.shape[2] % 2:
+            return grid
+        batch, height, width, channels = grid.shape
+        return grid.reshape(batch, height // 2, 2, width // 2, 2, channels).mean(dim=(2, 4))
 
     @staticmethod
     def _flatten_tokens(features: torch.Tensor) -> torch.Tensor:
@@ -795,6 +942,11 @@ class DinoV2SwinV2Encoder(nn.Module):
         projection_hidden_dim: Optional hidden width inside the projection.
         projection_dropout: Dropout inside the projection's hidden variant.
         token_mode: ``"grid"`` to emit the token grid, ``"pooled"`` for a vector.
+        feature_stage: Which trunk stage to read; see :data:`FEATURE_STAGES`.
+            Under ``"stage3"`` the backbone emits 384 channels natively, so the
+            Eq. 4 projection becomes 384 -> 384 (a Linear + LayerNorm, not an
+            identity, because ``use_norm=True``) and stops being an information
+            bottleneck. ``encoder(images).shape[-1] == 384`` holds either way.
     """
 
     def __init__(
@@ -810,6 +962,7 @@ class DinoV2SwinV2Encoder(nn.Module):
         projection_hidden_dim: int | None = None,
         projection_dropout: float = 0.0,
         token_mode: str = "grid",
+        feature_stage: str = "final",
     ):
         super().__init__()
         if token_mode not in TOKEN_MODES:
@@ -822,6 +975,7 @@ class DinoV2SwinV2Encoder(nn.Module):
             strict=strict,
             freeze=freeze_backbone,
             drop_path_rate=drop_path_rate,
+            feature_stage=feature_stage,
         )
         backbone_dim = self.encoder.feature_dim
         if backbone_dim is None:
@@ -834,6 +988,7 @@ class DinoV2SwinV2Encoder(nn.Module):
         self.embed_dim = int(embed_dim)
         self.frozen_backbone = bool(freeze_backbone)
         self.token_mode = token_mode
+        self.feature_stage = str(feature_stage)
         self.projection = EmbeddingProjection(
             in_dim=self.backbone_dim,
             out_dim=self.embed_dim,
@@ -865,7 +1020,8 @@ class DinoV2SwinV2Encoder(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"backbone_dim={self.backbone_dim} -> embed_dim={self.embed_dim}, "
-            f"token_mode={self.token_mode}, frozen_backbone={self.frozen_backbone}"
+            f"token_mode={self.token_mode}, feature_stage={self.feature_stage}, "
+            f"frozen_backbone={self.frozen_backbone}"
         )
 
 
@@ -942,6 +1098,7 @@ def build_encoder(
         projection_hidden_dim=getattr(backbone_cfg, "projection_hidden_dim", None),
         projection_dropout=float(getattr(backbone_cfg, "projection_dropout", 0.0) or 0.0),
         token_mode=str(token_mode),
+        feature_stage=str(getattr(backbone_cfg, "feature_stage", "final") or "final"),
     )
 
 
@@ -960,4 +1117,5 @@ def build_feature_extractor(cfg: Any) -> BackboneFeatureExtractor:
         strict=bool(getattr(cfg, "checkpoint_strict", False)),
         freeze=bool(getattr(cfg, "freeze", True)),
         drop_path_rate=float(getattr(cfg, "drop_path_rate", 0.0) or 0.0),
+        feature_stage=str(getattr(cfg, "feature_stage", "final") or "final"),
     )

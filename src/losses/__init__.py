@@ -7,7 +7,12 @@ from src.losses.cosine import (
     residual_cosine_loss,
     residual_magnitude_loss,
 )
-from src.losses.dino import CustomDINOLoss, koleo_regularizer, sinkhorn_knopp
+from src.losses.dino import (
+    CustomDINOLoss,
+    grouped_koleo,
+    koleo_regularizer,
+    sinkhorn_knopp,
+)
 from src.losses.hierarchical import (
     CombinedHierarchicalLoss,
     LossBreakdown,
@@ -48,6 +53,7 @@ __all__ = [
     "expert_utilization",
     "hierarchical_kl_loss",
     "intra_class_cosine_loss",
+    "grouped_koleo",
     "koleo_regularizer",
     "l1_sparsity_loss",
     "load_balancing_loss",

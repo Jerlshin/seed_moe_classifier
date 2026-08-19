@@ -141,3 +141,29 @@ Two collapse guards, pulling in opposite directions:
 
 Sharpening alone pushes toward one-hot outputs; centering alone pushes toward
 uniform. Together they hold the representation in between.
+
+## Stage 1: two things about `dino.py` that are not obvious
+
+**KoLeo is applied per global view.** `grouped_koleo` chunks the view-major
+student block by view before taking nearest neighbours. Applied to the
+concatenated block — the pre-audit behaviour, still reachable at
+`model.loss.koleo_scope=all_views` — the nearest neighbour of row `i` is row
+`B + i`, the *other view of the same crop*, so `-log(min distance)` pushes apart
+exactly the pair Eq. 1 pulls together. DINOv2 chunks for this reason and says so
+in a source comment. The control exists only so "the fix was worth X" is
+measurable; it is not a tuning knob.
+
+**The loss is emitted decomposed, on every micro-batch.** `CE = H(q) + KL(q‖p)`,
+and under Sinkhorn centering `H` is a property of the normaliser, `K`,
+`B_teacher` and the temperature schedule rather than of the student. On the
+shipped run 80 % of the total loss drop was `H` falling and the final loss was
+94.8 % irreducible target entropy. `compute_dino_loss` therefore always sets
+`dino_cross_entropy`, `teacher_entropy_cross_view` and `teacher_student_kl` —
+unlike the collapse diagnostics, which stay gated on `metrics_enabled`. They are
+device tensors, so this costs two reductions over an already-materialised tensor
+and **no synchronisation**; the epoch mean has to see every micro-batch to be an
+epoch mean at all.
+
+`CustomDINOLoss.loss_flags()` reports every objective-side setting an arm can
+move, and lands in stage 1's `summary.json`. Without it a `koleo_scope` control
+leaves a byte-identical machine-readable trace to the default.

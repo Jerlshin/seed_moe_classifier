@@ -101,7 +101,12 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from src.datasets.dataset import HierarchicalSeedDataset, get_finetune_dataset
+from src.datasets.dataset import (
+    HierarchicalSeedDataset,
+    describe_fingerprint_mismatch,
+    get_finetune_dataset,
+    raw_photograph_coverage,
+)
 from src.datasets.transforms import get_dino_transforms, get_supervised_transforms
 from src.models.backbones.swinv2_dino import DINOHead
 from src.models.builder import BackboneFeatureExtractor
@@ -135,12 +140,14 @@ from src.utils.representation import (
     centroid_similarity_matrix,
     class_separability,
     feature_statistics,
+    handcrafted_image_features,
     kmeans_report,
     knn_classifier,
     l2_normalize,
     linear_cka,
     linear_probe,
     low_shot_probe,
+    nuisance_decodability,
     prototype_report,
     retrieval_report,
     select_regularisation,
@@ -197,7 +204,22 @@ warnings.filterwarnings(
 
 @dataclass
 class EncoderSpec:
-    """One encoder to evaluate: where its weights come from and what it controls for."""
+    """One encoder to evaluate: where its weights come from and what it controls for.
+
+    ``backbone`` and ``image_size`` default to the run's configured trunk and
+    resolution, which is the ordinary case -- every row is the same architecture
+    at a different set of weights, so the comparison isolates training. Setting
+    them turns a row into an **initialisation screen** instead: the frozen-trunk
+    references of Phase 0/1 differ from the primary encoder in architecture and
+    pretraining corpus, and they exist because the stage-1 audit found the
+    initialisation worth more than the whole self-distillation run (+2.24 pp for
+    an IN-22k SwinV2-Base with zero in-domain training, against DINO's +0.58 pp
+    over its own starting point).
+
+    ``kind="handcrafted"`` is not an encoder at all: ten image statistics scored
+    by the identical probe and folds. It is a reporting obligation rather than a
+    control -- see :func:`~src.utils.representation.handcrafted_image_features`.
+    """
 
     label: str
     checkpoint: str | None = None
@@ -205,6 +227,10 @@ class EncoderSpec:
     role: str = "control"
     description: str = ""
     capture_stages: bool = False
+    kind: str = "backbone"
+    backbone: str | None = None
+    image_size: int | None = None
+    feature_stage: str = "final"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -213,6 +239,10 @@ class EncoderSpec:
             "pretrained": self.pretrained,
             "role": self.role,
             "description": self.description,
+            "kind": self.kind,
+            "backbone": self.backbone,
+            "image_size": self.image_size,
+            "feature_stage": self.feature_stage,
         }
 
 
@@ -430,6 +460,32 @@ def materialise_teacher_encoder(
     return output
 
 
+def read_stage1_summary(run_dir: str | Path | None, logger) -> dict[str, Any]:
+    """The stage-1 run's ``summary.json``, or ``{}`` when there is none.
+
+    Stage 1 writes it beside its checkpoints (see
+    :func:`~src.trainers.contrastive_pretrain.write_stage1_summary`). It is the
+    only artifact that records the **corpus** the published encoder was
+    self-distilled on, which is the one thing the bare ``state_dict`` handoff
+    cannot carry and the one thing that would have caught the shipped encoder
+    having been trained on 8,173 of 9,357 crops.
+
+    Missing is normal for a run produced before this file existed, and is a
+    warning rather than an error: the evaluation is still valid, it simply cannot
+    cross-check the corpus.
+    """
+    if not run_dir:
+        return {}
+    path = Path(str(run_dir)) / "summary.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Could not read the stage-1 summary at %s (%s).", path, error)
+        return {}
+
+
 def resolve_encoder_specs(cfg: DictConfig, logger) -> list[EncoderSpec]:
     """Build the encoder list from config, dropping entries whose file is missing.
 
@@ -443,6 +499,9 @@ def resolve_encoder_specs(cfg: DictConfig, logger) -> list[EncoderSpec]:
     stage_labels = set(
         OmegaConf.select(cfg, "experiment.evaluation.layerwise.encoders", default=None) or []
     )
+    capture_all = bool(
+        OmegaConf.select(cfg, "experiment.evaluation.layerwise.all_encoders", default=False)
+    )
     for entry in entries:
         item = dict(entry)
         checkpoint = item.get("checkpoint")
@@ -453,6 +512,7 @@ def resolve_encoder_specs(cfg: DictConfig, logger) -> list[EncoderSpec]:
             )
             continue
         label = str(item["label"])
+        backbone = item.get("backbone")
         specs.append(
             EncoderSpec(
                 label=label,
@@ -460,7 +520,13 @@ def resolve_encoder_specs(cfg: DictConfig, logger) -> list[EncoderSpec]:
                 pretrained=bool(item.get("pretrained", False)),
                 role=str(item.get("role", "control")),
                 description=str(item.get("description", "")),
-                capture_stages=label in stage_labels,
+                capture_stages=capture_all or label in stage_labels,
+                kind=str(item.get("kind", "backbone")),
+                backbone=str(backbone) if backbone else None,
+                image_size=(
+                    int(item["image_size"]) if item.get("image_size") is not None else None
+                ),
+                feature_stage=str(item.get("feature_stage", "final") or "final"),
             )
         )
     if not specs:
@@ -621,13 +687,17 @@ def build_backbone(
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
     extractor = BackboneFeatureExtractor(
-        model_name=str(cfg.model.backbone.name),
+        # A row may name its own trunk, which is what makes the Phase-0
+        # initialisation screen (Appendix 2 of STAGE1_CHANGES.md) a config entry
+        # rather than a separate script. Absent, every row is the run's trunk.
+        model_name=str(spec.backbone or cfg.model.backbone.name),
         checkpoint_path=spec.checkpoint,
         pretrained=bool(spec.pretrained),
         dynamic_img_size=bool(OmegaConf.select(cfg, "model.backbone.dynamic_img_size", default=True)),
         strict=False,
         freeze=True,
         drop_path_rate=0.0,
+        feature_stage=spec.feature_stage,
     )
     return extractor.to(device).eval()
 
@@ -1171,6 +1241,87 @@ def evaluate_encoder(
             restricted.get("out_of_fold_knn_accuracy", float("nan")),
         )
 
+    # ------------------------------------------------- alternative readouts
+    #
+    # B1/E3. Stage 2 reads the pooled final stage, which is exactly the stage
+    # self-distillation rewrote: linear CKA against the ImageNet initialisation
+    # is 0.103 at `layers.3` against 0.390 at `layers.2`. On the
+    # photograph-disjoint out-of-fold probe `layers.2` scored +3.25 pp over the
+    # pooled output, and the ordering held for the ImageNet weights too. So the
+    # headline readout is reported at EVERY configured stage rather than only at
+    # the one stage 2 happens to consume -- the default keeps `pooled` first, so
+    # a table written against the old output still finds its column.
+    readout_stages = [
+        stage for stage in settings.get("readout_stages", ["pooled"])
+        if stage == "pooled" or stage in bundle.stages
+    ]
+    if settings["grouped_cv_enabled"] and len(readout_stages) > 1:
+        report["readouts"] = {}
+        for stage in readout_stages:
+            matrix = features if stage == "pooled" else bundle.stages[stage]
+            selection = select_regularisation(
+                matrix[folds[0][0]], sub_labels[folds[0][0]],
+                matrix[folds[0][1]], sub_labels[folds[0][1]],
+                num_classes=num_sub,
+                grid=settings["probe_grid"],
+                max_iterations=settings["probe_max_iterations"],
+                seed=settings["seed"],
+            )
+            outcome = grouped_cv_readout(
+                matrix, sub_labels, groups, num_sub,
+                num_folds=settings["grouped_cv_folds"],
+                regularisation=selection["best_C"],
+                max_iterations=settings["probe_max_iterations"],
+                knn_k=report["knn"]["sub_variety"]["best_k"],
+                knn_temperature=settings["knn_temperature"],
+                seed=settings["seed"],
+            )
+            report["readouts"][stage] = {
+                "feature_dim": int(matrix.shape[1]),
+                "regularisation_selected": selection["best_C"],
+                "out_of_fold_accuracy": outcome["out_of_fold_accuracy"],
+                "out_of_fold_f1_macro": outcome["out_of_fold_f1_macro"],
+                "out_of_fold_knn_accuracy": outcome["out_of_fold_knn_accuracy"],
+                "probe_accuracy_std": outcome["probe_accuracy_std"],
+                "testable_classes_only": outcome["testable_classes_only"],
+            }
+        logger.info(
+            "  readouts | %s",
+            ", ".join(
+                f"{stage}={values['out_of_fold_accuracy']:.4f}"
+                for stage, values in report["readouts"].items()
+            ),
+        )
+
+    # ---------------------------------------------------- nuisance decodability
+    #
+    # E9. Every measurement above asks how much SIGNAL the representation holds.
+    # This asks how much photograph nuisance it holds, with class identity held
+    # constant -- which is precisely what the photograph-disjoint protocol
+    # punishes and what an in-domain SSL stage should remove. On the shipped
+    # encoders that is the one axis stage 1 demonstrably moved (+10.0 pp above
+    # chance for ImageNet, +3.5 pp after DINO), and no existing figure showed it.
+    #
+    # Read jointly with the readout: an encoder that discards everything scores
+    # chance here, so low alone is not good.
+    if settings.get("nuisance_enabled", True):
+        report["nuisance"] = nuisance_decodability(
+            features,
+            sub_labels,
+            groups,
+            min_groups_per_class=2,
+            folds=int(settings.get("nuisance_folds", 3)),
+            seed=int(settings["seed"]),
+        )
+        logger.info(
+            "  within-class photograph identity | %.4f against %.4f chance (%+.1f pp) over %d "
+            "classes with >= 2 photographs",
+            report["nuisance"]["within_class_photo_accuracy"],
+            report["nuisance"]["chance"],
+            100.0 * report["nuisance"]["above_chance"],
+            int(report["nuisance"]["classes_scored"]),
+        )
+
     # --------------------------------------------- structure without labels
     if settings["clustering_enabled"]:
         report["kmeans"] = {
@@ -1235,15 +1386,44 @@ def dynamics_panels(dynamics, summary: Mapping[str, Any]) -> list[dict[str, Any]
     """Panel specs for the stage-1 training-dynamics figure."""
     epochs, losses = dynamics.series("epoch/loss")
     steps, entropy = dynamics.series("train/teacher_entropy")
+    kl_epochs, kl_values = dynamics.series("epoch/teacher_student_kl")
+    entropy_epochs, entropy_values = dynamics.series("epoch/teacher_entropy_cross_view")
     floor = summary.get("teacher_entropy_floor")
     ceiling = summary.get("teacher_entropy_ceiling")
 
     panels: list[dict[str, Any]] = [
         {
-            "title": "DINO self-distillation loss",
+            # A4/E7. The PRIMARY curve, because the raw cross entropy is not a
+            # learning curve: `CE = H(teacher) + KL(teacher||student)`, and on
+            # the shipped run 80 % of the total loss drop was `H` falling while
+            # the final loss was 94.8 % irreducible target entropy. `KL` -- the
+            # only learnable part -- was still improving at epoch 93 with the raw
+            # curve flat since epoch 20.
+            #
+            # Falls back to the raw loss for runs recorded before the
+            # decomposition was logged, so an old events.jsonl still plots.
+            "title": (
+                "Learnable part of the objective: KL(teacher || student)"
+                if kl_values
+                else "DINO self-distillation loss (raw CE -- KL not logged by this run)"
+            ),
             "xlabel": "Epoch",
-            "ylabel": "Loss (nats)",
-            "series": {"epoch mean": (epochs, losses)},
+            "ylabel": "nats",
+            "series": (
+                {"KL(q||p)": (kl_epochs, kl_values)}
+                if kl_values
+                else {"epoch mean": (epochs, losses)}
+            ),
+        },
+        {
+            "title": "Cross entropy and its two parts",
+            "xlabel": "Epoch",
+            "ylabel": "nats",
+            "series": {
+                "CE (reported loss)": (epochs, losses),
+                **({"H(teacher)": (entropy_epochs, entropy_values)} if entropy_values else {}),
+                **({"KL(q||p)": (kl_epochs, kl_values)} if kl_values else {}),
+            },
         },
         {
             "title": "Learning-rate schedule (warmup then cosine)",
@@ -1309,10 +1489,26 @@ def dynamics_panels(dynamics, summary: Mapping[str, Any]) -> list[dict[str, Any]
         {
             # Separate panel, because a stall fraction in [0, 1] plotted beside a
             # throughput of ~17 img/s is a flat line on the x axis.
-            "title": "Share of wall clock blocked on the dataloader",
+            #
+            # NOT a GPU-idle fraction: nothing synchronises inside the step, so
+            # the queued GPU work drains while the loop blocks. It upper-bounds
+            # idleness. `gpu_busy_fraction` (opt-in, synchronised) is plotted
+            # beside it when the run measured it.
+            "title": "Share of wall clock the loop spent blocked in the dataloader",
             "xlabel": "Epoch",
-            "ylabel": "Data-wait fraction",
-            "series": {"data-wait": dynamics.series("epoch/data_wait_fraction")},
+            "ylabel": "Fraction",
+            "series": {
+                "loop blocked": (
+                    dynamics.series("epoch/loop_blocked_fraction")
+                    if dynamics.series("epoch/loop_blocked_fraction")[1]
+                    else dynamics.series("epoch/data_wait_fraction")
+                ),
+                **(
+                    {"GPU busy (measured)": dynamics.series("epoch/gpu_busy_fraction")}
+                    if dynamics.series("epoch/gpu_busy_fraction")[1]
+                    else {}
+                ),
+            },
             "ylim": (0.0, 1.02),
         },
     ]
@@ -1902,6 +2098,56 @@ def main(cfg: DictConfig) -> None:
             len(dataset), len(seed_names), len(sub_names),
             group_report["num_source_groups"], group_report["mean_crops_per_source"],
         )
+
+        # ------------------------------------------------------ corpus provenance
+        #
+        # The one thing a bare `state_dict` cannot carry. The shipped encoder was
+        # self-distilled on 8,173 crops while this evaluation, stage 2 and every
+        # published number use 9,357, and nothing said so -- it was recoverable
+        # only by cross-reading two log lines against `metrics.json`. Stage 1 now
+        # writes its corpus fingerprint into `summary.json` beside its
+        # checkpoints; this reads it back and states plainly when the two differ.
+        eval_fingerprint = dataset.corpus_fingerprint()
+        stage1_summary = read_stage1_summary(
+            OmegaConf.select(cfg, "experiment.evaluation.pretrain_run_dir", default=None), logger
+        )
+        stage1_fingerprint = dict(
+            (stage1_summary.get("split") or {}).get("corpus") or {}
+        )
+        corpus_mismatch = describe_fingerprint_mismatch(
+            stage1_fingerprint, eval_fingerprint, "the stage-1 run", "this evaluation"
+        )
+        logger.info(
+            "Corpus | %d images, %d classes, %d source photographs, digest %s.",
+            eval_fingerprint["num_samples"], eval_fingerprint["num_classes"],
+            eval_fingerprint["num_source_groups"], str(eval_fingerprint["sha256"])[:16],
+        )
+        if corpus_mismatch:
+            logger.warning(
+                "%s Every delta this report attributes to self-distillation is confounded with "
+                "that difference. Re-run stage 1 on this corpus, or state the discrepancy next to "
+                "the number.",
+                corpus_mismatch,
+            )
+        elif not stage1_fingerprint:
+            logger.warning(
+                "No stage-1 corpus fingerprint found under %s. Runs from before summary.json "
+                "existed carry no record of what they were trained on, so the corpus cannot be "
+                "cross-checked for this encoder.",
+                OmegaConf.select(cfg, "experiment.evaluation.pretrain_run_dir", default="?"),
+            )
+        else:
+            logger.info("Corpus check | the stage-1 run and this evaluation read identical corpora.")
+
+        raw_root = OmegaConf.select(cfg, "data.raw_photographs_root", default=None)
+        coverage = raw_photograph_coverage(str(raw_root), str(cfg.data.root_path)) if raw_root else {}
+        if coverage:
+            logger.warning(
+                "Raw photographs | %d of %d exist and were never cropped, so every "
+                "photograph-disjoint number here is measured over %d scenes rather than %d.",
+                coverage["num_unused_photographs"], coverage["num_raw_photographs"],
+                coverage["num_used_photographs"], coverage["num_raw_photographs"],
+            )
         singletons = group_report["single_group_sub_varieties"]
         if singletons:
             logger.warning(
@@ -1978,8 +2224,45 @@ def main(cfg: DictConfig) -> None:
         bundles: dict[str, FeatureBundle] = {}
         primary_extractor: BackboneFeatureExtractor | None = None
 
+        # One loader per distinct input resolution. Ordinary runs use exactly one;
+        # a Phase-0 initialisation screen may include a 192 px trunk beside a
+        # 256 px one, and resizing to the wrong resolution would make that row a
+        # measurement of interpolation rather than of the trunk.
+        loaders: dict[int, DataLoader] = {int(cfg.data.image_size): loader}
+
+        def loader_for(size: int) -> DataLoader:
+            if size not in loaders:
+                sized = get_finetune_dataset(
+                    str(cfg.data.root_path),
+                    transform=get_supervised_transforms(
+                        image_size=size,
+                        train=False,
+                        normalize_mean=cfg.data.augmentation.normalize_mean,
+                        normalize_std=cfg.data.augmentation.normalize_std,
+                    ),
+                    save_csv_path=None,
+                    include_path=False,
+                )
+                # The subsample must be the identical crops, or the rows are not
+                # comparable at all.
+                sized.samples = list(dataset.samples)
+                loaders[size] = DataLoader(
+                    sized,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=device.type == "cuda",
+                    drop_last=False,
+                )
+            return loaders[size]
+
         for spec in specs:
             digest = sha256_of(spec.checkpoint) if spec.checkpoint else ""
+            if spec.kind == "handcrafted":
+                # No checkpoint to hash, so the cache is keyed on the corpus
+                # instead. Keying it on nothing would make an empty digest match
+                # any other checkpointless row's cache.
+                digest = f"handcrafted:{eval_fingerprint['sha256']}"
             cache_path = features_dir / f"{spec.label}.npz"
             cached = (
                 load_cached_features(cache_path, digest, len(dataset), spec.capture_stages, logger)
@@ -1992,6 +2275,27 @@ def main(cfg: DictConfig) -> None:
             if cached is not None:
                 pooled, stages = cached
                 elapsed = 0.0
+            elif spec.kind == "handcrafted":
+                # Not an encoder: ten image statistics, scored by the identical
+                # probe, folds and seed. See E1 of STAGE1_CHANGES.md -- this row
+                # is the floor a reviewer asks about before any of the others.
+                logger.info("Computing handcrafted floor features | %s", spec.label)
+                pooled = handcrafted_image_features(
+                    [path for path, _, _ in dataset.samples]
+                )
+                stages = {}
+                elapsed = time.perf_counter() - started_extraction
+                if not subsampled:
+                    np.savez_compressed(
+                        cache_path,
+                        pooled=pooled,
+                        seed_labels=seed_labels,
+                        sub_labels=sub_labels,
+                        source_groups=groups,
+                        checkpoint_sha256=np.array(digest),
+                        backbone=np.array("handcrafted"),
+                        feature_stage=np.array("none"),
+                    )
             else:
                 logger.info(
                     "Extracting features | %s: %s", spec.label, spec.description or spec.checkpoint
@@ -1999,7 +2303,7 @@ def main(cfg: DictConfig) -> None:
                 extractor = build_backbone(spec, cfg, device, seed=int(cfg.seed))
                 pooled, stages = extract_features(
                     extractor,
-                    loader,
+                    loader_for(int(spec.image_size or cfg.data.image_size)),
                     device,
                     capture_stages=spec.capture_stages,
                     logger=logger,
@@ -2014,7 +2318,8 @@ def main(cfg: DictConfig) -> None:
                         sub_labels=sub_labels,
                         source_groups=groups,
                         checkpoint_sha256=np.array(digest),
-                        backbone=np.array(str(cfg.model.backbone.name)),
+                        backbone=np.array(str(spec.backbone or cfg.model.backbone.name)),
+                        feature_stage=np.array(str(spec.feature_stage)),
                         **{f"stage_{key}": value for key, value in stages.items()},
                     )
                 if extractor.load_report is not None:
@@ -2128,6 +2433,20 @@ def main(cfg: DictConfig) -> None:
                 OmegaConf.select(cfg, "experiment.evaluation.grouped_cv.num_folds", default=5)
             ),
             "single_split_classes": int(np.unique(sub_labels[test_indices]).size),
+            # B1/E3: which trunk stages get the headline out-of-fold readout.
+            # `pooled` alone reproduces the pre-audit output exactly.
+            "readout_stages": list(
+                OmegaConf.select(
+                    cfg, "experiment.evaluation.readout.stages", default=["pooled"]
+                )
+                or ["pooled"]
+            ),
+            "nuisance_enabled": bool(
+                OmegaConf.select(cfg, "experiment.evaluation.nuisance.enabled", default=True)
+            ),
+            "nuisance_folds": int(
+                OmegaConf.select(cfg, "experiment.evaluation.nuisance.folds", default=3)
+            ),
         }
 
         reports: dict[str, Any] = {}
@@ -2506,6 +2825,53 @@ def main(cfg: DictConfig) -> None:
                     prototypes["bottleneck_separability"] = class_separability(
                         bottleneck.numpy()[test_indices], sub_labels[test_indices], sub_names
                     )
+                    # F2. The head's 256-D bottleneck clusters the taxonomy
+                    # BETTER than the 768-D trunk output it is computed from
+                    # (silhouette +0.172 against +0.115), and stage 1 discards
+                    # it. This is the cheap test of whether that is a mistake:
+                    # the same out-of-fold readout, on the same folds, over the
+                    # bottleneck. It is not free of caveats -- the bottleneck is
+                    # L2-normalised and trained to serve the prototype task, so a
+                    # better silhouette does not automatically mean a better
+                    # input to a 9 M-parameter MoE head -- which is why this
+                    # measures rather than concludes.
+                    if bool(
+                        OmegaConf.select(
+                            cfg, "experiment.evaluation.prototypes.probe_bottleneck", default=True
+                        )
+                    ) and settings["grouped_cv_enabled"]:
+                        matrix = bottleneck.numpy().astype(np.float32)
+                        selection = select_regularisation(
+                            matrix[folds[0][0]], sub_labels[folds[0][0]],
+                            matrix[folds[0][1]], sub_labels[folds[0][1]],
+                            num_classes=len(sub_names),
+                            grid=settings["probe_grid"],
+                            max_iterations=settings["probe_max_iterations"],
+                            seed=int(cfg.seed),
+                        )
+                        outcome = grouped_cv_readout(
+                            matrix, sub_labels, groups, len(sub_names),
+                            num_folds=settings["grouped_cv_folds"],
+                            regularisation=selection["best_C"],
+                            max_iterations=settings["probe_max_iterations"],
+                            knn_k=reports[primary_label]["knn"]["sub_variety"]["best_k"],
+                            knn_temperature=settings["knn_temperature"],
+                            seed=int(cfg.seed),
+                        )
+                        prototypes["bottleneck_readout"] = {
+                            "feature_dim": int(matrix.shape[1]),
+                            "regularisation_selected": selection["best_C"],
+                            "out_of_fold_accuracy": outcome["out_of_fold_accuracy"],
+                            "out_of_fold_f1_macro": outcome["out_of_fold_f1_macro"],
+                            "out_of_fold_knn_accuracy": outcome["out_of_fold_knn_accuracy"],
+                            "probe_accuracy_std": outcome["probe_accuracy_std"],
+                        }
+                        logger.info(
+                            "  bottleneck readout | 27-way out-of-fold %.4f (macro F1 %.4f) over "
+                            "%d dimensions, against the trunk's own readouts above",
+                            outcome["out_of_fold_accuracy"], outcome["out_of_fold_f1_macro"],
+                            matrix.shape[1],
+                        )
                     extras["prototypes"] = prototypes
                     reports[primary_label]["prototypes"] = {
                         key: value
@@ -2705,18 +3071,42 @@ def main(cfg: DictConfig) -> None:
                 dynamics_summary["prototypes"] = int(cfg.model.head.out_dim)
                 dynamics_summary["events_path"] = str(candidate)
                 logger.info(
-                    "Stage-1 dynamics | %d epochs, loss %.4f -> %.4f (last-quarter improvement %.4f), "
-                    "teacher entropy %.3f against a floor of %.3f, %.1f%% of wall clock spent waiting "
-                    "for data, %.2f h total.",
+                    "Stage-1 dynamics | %d epochs, CE %.4f -> %.4f, KL(q||p) %.4f -> %.4f "
+                    "(min %.4f at epoch %s), teacher entropy %.3f against a floor of %.3f, "
+                    "the loop was blocked in the dataloader for %.1f%% of its wall clock, "
+                    "%.2f h total.",
                     dynamics_summary.get("epochs_completed", 0),
                     dynamics_summary.get("loss_initial", float("nan")),
                     dynamics_summary.get("loss_final", float("nan")),
-                    dynamics_summary.get("loss_improvement_last_quarter", float("nan")),
+                    dynamics_summary.get("teacher_student_kl_initial", float("nan")),
+                    dynamics_summary.get("teacher_student_kl_final", float("nan")),
+                    dynamics_summary.get("teacher_student_kl_min", float("nan")),
+                    dynamics_summary.get("teacher_student_kl_min_epoch", -1),
                     dynamics_summary.get("teacher_entropy_final", float("nan")),
                     dynamics_summary.get("teacher_entropy_floor", float("nan")),
-                    100.0 * dynamics_summary.get("data_wait_fraction_mean", float("nan")),
+                    100.0 * dynamics_summary.get("loop_blocked_fraction_mean", float("nan")),
                     dynamics_summary.get("training_hours", float("nan")),
                 )
+                share = dynamics_summary.get("teacher_entropy_share_of_loss_final")
+                if share is not None and share == share:
+                    logger.info(
+                        "  the reported loss is %.1f%% irreducible target entropy, and %.1f%% of "
+                        "its total improvement was the teacher sharpening rather than the student "
+                        "learning. Read KL(q||p), not the loss.",
+                        100.0 * share,
+                        100.0
+                        * dynamics_summary.get(
+                            "teacher_entropy_share_of_loss_improvement", float("nan")
+                        ),
+                    )
+                elif not dynamics_summary.get("epochs_completed"):
+                    pass
+                else:
+                    logger.warning(
+                        "This run predates the loss decomposition, so `epoch/teacher_student_kl` "
+                        "is absent and the loss curve cannot be separated into target entropy and "
+                        "the learnable part. Re-run stage 1 to get it."
+                    )
             else:
                 logger.warning("Stage-1 dynamics skipped: %s not found.", candidate)
 
@@ -2773,6 +3163,23 @@ def main(cfg: DictConfig) -> None:
             "efficiency": json_safe(efficiency),
             "leakage": json_safe({k: v for k, v in extras.get("leakage", {}).items()}),
             "milestones": json_safe(extras.get("milestones", [])),
+            "corpus": json_safe(
+                {
+                    "evaluation": eval_fingerprint,
+                    "stage1": stage1_fingerprint,
+                    "matches_stage1": (
+                        bool(
+                            stage1_fingerprint
+                            and str(stage1_fingerprint.get("sha256"))
+                            == str(eval_fingerprint.get("sha256"))
+                        )
+                        if stage1_fingerprint
+                        else None
+                    ),
+                    "mismatch": corpus_mismatch or None,
+                    "raw_photograph_coverage": coverage,
+                }
+            ),
         }
         (save_path / "metrics.json").write_text(
             json.dumps(json_safe(metrics_payload), indent=2, sort_keys=True), encoding="utf-8"
@@ -2795,6 +3202,13 @@ def main(cfg: DictConfig) -> None:
             "stage2_handoff_matches_primary": handoff_match,
             "stage2_handoff_verdict": handoff_verdict,
             "stage2_handoff_detail": handoff_detail,
+            # E2: the corpus, on both sides of the handoff. A report that names a
+            # checkpoint and a dataset root does not say whether they are the
+            # same dataset; this does.
+            "corpus_fingerprint": eval_fingerprint,
+            "stage1_corpus_fingerprint": stage1_fingerprint or None,
+            "corpus_mismatch": corpus_mismatch or None,
+            "raw_photograph_coverage": coverage or None,
             "encoders": {
                 label: {
                     **bundle.spec.as_dict(),
@@ -2843,7 +3257,7 @@ def main(cfg: DictConfig) -> None:
                 "encoder_frozen": True,
             },
             loss_flags={"stage1_objective": "dino_self_distillation"},
-            split=json_safe({**split_report, **group_report}),
+            split=json_safe({**split_report, **group_report, "corpus": eval_fingerprint}),
             fold_metrics=fold_metric_summary(reports, settings),
             runtime={
                 "device": str(device),
@@ -2852,10 +3266,31 @@ def main(cfg: DictConfig) -> None:
                 "deterministic": True,
                 "wall_clock_seconds": time.perf_counter() - started,
                 "ssl_saw_every_image": True,
+                # E4. Not a defect -- this is the standard in-domain SSL protocol,
+                # DINO linear-probes ImageNet-train after pretraining on
+                # ImageNet-train -- but a paper claiming photograph-disjoint
+                # generalisation has to state it. Note the direction: the setup
+                # favours the DINO encoder, and the DINO encoder still gains only
+                # +0.58 pp over its ImageNet initialisation, so the negative
+                # result is conservative.
+                "stage1_transductive": True,
                 "caveat": (
-                    "Stage-1 pretraining was label-free but covered the whole image set, so the "
-                    "readout test split is unseen photographs rather than unseen images. Standard "
-                    "SSL protocol; it bounds the claim to in-domain readout quality."
+                    "Stage 1 self-distilled on EVERY crop, including crops of the photographs "
+                    "this readout and stage 2 hold out. No labels leak and this is the standard "
+                    "in-domain SSL protocol, but the encoder is not photograph-disjoint from the "
+                    "test split: these numbers estimate in-domain readout quality, not transfer "
+                    "to a new acquisition session. The direction favours the self-distilled "
+                    "encoder, so a null result here is conservative. The control that removes it "
+                    "is a stage-1 run restricted to the training-fold photographs."
+                ),
+                "corpus_matches_stage1": (
+                    bool(
+                        stage1_fingerprint
+                        and str(stage1_fingerprint.get("sha256"))
+                        == str(eval_fingerprint.get("sha256"))
+                    )
+                    if stage1_fingerprint
+                    else None
                 ),
             },
             config={
@@ -3022,6 +3457,8 @@ def flatten_metrics(reports: Mapping[str, Any], dynamics: Mapping[str, Any]) -> 
             "layerwise_probe",
             "prototypes",
             "hierarchical_probe",
+            "readouts",
+            "nuisance",
         ):
             if section in report:
                 walk(f"{label}/{section}", report[section])
@@ -3117,9 +3554,38 @@ def write_tables(
                 ),
                 "retrieval_p_at_1_ungrouped": get(report, "retrieval", "ungrouped", "precision_at_1"),
                 "cka_vs_imagenet_init": get(report, "cka_vs_imagenet_init"),
+                # E7: the two quantities the KoLeo fix and the crop-scale arm
+                # are steering, promoted out of the invariance sub-report so a
+                # four-arm comparison is one table wide.
                 "alignment": get(report, "invariance", "alignment"),
                 "uniformity": get(report, "invariance", "uniformity"),
+                "same_image_minus_same_class": get(
+                    report, "invariance", "same_image_minus_same_class"
+                ),
                 "self_retrieval_top1": get(report, "invariance", "self_retrieval_top1"),
+                # E9: how much photograph nuisance survives, class held constant.
+                # Read jointly with the readout columns above -- an encoder that
+                # discards everything scores chance here.
+                "nuisance_photo_accuracy": get(
+                    report, "nuisance", "within_class_photo_accuracy"
+                ),
+                "nuisance_photo_chance": get(report, "nuisance", "chance"),
+                "nuisance_photo_above_chance": get(report, "nuisance", "above_chance"),
+                # B1/E3: the same headline probe read at each configured stage.
+                **{
+                    f"oof_probe_sub_accuracy_at_{stage}": value
+                    for stage, value in (
+                        (stage, get(report, "readouts", stage, "out_of_fold_accuracy"))
+                        for stage in (get(report, "readouts") or {})
+                    )
+                },
+                **{
+                    f"oof_probe_sub_f1_macro_at_{stage}": value
+                    for stage, value in (
+                        (stage, get(report, "readouts", stage, "out_of_fold_f1_macro"))
+                        for stage in (get(report, "readouts") or {})
+                    )
+                },
                 "backbone_parameters_m": (get(report, "backbone_parameters") or 0) / 1e6,
             }
         )
@@ -3180,6 +3646,41 @@ def write_tables(
                 }
                 for entry in evaluation.per_class_seed
             ],
+        )
+
+    readout_rows = [
+        {
+            "encoder": label,
+            "stage": stage,
+            "feature_dim": values.get("feature_dim"),
+            "oof_probe_sub_accuracy": values.get("out_of_fold_accuracy"),
+            "oof_probe_sub_f1_macro": values.get("out_of_fold_f1_macro"),
+            "oof_knn_sub_accuracy": values.get("out_of_fold_knn_accuracy"),
+            "oof_probe_sub_fold_std": values.get("probe_accuracy_std"),
+            "oof_probe_sub_accuracy_testable_classes": (
+                values.get("testable_classes_only", {}).get("out_of_fold_accuracy")
+            ),
+        }
+        for label, report in reports.items()
+        for stage, values in (get(report, "readouts") or {}).items()
+    ]
+    if readout_rows:
+        written["readout_stages"] = write_csv(tables_dir / "readout_stages.csv", readout_rows)
+
+    nuisance_rows = [
+        {
+            "encoder": label,
+            "within_class_photo_accuracy": get(report, "nuisance", "within_class_photo_accuracy"),
+            "chance": get(report, "nuisance", "chance"),
+            "above_chance": get(report, "nuisance", "above_chance"),
+            "classes_scored": get(report, "nuisance", "classes_scored"),
+        }
+        for label, report in reports.items()
+        if get(report, "nuisance") is not None
+    ]
+    if nuisance_rows:
+        written["nuisance_decodability"] = write_csv(
+            tables_dir / "nuisance_decodability.csv", nuisance_rows
         )
 
     if extras.get("low_shot"):

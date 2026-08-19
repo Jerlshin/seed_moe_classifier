@@ -35,6 +35,7 @@ from tests.conftest import (
     REVISED_TOP_K,
     SUBMITTED_WARMUP_EPOCHS,
     SUBMITTED_WARMUP_TEACHER_TEMP,
+    SUBVARIETY_COUNTS,
 )
 
 
@@ -198,15 +199,22 @@ def test_mapping_matrix_is_one_hot_over_seed_types(subvariety_to_seed_type):
     )
     assert mapping.shape == (PAPER_NUM_SUB_VARIETIES, PAPER_NUM_SEED_TYPES)
     assert torch.all(mapping.sum(dim=1) == 1.0)
-    # Column sums recover the paper's 8 / 3 / 13 / 3 split.
-    assert mapping.sum(dim=0).tolist() == [8.0, 3.0, 13.0, 3.0]
+    # Column sums recover the real tree's 3 / 8 / 3 / 13 split, in the SORTED
+    # directory order the dataset assigns indices from (Amaranthus, Millet,
+    # Mustard, Rice). Derived from the fixture rather than written as literals:
+    # the previous literals encoded the fixture's own wrong ordering, so both
+    # agreed with each other and neither agreed with production.
+    expected = [float(SUBVARIETY_COUNTS[name]) for name in sorted(SUBVARIETY_COUNTS)]
+    assert mapping.sum(dim=0).tolist() == expected
 
 
 def test_mapping_matrix_from_counts_matches_explicit_mapping(subvariety_to_seed_type):
     from_counts = build_subvariety_seed_mapping(
         num_sub_varieties=PAPER_NUM_SUB_VARIETIES,
         num_seed_types=PAPER_NUM_SEED_TYPES,
-        subvarieties_per_seed_type=[8, 3, 13, 3],
+        subvarieties_per_seed_type=[
+            SUBVARIETY_COUNTS[name] for name in sorted(SUBVARIETY_COUNTS)
+        ],
     )
     explicit = build_subvariety_seed_mapping(
         num_sub_varieties=PAPER_NUM_SUB_VARIETIES,

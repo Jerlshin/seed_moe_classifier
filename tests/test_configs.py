@@ -96,7 +96,16 @@ def finetune_cfg(conf_dir):
 ALL_EXPERIMENTS = [
     "pretrain_swinv2_dino",
     "pretrain_swinv2_base_dino",
+    # Stage-1 trunk options. `screen_backbones` decides between them on measured
+    # transfer rather than on capacity; until it has run, neither is adopted.
+    "pretrain_swinv2_tiny_dino",
+    "pretrain_swinv2_base_in22k_dino",
     "eval_pretrain_representation",
+    # Phase-0 screening and the frozen-trunk reference. Neither trains anything;
+    # both must still compose, because the failure mode of a dangling
+    # interpolation is discovering it when a suite launches.
+    "screen_backbones",
+    "eval_frozen_reference",
     "control_imagenet_frozen",
     "finetune_hierarchical_moe",
     "ablation_flat_classifier",

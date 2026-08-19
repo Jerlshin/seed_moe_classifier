@@ -86,10 +86,27 @@ teacher's *soft* marginal inside a 128-view micro-batch, which Sinkhorn forces
 towards uniform by construction. The hard argmax over the dataset tells a
 different and complementary story — see Finding 2.6.
 
-### Finding 1.3 — The GPU was idle for 91.6 % of the run
+### Finding 1.3 — The training loop spent 91.6 % of its wall clock blocked in the dataloader
 
-`epoch/data_wait_fraction`: mean **0.916**, min 0.866, max 0.928. Throughput 17.0
-images/s mean (14.2–18.8). Peak VRAM 43.5 GB of 79.2 GB.
+> **Corrected after the stage-1 audit (`STAGE1_CHANGES.md` A5).** This section
+> originally read "the GPU was idle for 91.6 % of the run" and derived a GPU-busy
+> time from it. That derivation is wrong. `data_wait_fraction` is the share of
+> wall clock the *training loop* spends inside the dataloader's `__next__`, and
+> **nothing synchronises inside the step** — deliberately, see the module
+> docstring of `src/trainers/contrastive_pretrain.py` — so the queued GPU work
+> drains *during* that window. The metric **upper-bounds** idleness; it does not
+> measure it, and `13.34 h × (1 − 0.916)` is the CPU *enqueue* time. The metric's
+> direction and its operational conclusion ("the loader is the bottleneck") are
+> both right; the derived TFLOP/s figure was not, and it is struck through below.
+>
+> The metric is now named `epoch/loop_blocked_fraction` (the old name is still
+> emitted as an alias). A genuinely synchronised measurement is available at
+> `experiment.training.measure_gpu_busy=true`, which reports
+> `epoch/gpu_busy_fraction` at the cost of one stall per logging interval; it is
+> off by default.
+
+`epoch/loop_blocked_fraction`: mean **0.916**, min 0.866, max 0.928. Throughput
+17.0 images/s mean (14.2–18.8). Peak VRAM 43.5 GB of 79.2 GB.
 
 The cause is in the launch command: `data.num_workers=0`. Stage 1 builds **six
 independent PIL pipelines per sample** (random resized crop, colour jitter,
@@ -98,13 +115,18 @@ per step, and with zero workers all of them run in the process that is also
 supposed to be feeding the GPU. `cache_images=true` removed the *decode* cost
 (8,173 images cached in 91.3 MB) but not the augmentation cost.
 
-Arithmetic on the consequence:
+Arithmetic on the consequence — **the first two lines are withdrawn**:
 
-- GPU-busy time ≈ 13.34 h × (1 − 0.916) = **1.12 h**.
-- 415.7 PFLOPs / 4,032 s ≈ 103 TFLOP/s, ≈ 14 % of an H100 PCIe's bf16 peak — a
-  reasonable figure for many small window-attention kernels.
-- So the run had **~12× of wall clock available for free**, and a second one at
-  57 % VRAM headroom.
+- ~~GPU-busy time ≈ 13.34 h × (1 − 0.916) = **1.12 h**.~~ This is the CPU enqueue
+  time, not the GPU busy time. See the correction above.
+- ~~415.7 PFLOPs / 4,032 s ≈ 103 TFLOP/s, ≈ 14 % of an H100 PCIe's bf16 peak.~~
+  The FLOP-based cross-check (415.7 PFLOPs at a plausible 50–100 TFLOP/s
+  effective ⇒ 1.2–2.3 h) happens to land in the same range, which is why the
+  error was not caught. Re-derive it from `epoch/gpu_busy_fraction`, or from
+  `steps/epoch × step_time` measured by `scripts/bench_pretrain_step.py --scaling 1`.
+- The operational conclusion **stands**: the loop is loader-bound, there is a
+  large multiple of wall clock available, and a second run fits at 57 % VRAM
+  headroom.
 
 This is the single largest finding in the report, and it is not about the model.
 
@@ -119,6 +141,17 @@ This is the single largest finding in the report, and it is not about the model.
   mostly interpolation. `match_view_lowpass` exists in
   `src/datasets/transforms.py` precisely to remove the resulting resolution
   shortcut by giving the global views the same artefact, and it was **off**.
+
+  The audit measured this precisely: over all 9,357 crops a global view carries a
+  median 2,035 native pixels and a local view **598** (p5 = 130), for upsample
+  factors of 5.7× and 10.5× (p95: 9.9× and 22.1×). **Eight of the ten cross-view
+  terms in Eq. 1 are anchored on such a view.**
+
+  > **Correction.** This report and `architecture/02` both instructed
+  > `data.augmentation.match_view_lowpass=true`, and the key was **absent from
+  > the config group**, so Hydra's struct mode rejected the documented override.
+  > The key now exists (`STAGE1_CHANGES.md` A3) and the command below works as
+  > written.
 
 ---
 
@@ -183,6 +216,26 @@ Two caveats, both stated so the finding is not overread:
 - **The encoder did change.** Linear CKA against the ImageNet initialisation is
   **0.297** — a very large move in representation space, not a stalled run. Stage 1
   did something; it just did not do something the task rewards.
+
+  > **Interpretation caveat, added after the stage-1 audit (`STAGE1_CHANGES.md`
+  > E8/D12).** `CKA(random_init, imagenet_init) = 0.335` is **larger** than
+  > `CKA(dino_epoch100, imagenet_init) = 0.295`, and that is *not* evidence that
+  > DINO drifted further than a random trunk. `random_init` has a participation
+  > ratio of **1.36** and a top-1 variance share of **0.851** — it is very nearly
+  > rank one — so linear CKA against it measures the shared dominant direction
+  > rather than similarity of representation. This report already carries an
+  > analogous caution for `fisher_ratio` and `calinski_harabasz`; the same applies
+  > here. Compare CKA values only between encoders of comparable effective rank.
+
+- **What stage 1 *did* achieve, and this report did not measure.** Within-class
+  **source-photograph** decodability — the nuisance direction the
+  photograph-disjoint protocol punishes, with class identity held constant — fell
+  from **+10.0 pp above chance** (ImageNet) to **+3.5 pp** (DINO): a 65 %
+  reduction. That is a real, correctly-signed effect that no metric in this report
+  reported. It is now a first-class measurement
+  (`tables/nuisance_decodability.csv`, `STAGE1_CHANGES.md` E9) and every stage-1
+  arm is judged on it alongside the readout — because an arm can win the probe by
+  *re-learning* the confound.
 
 ### Finding 2.2 — The geometry improved, the *cluster* structure got worse, and one of those matters more than the other
 
@@ -493,8 +546,8 @@ and R11)**. Two of the recommendations in the first draft of this report were
 
 ### R1 — Set `data.num_workers`. Twelve times the wall clock, zero risk to the objective
 
-**Evidence:** Finding 1.3 — `data_wait_fraction` 0.916 mean, and the launch command
-carried `data.num_workers=0`.
+**Evidence:** Finding 1.3 — `loop_blocked_fraction` 0.916 mean, and the launch
+command carried `data.num_workers=0`.
 
 **Change:**
 
@@ -502,7 +555,10 @@ carried `data.num_workers=0`.
 python main.py pretrain data.num_workers=8   # or omit it: the config default is "auto"
 ```
 
-`auto` resolves to affinity-aware cores per rank capped at 8. Keep
+`auto` resolves to affinity-aware cores per rank capped at
+`data.num_workers_auto_cap`, **raised from 8 to 16** after the audit: the 8 was
+chosen for a 4-vCPU Kaggle T4×2 and was the binding limit on the 48-core host this
+run used. Keep
 `cache_images=true` — under `fork` (Linux) the decoded buffer is shared
 copy-on-write across workers, and it already removed the *decode* cost; the
 remaining cost is the six PIL augmentation chains per sample, which is what the
@@ -512,8 +568,9 @@ workers parallelise.
 untouched: workers change who computes an augmentation, not what it is.
 
 **Falsify:** `scripts/bench_pretrain_step.py --scaling 1` before and after, and
-`epoch/data_wait_fraction` in the first epoch of the real run. If it does not fall
-below ~0.3, the bottleneck is elsewhere and everything below should be re-costed.
+`epoch/loop_blocked_fraction` in the first epoch of the real run. If it does not
+fall below ~0.3, the bottleneck is elsewhere and everything below should be
+re-costed.
 
 Everything that follows depends on this one, because it converts "one 100-epoch
 run per 13.5 h" into "five configurations per day".
@@ -726,6 +783,32 @@ rather than editing:
 
 Both were correct before the trunk changed. Recomputing them is a
 `profile_model` run against the current config, not a search-and-replace.
+
+---
+
+## What this report got wrong, and where the corrections live
+
+`STAGE1_CHANGES.md` audited this report against the run's own artifacts and the
+raw dataset. Four items are corrections to what is written above rather than new
+recommendations, and each is now marked in place:
+
+| # | Correction | Where |
+| --- | --- | --- |
+| A5 | "The GPU was idle for 91.6 % of the run" is wrong. `data_wait_fraction` is the share of wall clock the *loop* spent blocked in the dataloader, and nothing synchronises inside the step, so the queued GPU work drains during that window. The derived 1.12 h GPU-busy figure and the 103 TFLOP/s that follows from it are withdrawn. | Finding 1.3 |
+| A3 | `data.augmentation.match_view_lowpass=true` was documented here and in `architecture/02` while the key was **absent from the config group**, so Hydra rejected the documented override. The key now exists. | Finding 1.4, R3 |
+| A4 | The DINO loss is **95 % target entropy**. 80 % of its apparent improvement was `H(teacher)` falling, not the student learning, and the learnable part `KL(q‖p)` was still improving at epoch 93 while the raw curve had been flat since epoch 20. Every "converged at epoch 20" statement here is about the wrong quantity. It does not overturn R2 — the milestone probes are flat regardless — it makes R2 *stronger*. | Finding 1.1, R2 |
+| D12 | CKA against `random_init` is not comparable; that trunk is near rank one. | Finding 2.1 |
+
+Three findings this report **under-reported**, now instrumented:
+
+* **Nuisance decodability** (E9) — stage 1's one demonstrated success, above.
+* **The stage-3 readout** (B1) — Finding 2.9 identified it; the audit quantified
+  it at **+3.25 pp** linear / **+3.90 pp** MLP on the out-of-fold protocol, and
+  `model.backbone.feature_stage=stage3` now makes it runnable.
+* **The trivial-feature floor** (E1) — ten numpy scalars score **0.5360** under
+  the identical protocol, 15.6 pp *above* the untrained 48.96 M trunk this report
+  uses as its floor. `handcrafted_floor` is now a row in
+  `tables/encoder_comparison.csv`.
 
 ---
 

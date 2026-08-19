@@ -23,7 +23,8 @@ from tests.conftest import (
     REVISED_TOP_K,
 )
 
-SEED_NAMES = ["Millet", "Mustard", "Rice", "Seasame"]
+#: The real seed types, in the sorted order the dataset assigns indices from.
+SEED_NAMES = ["Amaranthus", "Millet", "Mustard", "Rice"]
 
 
 def test_classification_metrics_on_perfect_predictions():
@@ -69,21 +70,28 @@ def test_alignment_is_zero_when_the_hierarchy_never_agrees(subvariety_to_seed_ty
 
 
 def test_alignment_breakdown_groups_by_true_seed_type(subvariety_to_seed_type):
-    """Reproduces the shape of Table 3: one rate per seed type, plus an overall."""
-    # Four samples: rice agrees, mustard disagrees.
-    parents = np.array(subvariety_to_seed_type)
-    rice_sub = int(np.where(parents == 2)[0][0])
-    mustard_sub = int(np.where(parents == 1)[0][0])
+    """Reproduces the shape of Table 3: one rate per seed type, plus an overall.
 
-    seed_true = np.array([2, 2, 1, 1])
-    sub_pred = np.array([rice_sub, rice_sub, mustard_sub, mustard_sub])
-    seed_pred = np.array([2, 2, 0, 0])  # mustard rows predicted as Millet
+    Indices, not names, drive the construction: seed types are numbered from
+    *sorted* directory names, so writing "Rice" as index 2 would be a claim about
+    the alphabet rather than about the taxonomy -- and it was wrong, because the
+    real tree is Amaranthus, Millet, Mustard, Rice.
+    """
+    parents = np.array(subvariety_to_seed_type)
+    agreeing, disagreeing = 2, 1
+    agreeing_sub = int(np.where(parents == agreeing)[0][0])
+    disagreeing_sub = int(np.where(parents == disagreeing)[0][0])
+
+    seed_true = np.array([agreeing, agreeing, disagreeing, disagreeing])
+    sub_pred = np.array([agreeing_sub, agreeing_sub, disagreeing_sub, disagreeing_sub])
+    # The last two rows' coarse head disagrees with their fine head's parent.
+    seed_pred = np.array([agreeing, agreeing, 0, 0])
 
     report = kl_alignment_rate(seed_pred, sub_pred, subvariety_to_seed_type, seed_true, SEED_NAMES)
-    assert report.per_seed_type["Rice"] == pytest.approx(1.0)
-    assert report.per_seed_type["Mustard"] == pytest.approx(0.0)
+    assert report.per_seed_type[SEED_NAMES[agreeing]] == pytest.approx(1.0)
+    assert report.per_seed_type[SEED_NAMES[disagreeing]] == pytest.approx(0.0)
     assert report.overall == pytest.approx(0.5)
-    assert report.support_per_seed_type["Rice"] == 2
+    assert report.support_per_seed_type[SEED_NAMES[agreeing]] == 2
 
 
 def test_alignment_rejects_out_of_range_sub_variety(subvariety_to_seed_type):

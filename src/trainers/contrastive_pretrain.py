@@ -34,12 +34,52 @@ learning rate from the effective batch it ends up with -- see
 :func:`resolve_learning_rate`, which applies the linear scaling rule rather than
 quoting DINO's rate at a batch 8x smaller than the one it belongs to.
 
-The run ends by writing two files: ``dino_pretrained_final.pth`` (full state) and
-``dino_pretrained_backbone.pth`` (a bare ``student_backbone`` state dict). The
-latter is the **only** handoff to stage 2. ``experiment.training.save_epochs``
+The run ends by writing three files: ``dino_pretrained_final.pth`` (full state),
+``dino_pretrained_backbone.pth`` (a bare ``student_backbone`` state dict) and
+``summary.json``. The second is the **only** weight handoff to stage 2; the third
+is the machine-readable record of what produced it -- resolved augmentation, view
+geometry, effective batch, LR provenance, centering/``K``/``lambda_koleo``, the
+**corpus fingerprint**, the final ``KL(q||p)`` and teacher entropy with its
+bounds, wall clock and peak VRAM. ``experiment.training.save_epochs``
 additionally keeps a permanent encoder at each listed epoch
 (``dino_backbone_epoch_0025.pth`` and friends), which is what makes "was 100
 epochs necessary?" a question stage 2 can answer instead of a claim.
+
+Reading the training log
+========================
+
+**The loss is not a learning curve.** ``loss`` is a cross entropy, so
+``loss = H(teacher) + KL(teacher||student)``, and under Sinkhorn centering
+``H(teacher)`` is fixed by the normaliser, ``K``, ``B_teacher`` and the
+temperature schedule. Measured on the shipped 100-epoch run: 80 % of the total
+loss drop was ``H`` falling, the final loss was 94.8 % irreducible target
+entropy, and ``KL`` -- the only learnable part -- was still improving at epoch 93
+while the raw curve had been flat since epoch 20. Every step and epoch record
+therefore carries ``teacher_student_kl`` and ``teacher_entropy_cross_view``
+alongside ``loss``, and the loss figure plots the KL first.
+
+**``loop_blocked_fraction`` is not a GPU-idle fraction.** It is the share of wall
+clock the training loop spent inside the dataloader's ``__next__``. Nothing
+synchronises inside the step, so queued GPU work drains during that window: the
+metric *upper-bounds* idleness, and turning ``1 - loop_blocked_fraction`` into a
+GPU-busy time measures CPU enqueue time instead. Set
+``experiment.training.measure_gpu_busy=true`` for a genuinely synchronised
+measurement (``gpu_busy_fraction``), at the cost of one stall per logging
+interval. ``data_wait_fraction`` remains as an alias of the same number so
+figures written against the shipped run keep working.
+
+**The corpus is recorded and checked.** The stage-1 -> stage-2 handoff is a bare
+``state_dict``, and until the audit nothing recorded what it was self-distilled
+on -- the shipped encoder was trained on 8,173 crops while everything downstream
+used 9,357. A SHA-256 over the sorted relative path list, the sample and class
+counts, the source-photograph count and the per-class histogram go into
+``events.jsonl`` and ``summary.json``, and ``pretrain_eval`` compares its own
+corpus against them.
+
+**KoLeo is applied per global view.** Applied across the two views concatenated
+-- the pre-audit behaviour, still reachable at
+``model.loss.koleo_scope=all_views`` -- it makes the two views of one image each
+other's nearest neighbour and pushes them apart. See ``src/losses/dino.py``.
 
 How a step is executed
 ======================
@@ -72,11 +112,12 @@ transfer each -- and then dropped on the floor by this loop.
 **Nothing synchronises inside the step.** Every ``float(tensor)`` blocks the CPU
 until the queued backward drains, so the next batch cannot start being enqueued.
 The loss accumulator stays a device tensor, the loss diagnostics stay device
-tensors (``CustomDINOLoss.metrics_enabled``), and the whole lot is converted once
-per logging interval. ``data_wait_fraction`` in the step log is the direct
-measurement of whether any of this is working: it is the share of wall clock the
-loop spent blocked in the dataloader, and if it is high the bottleneck is the
-CPU pipeline, not the GPU.
+tensors (``CustomDINOLoss.metrics_enabled``), the KL decomposition is accumulated
+as device tensors too, and the whole lot is converted once per logging interval.
+``loop_blocked_fraction`` in the step log is the direct measurement of whether any
+of this is working: it is the share of wall clock the loop spent blocked in the
+dataloader, and if it is high the bottleneck is the CPU pipeline, not the GPU. It
+is *not* a GPU-idle fraction -- see "Reading the training log" above.
 
 **The EMA is two kernels, not ~880.** See
 :class:`~src.utils.training.ema.TeacherEmaUpdater`.
@@ -165,6 +206,7 @@ import random
 import shutil
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -181,7 +223,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from src.datasets.dataset import MultiCropBatch, get_pretrain_dataloader
+from src.datasets.dataset import (
+    MultiCropBatch,
+    corpus_fingerprint,
+    get_pretrain_dataloader,
+    raw_photograph_coverage,
+)
 from src.datasets.transforms import get_dino_transforms
 from src.losses.dino import CustomDINOLoss
 from src.models.backbones.swinv2_dino import DINO, build_dino
@@ -220,6 +267,7 @@ from src.utils.training import (
     snapshot_run_configuration,
     to_cpu_state_dict,
 )
+from src.utils.evaluation import RunSummary
 from src.utils.visualization import plot_loss_curves
 
 #: Rolling resume checkpoints. Two, not one: on a preempted instance the newest
@@ -760,6 +808,112 @@ class ViewBatcher:
 # ------------------------------------------------------------------ checkpoints
 
 
+class GpuBusyMeter:
+    """Optional, genuinely synchronised measurement of GPU-busy time per step.
+
+    ``loop_blocked_fraction`` is what the loop spends waiting for data, and it
+    **upper-bounds** GPU idleness rather than measuring it: nothing synchronises
+    inside the step, so the queued backward drains while the loop blocks. Turning
+    ``1 - loop_blocked_fraction`` into a GPU-busy time -- which is what produced
+    the shipped run's "GPU-busy 1.12 h of 13.34 h" -- measures CPU *enqueue*
+    time instead.
+
+    This measures the real thing with a pair of ``torch.cuda.Event``s around each
+    micro-batch's compute. The events are queued asynchronously and **drained in
+    batches**, at logging steps and at the epoch boundary, so the stall is paid
+    once per logging interval rather than once per micro-batch. It is still a
+    stall, which is why the whole thing is off unless
+    ``experiment.training.measure_gpu_busy=true``.
+
+    A no-op on CPU/MPS, where there is no separate device queue to measure.
+    """
+
+    def __init__(self, device: torch.device, enabled: bool):
+        self.enabled = bool(enabled) and device.type == "cuda"
+        self._pending: list[tuple[Any, Any]] = []
+        self.seconds = 0.0
+
+    def start(self):
+        """Context manager around one micro-batch's compute."""
+        if not self.enabled:
+            return nullcontext()
+        return self._Region(self)
+
+    def drain(self) -> float:
+        """Synchronise on the queued events and fold them into :attr:`seconds`."""
+        if not self._pending:
+            return self.seconds
+        for start, end in self._pending:
+            end.synchronize()
+            self.seconds += start.elapsed_time(end) / 1000.0
+        self._pending.clear()
+        return self.seconds
+
+    class _Region:
+        def __init__(self, meter: "GpuBusyMeter"):
+            self.meter = meter
+            self.start_event = torch.cuda.Event(enable_timing=True)
+            self.end_event = torch.cuda.Event(enable_timing=True)
+
+        def __enter__(self):
+            self.start_event.record()
+            return self
+
+        def __exit__(self, *exc):
+            self.end_event.record()
+            self.meter._pending.append((self.start_event, self.end_event))
+            return False
+
+
+def _corpus_fingerprint_of(dataset: Any, cfg: DictConfig, logger) -> dict[str, Any]:
+    """Corpus identity for whatever dataset the loader ended up with.
+
+    ``PretrainImageFolderDataset`` knows its own sample list, which is the honest
+    answer -- it describes what will actually be read rather than what the
+    directory contains. The pickle-batch escape hatch has no per-file paths at
+    all, so it reports its length and no digest rather than a digest of nothing.
+    """
+    method = getattr(dataset, "corpus_fingerprint", None)
+    if callable(method):
+        return dict(method())
+    try:
+        return dict(corpus_fingerprint(str(cfg.data.root_path)))
+    except OSError as error:  # pragma: no cover - unreadable root
+        logger.warning("Could not fingerprint the corpus at %s (%s).", cfg.data.root_path, error)
+        return {}
+
+
+def _check_corpus(cfg: DictConfig, fingerprint: Mapping[str, Any], logger) -> None:
+    """Compare the corpus against what the config declares, and act on the verdict.
+
+    ``experiment.training.corpus_check`` is ``"warn"`` (default), ``"error"`` or
+    ``"off"``. The check is the class-count one -- stage 2's label indices come
+    from *sorted directory names*, so a corpus with a different number of
+    sub-variety directories produces an encoder whose downstream indices refer to
+    different classes, with nothing anywhere to say so.
+
+    Default ``warn`` rather than ``error`` because stage 1 is label-free and a
+    legitimate corpus (a subsample, a smoke tree, a partner-dataset screen) can
+    have any class count; ``error`` is what a publication run should set.
+    """
+    mode = str(OmegaConf.select(cfg, "experiment.training.corpus_check", default="warn") or "off")
+    if mode == "off":
+        return
+    expected = int(OmegaConf.select(cfg, "data.num_sub_varieties", default=0) or 0)
+    found = int(fingerprint.get("num_classes", 0))
+    if not expected or found == expected:
+        return
+    message = (
+        f"Corpus has {found} class directories but data.num_sub_varieties={expected}. Stage-2 "
+        "label indices come from sorted directory names, so an encoder pretrained on a corpus "
+        "with a different class set is not the encoder the downstream indices assume. Set "
+        "experiment.training.corpus_check=off if this is deliberate."
+    )
+    if mode == "error":
+        raise RuntimeError(message)
+    logger.warning(message)
+
+
 def save_dino_checkpoint(
     model: DINO,
     optimizer: optim.Optimizer,
@@ -858,6 +1012,114 @@ def save_resume_checkpoint(
         extra={"epoch": progress.epoch, **(extra or {})},
     )
     return checkpoint_manager.save(filename, payload, rolling_prefix=rolling_prefix)
+
+
+def write_stage1_summary(
+    save_path: Path,
+    cfg: DictConfig,
+    *,
+    criterion: CustomDINOLoss,
+    model: DINO,
+    transform,
+    fingerprint: Mapping[str, Any],
+    raw_coverage: Mapping[str, Any],
+    parameters: Mapping[str, int],
+    budget: StageOneBudget,
+    dynamics: Mapping[str, float],
+    runtime: Mapping[str, Any],
+    artifacts: Mapping[str, str],
+    context: DistributedContext,
+    logger,
+) -> str:
+    """Write ``summary.json`` beside the stage-1 checkpoints.
+
+    Stage 2 has written one since the beginning and ``scripts/generate_plots.py``
+    reads nothing else; stage 1 wrote checkpoints, ``events.jsonl`` and a table
+    printed into a log, so "what recipe produced this encoder?" meant parsing
+    3.7 MB of JSONL. A four-arm stage-1 comparison is only tractable when each
+    arm leaves exactly one machine-readable file, which is why
+    ``scripts/run_stage1_ablations.py`` reads this and nothing else.
+
+    Uses :class:`~src.utils.evaluation.RunSummary`, so the cross-run table
+    renders a stage-1 arm and a stage-2 variant without a special case. The three
+    fields that carry the stage-1-specific weight:
+
+    * ``loss_flags`` -- every objective-side setting an arm can move, from the
+      criterion itself, so a ``koleo_scope=all_views`` control is machine-
+      distinguishable from the default rather than distinguished only by its
+      directory name.
+    * ``split`` -- the **corpus fingerprint**, which is the field that would have
+      caught the shipped encoder having been trained on 8,173 of 9,357 crops.
+    * ``metrics`` -- the final ``KL(q||p)`` and teacher entropy with its bounds,
+      not the raw loss alone; see A4.
+    """
+    summary = RunSummary(
+        name=str(cfg.experiment.name),
+        group=str(OmegaConf.select(cfg, "experiment.group", default="stage1_pretraining")),
+        run_dir=str(save_path),
+        metrics=dict(dynamics),
+        efficiency={},
+        history={},
+        component_flags={
+            "stage": "pretrain",
+            "backbone": str(cfg.model.backbone.name),
+            "feature_stage_published": "final",
+            "pretrained_init": (
+                "imagenet"
+                if bool(OmegaConf.select(cfg, "model.backbone.pretrained", default=False))
+                else "random"
+            ),
+            "drop_path_rate": model.drop_path_rate,
+            "aux_stage": model.aux_stage,
+            "aux_weight": model.aux_weight if model.aux_stage is not None else None,
+            "koleo_space": str(
+                OmegaConf.select(cfg, "model.loss.koleo_space", default="bottleneck")
+            ),
+            **{f"params_{key}": int(value) for key, value in parameters.items()},
+        },
+        loss_flags=criterion.loss_flags(),
+        split={
+            "corpus": dict(fingerprint),
+            "raw_photograph_coverage": dict(raw_coverage),
+            # Stage 1 is TRANSDUCTIVE on this dataset: it self-distils on every
+            # crop, including crops of the photographs the evaluation and stage 2
+            # hold out. No labels leak and this is the standard in-domain SSL
+            # setting, but a paper claiming photograph-disjoint generalisation
+            # has to say so, and the direction is conservative -- the setup
+            # favours DINO.
+            "stage1_transductive": True,
+            "transductive_note": (
+                "Stage 1 self-distilled on every crop, including the photographs the readout "
+                "and stage 2 hold out. Labels never leak; the encoder is not photograph-disjoint "
+                "from the test split."
+            ),
+        },
+        fold_metrics={},
+        runtime={
+            "world_size": context.world_size,
+            "effective_batch_size": budget.effective_batch_size,
+            "physical_batch_size": budget.physical_batch_size,
+            "gradient_accumulation_steps": budget.gradient_accumulation_steps,
+            **dict(runtime),
+        },
+        config={
+            "backbone": str(cfg.model.backbone.name),
+            "image_size": int(cfg.data.image_size),
+            "local_crop_size": int(cfg.data.local_crop_size),
+            "num_crops": transform.num_crops,
+            "view_sizes": list(transform.view_sizes),
+            "view_ids": list(transform.view_ids),
+            "global_view_ids": list(transform.global_view_ids),
+            "epochs": int(cfg.experiment.training.epochs),
+            "seed": int(cfg.seed),
+            "augmentation": OmegaConf.to_container(cfg.data.augmentation, resolve=True),
+            "budget": budget.as_dict(),
+        },
+        artifacts=dict(artifacts),
+    )
+    path = summary.save(save_path)
+    logger.info("Wrote %s", path)
+    return path
 
 
 def publish_shared_backbone(cfg: DictConfig, backbone_file: Path, logger) -> Path | None:
@@ -976,7 +1238,12 @@ def main(cfg: DictConfig) -> None:
         # stays byte-identical to a single-process run.
         loader_generator.manual_seed(int(cfg.seed) + context.rank)
         num_workers = resolve_num_workers(
-            OmegaConf.select(cfg, "data.num_workers", default=8), context, logger=logger
+            OmegaConf.select(cfg, "data.num_workers", default=8),
+            context,
+            auto_cap=int(
+                OmegaConf.select(cfg, "data.num_workers_auto_cap", default=16) or 16
+            ),
+            logger=logger,
         )
         dataloader = get_pretrain_dataloader(
             data_dir=cfg.data.root_path,
@@ -997,6 +1264,10 @@ def main(cfg: DictConfig) -> None:
             logger=logger,
             world_size=context.world_size,
             rank=context.rank,
+            same_photo_local_views=int(
+                OmegaConf.select(cfg, "data.augmentation.same_photo_local_views", default=0) or 0
+            ),
+            seed=int(cfg.seed),
         )
         if len(dataloader) == 0:
             raise RuntimeError(
@@ -1006,6 +1277,48 @@ def main(cfg: DictConfig) -> None:
             )
         sampler = dataloader.sampler if context.enabled else None
         num_crops = transform.num_crops
+
+        # ------------------------------------------------------- corpus provenance
+        #
+        # The stage-1 -> stage-2 handoff is a bare `state_dict`, and until this
+        # block existed nothing anywhere recorded WHAT it was self-distilled on.
+        # That was not hypothetical: the shipped 100-epoch encoder was trained on
+        # 8,173 crops while the evaluation, stage 2 and every published number use
+        # 9,357, and the discrepancy was recoverable only by cross-reading two log
+        # lines against `metrics.json`.
+        #
+        # The digest is over the sorted list of dataset-relative paths, so it is
+        # stable across machines and mount points and changes the instant a file
+        # is added, removed or renamed. It travels into `events.jsonl`, into
+        # `summary.json` beside the checkpoints, and -- via that file --
+        # into `pretrain_eval`, which compares it against its own corpus and
+        # prints a prominent mismatch line.
+        fingerprint = _corpus_fingerprint_of(dataloader.dataset, cfg, logger)
+        coverage = {}
+        raw_root = OmegaConf.select(cfg, "data.raw_photographs_root", default=None)
+        if raw_root:
+            coverage = raw_photograph_coverage(str(raw_root), str(cfg.data.root_path))
+        if fingerprint:
+            logger.info(
+                "Corpus | %s images in %s classes from %s source photographs, digest %s "
+                "(root %s).",
+                fingerprint["num_samples"], fingerprint["num_classes"],
+                fingerprint["num_source_groups"], str(fingerprint["sha256"])[:16],
+                fingerprint["root"],
+            )
+            tracker.log_event("corpus", {**fingerprint, "raw_photograph_coverage": coverage})
+            _check_corpus(cfg, fingerprint, logger)
+        if coverage:
+            logger.warning(
+                "Raw photographs | %s of %s source photographs under %s were never cropped, so "
+                "this corpus covers %s scenes rather than %s. Scene count -- not crop count -- is "
+                "the binding constraint on photograph-disjoint generalisation. See "
+                "scripts/report_raw_photographs.py.",
+                coverage["num_unused_photographs"], coverage["num_raw_photographs"],
+                coverage["raw_root"], coverage["num_used_photographs"],
+                coverage["num_raw_photographs"],
+            )
+
         logger.info(
             "Loaded %s batches of %s images, %s views each (2 global + %s local).",
             len(dataloader),
@@ -1013,6 +1326,17 @@ def main(cfg: DictConfig) -> None:
             num_crops,
             cfg.data.augmentation.local_crops_number,
         )
+        same_photo_views = int(
+            OmegaConf.select(cfg, "data.augmentation.same_photo_local_views", default=0) or 0
+        )
+        if same_photo_views:
+            logger.warning(
+                "Provenance-derived positives ON: %s of %s local views are other crops of the "
+                "SAME source photograph. This changes what invariance is being learned. Gate the "
+                "result on the evaluation's within-class photograph decodability -- an arm that "
+                "raises it has learned the photograph confound, not the variety.",
+                same_photo_views, cfg.data.augmentation.local_crops_number,
+            )
         logger.info(
             "View geometry | emitted sizes=%s dtype=%s local upsample on %s",
             transform.view_sizes,
@@ -1167,19 +1491,82 @@ def main(cfg: DictConfig) -> None:
                 OmegaConf.select(cfg, "model.loss.sinkhorn_iterations", default=3)
             ),
             lambda_koleo=float(OmegaConf.select(cfg, "model.loss.lambda_koleo", default=0.0)),
+            koleo_scope=str(
+                OmegaConf.select(cfg, "model.loss.koleo_scope", default="per_view")
+            ),
+            koleo_reduction=str(
+                OmegaConf.select(cfg, "model.loss.koleo_reduction", default="mean")
+            ),
             context=context,
             distributed_sinkhorn=bool(
                 OmegaConf.select(cfg, "model.loss.distributed_sinkhorn", default=False)
             ),
         ).to(device)
+        koleo_space = str(OmegaConf.select(cfg, "model.loss.koleo_space", default="bottleneck"))
+        if koleo_space not in {"bottleneck", "backbone"}:
+            raise ValueError(
+                f"model.loss.koleo_space must be 'bottleneck' or 'backbone', got {koleo_space!r}"
+            )
         logger.info(
-            "Stage 1 objective: DINO self-distillation | centering=%s koleo=%s prototypes=%s "
-            "distributed_sinkhorn=%s",
+            "Stage 1 objective: DINO self-distillation | centering=%s koleo=%s (scope=%s, "
+            "space=%s) prototypes=%s distributed_sinkhorn=%s",
             criterion.centering,
             criterion.lambda_koleo,
+            criterion.koleo_scope,
+            koleo_space,
             int(cfg.model.head.out_dim),
             criterion.distributed_sinkhorn,
         )
+        if criterion.lambda_koleo > 0 and criterion.koleo_scope == "all_views":
+            logger.warning(
+                "koleo_scope=all_views applies the nearest-neighbour term ACROSS the two global "
+                "views, so the two views of one image are each other's closest pair and the "
+                "gradient pushes them apart -- an anti-alignment force on exactly the pair Eq. 1 "
+                "pulls together. This is the pre-audit behaviour, kept only as a control."
+            )
+
+        # The auxiliary stage head (the C4 arm). Off unless model.head.aux_stage
+        # is set, in which case a second DINO objective supervises `layers.2`
+        # directly instead of reaching it through two blocks optimised for the
+        # 2,048-prototype task at `layers.3`.
+        aux_enabled = model.aux_stage is not None
+        aux_criterion = None
+        if aux_enabled:
+            aux_criterion = CustomDINOLoss(
+                out_dim=int(
+                    OmegaConf.select(cfg, "model.head.aux_out_dim", default=None)
+                    or cfg.model.head.out_dim
+                ),
+                num_crops=num_crops,
+                warmup_teacher_temp=float(cfg.model.loss.warmup_teacher_temp),
+                teacher_temp=float(cfg.model.loss.teacher_temp),
+                warmup_teacher_temp_epochs=int(cfg.model.loss.warmup_teacher_temp_epochs),
+                num_epochs=int(cfg.experiment.training.epochs),
+                student_temp=float(cfg.model.loss.student_temp),
+                center_momentum=float(cfg.model.loss.center_momentum),
+                num_global_crops=2,
+                centering=str(OmegaConf.select(cfg, "model.loss.centering", default="sinkhorn")),
+                sinkhorn_iterations=int(
+                    OmegaConf.select(cfg, "model.loss.sinkhorn_iterations", default=3)
+                ),
+                # KoLeo is applied once, by the primary criterion, on the space
+                # `koleo_space` names. A second copy on the auxiliary head would
+                # double an unrelated regulariser as a side effect of enabling
+                # the arm, which would make the arm uninterpretable.
+                lambda_koleo=0.0,
+                context=context,
+                distributed_sinkhorn=bool(
+                    OmegaConf.select(cfg, "model.loss.distributed_sinkhorn", default=False)
+                ),
+            ).to(device)
+            logger.warning(
+                "Auxiliary stage-%s DINO head ON at weight %.3g (%.2f M parameters). The "
+                "objective now supervises layers.%s directly as well as the trunk output; this "
+                "confounds a simultaneous model.backbone.feature_stage change, so run it after "
+                "that decision, not beside it.",
+                model.aux_stage, model.aux_weight,
+                parameters["dino_aux_head"] / 1e6, model.aux_stage,
+            )
 
         # DDP goes on *after* the runtime options, so the compiled callables and
         # the SDPA rebinding are already in place when the reducer is built.
@@ -1311,6 +1698,26 @@ def main(cfg: DictConfig) -> None:
             entropy_min, entropy_max, int(cfg.model.head.out_dim),
             int(cfg.data.batch_size) * 2, criterion.centering,
         )
+        # Only ask the student pass for the pooled trunk feature when something
+        # will read it: returning it otherwise keeps a [6B, 768] tensor alive for
+        # the whole step for nothing.
+        need_backbone_koleo = koleo_space == "backbone" and criterion.lambda_koleo > 0
+        measure_gpu_busy = bool(
+            OmegaConf.select(cfg, "experiment.training.measure_gpu_busy", default=False)
+        )
+        busy_meter = GpuBusyMeter(device, measure_gpu_busy)
+        if measure_gpu_busy and not busy_meter.enabled:
+            logger.info(
+                "measure_gpu_busy has no effect on %s: there is no separate device queue to "
+                "time.", device.type,
+            )
+        elif busy_meter.enabled:
+            logger.warning(
+                "measure_gpu_busy is ON. It synchronises once per logging interval, so the "
+                "reported throughput is slightly pessimistic; use it to establish the real GPU "
+                "busy fraction, then turn it off for the production run."
+            )
+
         clip_grad = cfg.experiment.training.clip_grad
         save_interval = int(cfg.experiment.training.save_interval)
         # Permanently-kept milestone epochs. Named artifacts, so
@@ -1349,6 +1756,7 @@ def main(cfg: DictConfig) -> None:
         )
         global_step = resume.progress.global_step
         loss_history: list[float] = []
+        kl_history: list[float] = []
 
         momentum = momentum_start
         logger.info(
@@ -1424,8 +1832,20 @@ def main(cfg: DictConfig) -> None:
                 # Accumulated on the device. Summing `float(loss)` here would put
                 # a full pipeline stall in every micro-batch.
                 total_loss = torch.zeros((), device=device, dtype=torch.float32)
+                # A4: the reported loss is 95 % target entropy, so the epoch
+                # summary carries the decomposition rather than the sum alone.
+                # Both are device tensors read from `last_metric_tensors`, which
+                # does not synchronise -- the conversion happens once, at the
+                # epoch boundary, exactly as `total_loss` already does.
+                total_kl = torch.zeros((), device=device, dtype=torch.float32)
+                total_entropy = torch.zeros((), device=device, dtype=torch.float32)
+                # The primary cross-entropy term alone. `total_loss` is the whole
+                # objective and can carry KoLeo and the auxiliary head on top, so
+                # only THIS decomposes exactly as `CE = H + KL`.
+                total_ce = torch.zeros((), device=device, dtype=torch.float32)
                 batches_seen = 0
                 data_wait = 0.0
+                busy_meter.seconds = 0.0
                 model.train()
                 if device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats()
@@ -1497,22 +1917,44 @@ def main(cfg: DictConfig) -> None:
                     # identical result -- which on two T4s over PCIe is enough
                     # to make the two-GPU run slower than the one-GPU run.
                     sync_context = nullcontext() if is_step else model.no_sync()
-                    with sync_context:
+                    with sync_context, busy_meter.start():
                         with autocast_context(amp):
                             # One fused forward for the teacher's 2B globals ...
-                            teacher_out = model.forward_teacher_views(
-                                teacher_views, chunk_size=forward_chunk_size
+                            teacher_result = model.forward_teacher_views(
+                                teacher_views,
+                                chunk_size=forward_chunk_size,
+                                return_aux=aux_enabled,
+                            )
+                            teacher_out, teacher_aux = (
+                                teacher_result if aux_enabled else (teacher_result, None)
                             )
                             # ... and one for the student's 6B views, view-major.
-                            student_out, bottleneck = model.forward_student_views(
-                                student_views, return_bottleneck=True, chunk_size=forward_chunk_size
+                            student_result = model.forward_student_views(
+                                student_views,
+                                return_bottleneck=True,
+                                chunk_size=forward_chunk_size,
+                                return_features=need_backbone_koleo,
+                                return_aux=aux_enabled,
                             )
-                            # KoLeo measures uniformity of the *representation*,
-                            # so it reads the bottleneck of the global views, not
-                            # the prototype logits. The globals are the leading
-                            # 2B rows.
+                            student_out, bottleneck, *rest = student_result
+                            trunk_features = rest.pop(0) if need_backbone_koleo else None
+                            student_aux = rest.pop(0) if aux_enabled else None
+                            # KoLeo measures uniformity of the *representation*.
+                            # `bottleneck` is the head's 256-D L2-normalised
+                            # embedding, which stage 2 never sees;
+                            # `koleo_space=backbone` regularises the pooled trunk
+                            # feature instead -- the space that actually ships,
+                            # and the one DINOv2 applies KoLeo to. Either way the
+                            # rows handed over are the leading 2B GLOBAL views in
+                            # view-major order, which is what makes the per-view
+                            # chunking inside the loss meaningful.
+                            koleo_source = (
+                                trunk_features if koleo_space == "backbone" else bottleneck
+                            )
                             student_embeddings = (
-                                bottleneck[: 2 * batch_size] if criterion.lambda_koleo > 0 else None
+                                koleo_source[: 2 * batch_size]
+                                if criterion.lambda_koleo > 0
+                                else None
                             )
                             loss = criterion(
                                 student_out,
@@ -1528,6 +1970,16 @@ def main(cfg: DictConfig) -> None:
                                 teacher_view_ids=transform.global_view_ids,
                                 student_embeddings=student_embeddings,
                             )
+                            if aux_enabled:
+                                aux_criterion.metrics_enabled = will_log
+                                aux_loss = aux_criterion(
+                                    student_aux,
+                                    teacher_aux,
+                                    epoch=epoch,
+                                    student_view_ids=transform.view_ids,
+                                    teacher_view_ids=transform.global_view_ids,
+                                )
+                                loss = loss + model.aux_weight * aux_loss
 
                         scaled = loss / accumulation_steps
                         if scaler is not None:
@@ -1588,6 +2040,10 @@ def main(cfg: DictConfig) -> None:
                         micro_in_window += 1
 
                     total_loss += loss.detach().float()
+                    decomposition = criterion.last_metric_tensors
+                    total_kl += decomposition["teacher_student_kl"].float()
+                    total_entropy += decomposition["teacher_entropy_cross_view"].float()
+                    total_ce += decomposition["dino_cross_entropy"].float()
                     batches_seen += 1
 
                     if will_log:
@@ -1609,15 +2065,42 @@ def main(cfg: DictConfig) -> None:
                             "views_per_second": (
                                 batches_seen * batch_size * num_crops * context.world_size / elapsed
                             ),
-                            # If this is large the GPU is starving and the fix is
-                            # in data.num_workers / prefetch_factor /
-                            # cache_images, not in the model.
+                            # Wall clock the TRAINING LOOP spent blocked inside
+                            # the dataloader's `__next__`, as a share of the
+                            # epoch so far.
+                            #
+                            # It is NOT a GPU-idle fraction, and reading it as
+                            # one produces a wrong throughput number: nothing
+                            # synchronises inside the step (deliberately -- see
+                            # the module docstring), so the queued GPU work
+                            # drains *during* this window. The shipped run's
+                            # 0.916 was turned into "GPU-busy time = 13.34 h x
+                            # (1 - 0.916) = 1.12 h", which is the CPU *enqueue*
+                            # time. The metric's direction and its operational
+                            # conclusion ("the loader is the bottleneck") are
+                            # right; the derived FLOP/s figure is not.
+                            #
+                            # `experiment.training.measure_gpu_busy=true` adds a
+                            # genuinely synchronised measurement below, at the
+                            # cost of one stall per logging step.
+                            "loop_blocked_fraction": data_wait / elapsed,
+                            # Retained under its historical name so a figure or a
+                            # parser written against the shipped run keeps
+                            # working. Same number, better name above.
                             "data_wait_fraction": data_wait / elapsed,
                             # The loss curve of a partially collapsed run looks
                             # perfectly plausible. These are the numbers that do
                             # not.
                             **criterion.last_metrics,
                         }
+                        if busy_meter.enabled:
+                            busy_seconds = busy_meter.drain()
+                            step_metrics["gpu_busy_fraction"] = busy_seconds / elapsed
+                            step_metrics["gpu_busy_seconds"] = busy_seconds
+                        if aux_criterion is not None:
+                            step_metrics.update(
+                                {f"aux_{key}": value for key, value in aux_criterion.last_metrics.items()}
+                            )
                         if gradient_norm is not None:
                             step_metrics["gradient_norm"] = gradient_norm
                         if clipped_norm is not None:
@@ -1626,12 +2109,15 @@ def main(cfg: DictConfig) -> None:
                             step_metrics["grad_scale"] = float(scaler.get_scale())
                         tracker.log_metrics(step_metrics, global_step, prefix="train")
                         logger.info(
-                            "Step %s | epoch=%s batch=%s loss=%.5f lr=%.6g tau_t=%.4f "
-                            "img/s=%.1f data_wait=%.1f%%",
+                            "Step %s | epoch=%s batch=%s loss=%.5f | CE=%.5f = KL %.5f + H %.5f "
+                            "| lr=%.6g tau_t=%.4f img/s=%.1f loop_blocked=%.1f%%",
                             global_step, epoch + 1, batch_idx + 1, step_metrics["loss"],
+                            step_metrics.get("dino_cross_entropy", float("nan")),
+                            step_metrics.get("teacher_student_kl", float("nan")),
+                            step_metrics.get("teacher_entropy_cross_view", float("nan")),
                             lr, criterion.teacher_temperature(epoch),
                             step_metrics["images_per_second"],
-                            step_metrics["data_wait_fraction"] * 100.0,
+                            step_metrics["loop_blocked_fraction"] * 100.0,
                         )
 
                     if is_step and global_step % device_every_steps == 0:
@@ -1746,11 +2232,20 @@ def main(cfg: DictConfig) -> None:
                         epoch + 1, skip_batches, len(dataloader),
                     )
                     average_loss = float("nan")
+                    average_kl = float("nan")
+                    average_entropy = float("nan")
+                    average_ce = float("nan")
                 else:
                     # Both are per-rank sums over an identical batch count, so
                     # the mean of the means is the global mean.
                     average_loss = float(all_reduce_mean(total_loss / batches_seen, context))
+                    average_kl = float(all_reduce_mean(total_kl / batches_seen, context))
+                    average_entropy = float(
+                        all_reduce_mean(total_entropy / batches_seen, context)
+                    )
+                    average_ce = float(all_reduce_mean(total_ce / batches_seen, context))
                     loss_history.append(average_loss)
+                    kl_history.append(average_kl)
                 epoch_seconds = time.perf_counter() - epoch_started
 
                 if scheduler is not None:
@@ -1774,6 +2269,19 @@ def main(cfg: DictConfig) -> None:
 
                 epoch_metrics = {
                     "loss": average_loss,
+                    # The decomposition, at epoch resolution. `loss` is a cross
+                    # entropy, so `loss = teacher_entropy_cross_view +
+                    # teacher_student_kl` exactly, and only the second term is
+                    # the student learning. Read THIS as the learning curve --
+                    # on the shipped run the raw loss was flat from epoch 20
+                    # while the KL kept falling to epoch 93.
+                    "teacher_student_kl": average_kl,
+                    "teacher_entropy_cross_view": average_entropy,
+                    # `dino_cross_entropy == teacher_entropy_cross_view +
+                    # teacher_student_kl` exactly. `loss` equals it too unless
+                    # KoLeo or an auxiliary head is on, in which case `loss` is
+                    # the full objective and this is its Eq. 1 term.
+                    "dino_cross_entropy": average_ce,
                     "duration_seconds": epoch_seconds,
                     "batches": batches_seen * context.world_size,
                     "lr": new_lr,
@@ -1781,8 +2289,12 @@ def main(cfg: DictConfig) -> None:
                     "images_per_second": (
                         batches_seen * int(cfg.data.batch_size) * context.world_size / epoch_seconds
                     ),
+                    "loop_blocked_fraction": data_wait / epoch_seconds,
+                    # Same number under its historical name; see the step metrics.
                     "data_wait_fraction": data_wait / epoch_seconds,
                 }
+                if busy_meter.enabled:
+                    epoch_metrics["gpu_busy_fraction"] = busy_meter.drain() / epoch_seconds
                 images_processed += batches_seen * int(cfg.data.batch_size) * context.world_size
                 if device.type == "cuda":
                     epoch_metrics["peak_memory_mb"] = torch.cuda.max_memory_allocated() / 1024**2
@@ -1797,11 +2309,12 @@ def main(cfg: DictConfig) -> None:
                     )
                 tracker.log_metrics(epoch_metrics, epoch + 1, prefix="epoch")
                 logger.info(
-                    "Epoch %s/%s | loss=%.5f batches=%s duration=%.2fs img/s=%.1f "
-                    "data_wait=%.1f%% peak_mem=%.0fMB",
-                    epoch + 1, epochs, average_loss, batches_seen, epoch_seconds,
+                    "Epoch %s/%s | loss=%.5f | CE %.5f = KL %.5f + H %.5f | batches=%s "
+                    "duration=%.2fs img/s=%.1f loop_blocked=%.1f%% peak_mem=%.0fMB",
+                    epoch + 1, epochs, average_loss, average_ce, average_kl, average_entropy,
+                    batches_seen, epoch_seconds,
                     epoch_metrics["images_per_second"],
-                    epoch_metrics["data_wait_fraction"] * 100.0,
+                    epoch_metrics["loop_blocked_fraction"] * 100.0,
                     epoch_metrics.get("peak_memory_mb", 0.0),
                 )
 
@@ -1818,7 +2331,16 @@ def main(cfg: DictConfig) -> None:
                 if figure_every > 0 and (epoch + 1) % figure_every == 0 and len(loss_history) > 1:
                     tracker.log_figure(
                         "pretrain/loss_curve",
-                        plot_loss_curves({"DINO loss": loss_history}, title="DINO pretraining loss"),
+                        plot_loss_curves(
+                            {
+                                # KL first so it owns the legend order: it is the
+                                # learnable half and the raw cross entropy is
+                                # mostly the teacher's entropy.
+                                "KL(teacher||student)": kl_history,
+                                "DINO loss (CE)": loss_history,
+                            },
+                            title="DINO pretraining: cross entropy and its learnable part",
+                        ),
                         epoch + 1,
                     )
 
@@ -1920,6 +2442,42 @@ def main(cfg: DictConfig) -> None:
             if budget_enabled and context.is_main:
                 logger.info("Stage-1 budget (interrupted segment)\n%s", budget.format_table())
                 tracker.log_event("stage1_budget", {"phase": "interrupted", **budget.as_dict()})
+            if context.is_main:
+                # A summary for the segment that ran, flagged as incomplete. On a
+                # preemptible platform this is the only path that ever executes,
+                # so skipping it would leave the arm with no machine-readable
+                # trace at all -- and `run_stage1_ablations.py` reads exactly
+                # this file to decide whether an arm produced anything.
+                write_stage1_summary(
+                    save_path,
+                    cfg,
+                    criterion=criterion,
+                    model=model,
+                    transform=transform,
+                    fingerprint=fingerprint,
+                    raw_coverage=coverage,
+                    parameters=parameters,
+                    budget=budget,
+                    dynamics={
+                        "final_loss": loss_history[-1] if loss_history else float("nan"),
+                        "final_teacher_student_kl": kl_history[-1] if kl_history else float("nan"),
+                        "epochs_completed": float(len(loss_history)),
+                        "global_step": float(global_step),
+                    },
+                    runtime={
+                        "amp": amp.label,
+                        "device": str(device),
+                        "completed": False,
+                        "interrupted_at_step": global_step,
+                        "note": (
+                            "Interrupted run. Every figure here describes the segment that "
+                            "executed, not the configured schedule."
+                        ),
+                    },
+                    artifacts={"events": str(Path(output_dir) / "events.jsonl")},
+                    context=context,
+                    logger=logger,
+                )
             return
 
         # ------------------------------------------------------- final saves
@@ -1947,11 +2505,22 @@ def main(cfg: DictConfig) -> None:
             if loss_history:
                 tracker.log_figure(
                     "pretrain/loss_curve",
-                    plot_loss_curves({"DINO loss": loss_history}, title="DINO pretraining loss"),
+                    plot_loss_curves(
+                        {
+                            "KL(teacher||student)": kl_history,
+                            "DINO loss (CE)": loss_history,
+                        },
+                        title="DINO pretraining: cross entropy and its learnable part",
+                    ),
                     epochs,
                 )
             tracker.log_artifact(backbone_file, name="dino_pretrained_backbone", artifact_type="model")
         barrier(context)
+
+        # ---------------------------------------------------- run artifacts
+        # `summary.json` is written before the budget's runtime half is folded
+        # in below, so the wall-clock figures are added by a second write. One
+        # file, two writes, rather than a partial file if the second half fails.
 
         total_seconds = time.perf_counter() - training_started
         tracker.log_event(
@@ -1981,6 +2550,52 @@ def main(cfg: DictConfig) -> None:
             logger.info("Stage-1 budget (final)\n%s", budget.format_table())
             tracker.log_metrics(budget.as_metrics(), step=global_step)
             tracker.log_event("stage1_budget", {"phase": "final", **budget.as_dict()})
+
+        if context.is_main:
+            summary_path = write_stage1_summary(
+                save_path,
+                cfg,
+                criterion=criterion,
+                model=model,
+                transform=transform,
+                fingerprint=fingerprint,
+                raw_coverage=coverage,
+                parameters=parameters,
+                budget=budget,
+                dynamics={
+                    "final_loss": loss_history[-1] if loss_history else float("nan"),
+                    "final_teacher_student_kl": kl_history[-1] if kl_history else float("nan"),
+                    "initial_teacher_student_kl": kl_history[0] if kl_history else float("nan"),
+                    "min_teacher_student_kl": min(kl_history) if kl_history else float("nan"),
+                    "initial_loss": loss_history[0] if loss_history else float("nan"),
+                    "teacher_entropy_floor": entropy_min,
+                    "teacher_entropy_ceiling": entropy_max,
+                    "epochs_completed": float(epochs),
+                    "global_step": float(global_step),
+                    "wall_clock_seconds": total_seconds,
+                    "peak_allocated_gb": run_peak_allocated_gb,
+                    "learning_rate": learning_rate,
+                },
+                runtime={
+                    "amp": amp.label,
+                    "device": str(device),
+                    "num_workers": num_workers,
+                    "wall_clock_seconds": total_seconds,
+                    "peak_allocated_gb": run_peak_allocated_gb,
+                    "peak_reserved_gb": run_peak_reserved_gb,
+                    **{f"runtime_{key}": value for key, value in runtime.items()},
+                    **distributed_runtime,
+                    "learning_rate_provenance": lr_provenance,
+                },
+                artifacts={
+                    "final_checkpoint": str(final_file),
+                    "student_backbone": str(backbone_file),
+                    "events": str(Path(output_dir) / "events.jsonl"),
+                },
+                context=context,
+                logger=logger,
+            )
+            tracker.log_event("stage1_summary", {"path": summary_path})
 
         logger.info(
             "Pretraining complete in %.2fs. Final: %s. Backbone for stage 2: %s",

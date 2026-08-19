@@ -58,3 +58,33 @@ use_batch_norm: "layer"
 # implementation; combined with `freeze_last_layer_epochs` this is what keeps
 # the first epoch stable.
 norm_last_layer: true
+
+# ---------------------------------------------------------------------------
+# Auxiliary head on an intermediate trunk stage (STAGE1_CHANGES.md C4).
+#
+# null (the default) is plain DINO: one head, on the pooled trunk output.
+#
+# `aux_stage: 2` attaches a SECOND DINO head, with its own prototypes and its
+# own EMA teacher copy, to the mean-pooled output of `layers.2`, and the trainer
+# adds `aux_weight * L_aux` to the objective.
+#
+# The argument for it. `model.backbone.feature_stage=stage3` fixes WHERE stage 2
+# reads; it does not fix the fact that the stage-1 gradient reaches `layers.2`
+# only through two blocks being optimised for something else. Linear CKA against
+# the ImageNet initialisation was 0.103 at `layers.3` against 0.390 at
+# `layers.2` on the shipped run -- the objective consumed the last stage. If the
+# objective supervises `layers.2` directly, the layer that ships is the layer
+# that was trained.
+#
+# The arguments against, which is why it is off. Two heads is more parameters,
+# more prototypes to keep alive and an extra weight to tune, and a multi-level
+# objective can make the shallower stage merely mimic the deeper one. It is also
+# CONFOUNDED with the `feature_stage` decision: run it after that has been
+# settled, never beside it. Judge it on `layerwise_probe/stage3` and on
+# `cka_vs_imagenet_init` per stage, which should rise at layers.3 and fall at
+# layers.2 -- if `layers.2`'s probe does not move, the answer is no.
+#
+# `aux_out_dim: null` reuses `out_dim`.
+aux_stage: null
+aux_out_dim: null
+aux_weight: 1.0

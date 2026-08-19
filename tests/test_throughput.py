@@ -177,7 +177,23 @@ def test_diagnostics_stay_on_device_until_asked_for():
     loss_fn._metric_tensors.clear()
     loss_fn.metrics_enabled = False
     loss_fn(student, teacher, epoch=0, student_embeddings=torch.randn(6, 16))
-    assert loss_fn._metric_tensors == {}, "diagnostics were computed on a non-logging step"
+    # The COLLAPSE diagnostics are gated; the loss decomposition and KoLeo are
+    # not, and deliberately so. `teacher_student_kl` is the only honest learning
+    # curve this objective has -- the reported cross entropy is ~95 % target
+    # entropy -- so its epoch mean has to see every micro-batch to be an epoch
+    # mean at all. All four stay DEVICE TENSORS, so the cost is two reductions
+    # over an already-materialised tensor and no synchronisation, which is the
+    # property this test exists to protect.
+    assert set(loss_fn._metric_tensors) == {
+        "dino_cross_entropy",
+        "teacher_entropy_cross_view",
+        "teacher_student_kl",
+        "koleo",
+    }, "a gated diagnostic was computed on a non-logging step"
+    assert all(torch.is_tensor(value) for value in loss_fn._metric_tensors.values())
+    assert all(torch.is_tensor(value) for value in loss_fn.last_metric_tensors.values())
+    for gated in ("teacher_entropy", "prototype_kl_to_uniform", "prototype_perplexity"):
+        assert gated not in loss_fn._metric_tensors
 
 
 # ------------------------------------------------------- transforms and views

@@ -153,3 +153,63 @@ layer's weight-norm gain is frozen, and its gradients are cancelled for the firs
 epoch (`freeze_last_layer_epochs`) — the prototype layer is where a collapsing
 run collapses first. `_set_weight_norm_gain` handles both PyTorch weight-norm
 APIs, since the legacy `weight_g` attribute moved under `parametrizations`.
+
+## `feature_stage` — which trunk stage the encoder reads
+
+`BackboneFeatureExtractor(feature_stage=...)`, plumbed through
+`DinoV2SwinV2Encoder` and `model.backbone.feature_stage`:
+
+| Value | Reads | Shape at 256 px (Tiny/Small) |
+| --- | --- | --- |
+| `final` (default) | `forward_features` — `layers.3` after the trunk's `norm` | `8×8×768` |
+| `stage3` | `layers.2` | `16×16×`**384** |
+| `stage3_pooled_2x2` | `layers.2`, 2×2 average-pooled | `8×8×384` |
+
+`final` is what every published number was produced under and stays the default.
+The reason to consider `stage3` is measured: linear CKA between the shipped DINO
+encoder and its ImageNet initialisation is 0.976 / 0.960 / 0.390 / **0.103**
+across `layers.0..3` — self-distillation rewrote the last stage to serve its
+2,048-prototype head, and that is the stage stage 2 reads. On the
+photograph-disjoint out-of-fold probe `layers.2` scored **+3.25 pp** (linear) and
+**+3.90 pp** (512-unit MLP) over the pooled final stage, and the ordering held for
+the plain ImageNet weights, so it is not an artefact of one checkpoint.
+Concatenating all four stages was no better than `layers.2` alone — a
+*replacement*, not a fusion.
+
+Three implementation facts:
+
+- **`feature_dim` reports the emitted width**, 384 under `stage3`, not the trunk's
+  768. Reporting the trunk width would build the Eq. 4 projection with the wrong
+  input size and surface as a shape error several modules downstream.
+  `backbone_feature_dim` still reports the trunk's own.
+- **It changes what is read, never what is stored.** Every existing checkpoint
+  loads at every stage with zero missing keys.
+- **`stage3` quadruples the token count** (256 vs 64), which quadruples the MoE's
+  routing slots and makes the Eq. 11 cross-attention 16× as expensive.
+  `stage3_pooled_2x2` restores the budget. Note also that the +3.25 pp was
+  measured on the *mean-pooled* stage-3 feature; grid routing over stage-3 tokens
+  is a different measurement.
+
+Extraction uses timm's `forward_intermediates(..., stop_early=True)`, so reading
+`layers.2` genuinely skips the blocks after it rather than running the whole trunk
+with a hook on it. A build without that method falls back to a forward hook, and
+`tests/test_stage1_changes.py` pins that the two produce bit-identical tensors.
+
+## The auxiliary stage head
+
+`DINO(aux_stage=2, aux_out_dim=..., aux_weight=...)` attaches a second DINO head,
+with its own prototypes and its own EMA teacher copy, to the mean-pooled output of
+`layers.2`. Off by default (`model.head.aux_stage: null`), in which case nothing
+is allocated at all — `parameter_summary()["dino_aux_head"]` is 0 and `ema_pairs()`
+has two entries, so an ablation's parameter count stays honest.
+
+`feature_stage` fixes *where stage 2 reads*; this fixes what the deep layers are
+optimised **for**. The two are confounded and must not be run together.
+
+The capture is a forward hook installed for the duration of one forward
+(`DINO.capture_aux`), not a second forward pass: the auxiliary objective
+supervises the same activations the primary one produces, and recomputing them
+would double the trunk cost and — under stochastic depth — not even produce the
+same tensor. The head is registered on the DDP wrapper so its gradients are
+reduced, and `student_backbone.state_dict()` — the only handoff to stage 2 — is
+byte-identical with or without it.

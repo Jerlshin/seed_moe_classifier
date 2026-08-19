@@ -1,0 +1,48 @@
+# Phase 0 of the STAGE1_CHANGES.md sequence: no training at all.
+#
+#   python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase0.yaml
+#
+# Everything here is a frozen forward pass plus a probe, so the whole phase is a
+# day of wall clock and it gates every arm that follows.
+#
+# The steps this manifest automates are 0.3-0.5 of the sequence's table. The
+# other three are code, not runs, and they ship before this:
+#
+#   0.1  A2/A3/A4/A6 -- corpus fingerprint, match_view_lowpass key, the KL
+#        metric, stage-1 summary.json.
+#   0.2  B3/G1/G4 -- workers and both GPUs. Gate: epoch/loop_blocked_fraction
+#        below 0.3 in epoch 1 of a 2-epoch smoke run.
+#   0.6  B4 -- crop the 18 unused source photographs, IF they are usable. Inspect
+#        them first (`python scripts/report_raw_photographs.py`): an out-of-focus
+#        photograph added to the SSL corpus is worse than nothing, and
+#        republishing the corpus moves every published accuracy, so it is a
+#        deliberate re-baseline rather than a step in a script.
+
+experiment: eval_pretrain_representation
+
+common: []
+
+arms:
+  - name: readout-screen
+    description: >-
+      Step 0.4 -- B1 screening. Probe pooled, layers.2 and the 2x2-pooled
+      layers.2 for every existing encoder. Gate: confirm the ~+3 pp at layers.2
+      and pick the readout stage 2 will consume. Needs no stage-1 retraining,
+      which makes it the cheapest real gain available.
+    train: false
+    evaluate: true
+    eval_experiment: eval_pretrain_representation
+    eval_overrides:
+      - experiment.evaluation.readout.stages=[pooled,stage3]
+      - experiment.evaluation.layerwise.all_encoders=true
+
+  - name: backbone-screen
+    description: >-
+      Step 0.5 -- B2/B5 screening, including the missing
+      `swinv2_base_window16_256.ms_in1k` control that separates *capacity* from
+      the *IN-22k corpus*. Gate: pick the trunk and the input resolution. Do not
+      adopt Base until the IN-1k Base row has run.
+    train: false
+    evaluate: true
+    eval_experiment: screen_backbones
+    eval_overrides: []

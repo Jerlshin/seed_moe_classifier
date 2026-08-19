@@ -320,15 +320,37 @@ class DataAugmentationDINO:
         """Identifiers of the views the teacher sees."""
         return [0, 1]
 
-    def __call__(self, image: Image.Image):
+    def __call__(
+        self,
+        image: Image.Image,
+        partner_images: Sequence[Image.Image] | None = None,
+    ):
         """Return ``(original_tensor, [global_1, global_2, *locals])``.
 
         ``original_tensor`` is ``None`` when ``return_original=False``; the
         multi-crop collate drops it in that case rather than trying to batch it.
+
+        ``partner_images`` replaces the **trailing** local views with local crops
+        of those images instead of the anchor -- the provenance-derived positives
+        of ``STAGE1_CHANGES.md`` F1, where the partners are other crops of the
+        same source photograph. The view *count* is unchanged, so the loss's
+        cross-view pairing, ``view_ids`` and every shape downstream are untouched;
+        only what view 2..V depict changes. Supplying more partners than there are
+        local views is an error rather than a silent truncation, because the
+        difference between "two of four" and "all four" is the arm.
         """
         image = image.convert("RGB")
+        partners = list(partner_images or ())
+        if len(partners) > self.local_crops_number:
+            raise ValueError(
+                f"{len(partners)} partner images were supplied for {self.local_crops_number} "
+                "local views; there is nowhere to put the extras."
+            )
         crops = [self.global_transform_1(image), self.global_transform_2(image)]
-        crops.extend(self.local_transform(image) for _ in range(self.local_crops_number))
+        anchors = [image] * (self.local_crops_number - len(partners)) + [
+            partner.convert("RGB") for partner in partners
+        ]
+        crops.extend(self.local_transform(source) for source in anchors)
         original = self.original_transform(image) if self.return_original else None
         return original, crops
 
@@ -348,6 +370,12 @@ def get_dino_transforms(
     params = dict(augmentation_cfg or {})
     # `local_crop_size` lives on the data node, not inside `augmentation`.
     params.pop("local_crop_size", None)
+    # `same_photo_local_views` is an *augmentation policy* -- which is why it
+    # lives in this node -- but it is consumed by the dataset, which owns the
+    # source-photograph index needed to draw a partner. The transform only has to
+    # accept partner images when it is handed some, so the key is dropped here
+    # rather than becoming a constructor argument that would have nothing to do.
+    params.pop("same_photo_local_views", None)
     params.update({key: value for key, value in overrides.items() if value is not None})
     return DataAugmentationDINO(image_size=image_size, local_crop_size=local_crop_size, **params)
 

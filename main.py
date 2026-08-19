@@ -3,6 +3,8 @@
     python main.py pretrain                   # DINO self-supervised pretraining
     python main.py pretrain --gpus 2          # the same, over 2 GPUs with DDP
     python main.py eval-pretrain              # evaluate the stage-1 representation
+    python main.py screen-backbones           # Phase 0: initialisation screen, no training
+    python main.py eval-frozen                # the frozen-trunk reference stage 1 must beat
     python main.py finetune                   # hierarchical MoE finetuning
     python main.py ablation                   # flat-classifier ablation
     python main.py smoke                      # 2-batch dry run of both stages
@@ -38,6 +40,14 @@ layout, shared-checkpoint reuse and result aggregation:
     python scripts/generate_plots.py          # figures + summary_metrics.csv
     python scripts/dry_run.py                 # synthetic end-to-end smoke test
 
+Stage-1 arm suites (the STAGE1_CHANGES.md sequence) have their own runner, which
+pins per-arm checkpoint, publication and evaluation paths -- without that, arms
+silently overwrite each other's encoders and each other's eval output:
+
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase0.yaml
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml
+    python scripts/report_raw_photographs.py  # source photographs never cropped
+
 Each stage runs in a subprocess so Hydra owns its own working directory and
 logging configuration, exactly as if the module were launched directly.
 """
@@ -61,10 +71,30 @@ EVAL_PRETRAIN = [
     "src.trainers.pretrain_eval",
     "experiment=eval_pretrain_representation",
 ]
+# Phase-0 screens: no training, no checkpoint written, no handoff touched.
+#
+# `screen-backbones` is the initialisation screen. It is worth running first
+# because the stage-1 evaluation's own decomposition is
+# `random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO`: the initialisation was
+# never treated as a variable and is worth 79x what the self-distillation run
+# bought. It includes the `swinv2_base_window16_256.ms_in1k` control that
+# separates *capacity* from the *IN-22k corpus*, which is the row that decides
+# the trunk.
+#
+# `eval-frozen` is the reference every stage-1 arm is measured against: the
+# chosen trunk, frozen, with no in-domain training at all.
+SCREEN_BACKBONES = [
+    sys.executable, "-m", "src.trainers.pretrain_eval", "experiment=screen_backbones",
+]
+EVAL_FROZEN = [
+    sys.executable, "-m", "src.trainers.pretrain_eval", "experiment=eval_frozen_reference",
+]
 
 COMMANDS: dict[str, list[list[str]]] = {
     "pretrain": [PRETRAIN],
     "eval-pretrain": [EVAL_PRETRAIN],
+    "screen-backbones": [SCREEN_BACKBONES],
+    "eval-frozen": [EVAL_FROZEN],
     "finetune": [FINETUNE],
     "ablation": [ABLATION],
 }
@@ -116,8 +146,9 @@ def main() -> int:
         help=(
             "Processes to launch with DDP: a count, or 'auto' for every visible CUDA "
             "device. Delegates to scripts/launch.py. Not available for 'smoke', which "
-            "is a shape check rather than a training run, nor for 'eval-pretrain', "
-            "which is one forward pass per encoder and has no gradient to reduce."
+            "is a shape check rather than a training run, nor for the evaluation and "
+            "screening stages, which are one forward pass per encoder and have no "
+            "gradient to reduce."
         ),
     )
     # `parse_known_args`, not a REMAINDER positional: a REMAINDER swallows

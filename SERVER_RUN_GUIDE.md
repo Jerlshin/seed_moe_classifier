@@ -128,10 +128,20 @@ single- or multi-GPU depending on `GPUS`.
 ### 3.3 Stage 1 — DINO self-supervised pretraining (run once)
 
 ```bash
-python main.py pretrain
+python main.py pretrain data.num_workers=16
 # equivalent to:
 python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
 ```
+
+> **Set `data.num_workers` on a server.** The published 13.34-hour run carried
+> `data.num_workers=0` on a 48-physical-core host and spent a mean **91.6 %** of
+> its wall clock blocked in the dataloader. One sample costs six independent PIL
+> chains, so the loader — not the GPU — set the throughput. `auto` now caps at
+> **16** per rank (`data.num_workers_auto_cap`, raised from 8, which was chosen
+> for a 4-vCPU Kaggle instance). This changes who computes an augmentation, never
+> what it is: the objective and every reported number are unaffected. Watch
+> `epoch/loop_blocked_fraction` in epoch 1; if it does not fall below ~0.3 the
+> bottleneck is elsewhere and every cost estimate below has to be redone.
 
 Produces and publishes the **one** encoder checkpoint every downstream run
 reads: `${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth`. Do not
@@ -170,6 +180,34 @@ every later candidate), reports peak VRAM and img/s per size, and names the
 largest that fits. Raise `data.batch_size` and
 `experiment.training.effective_batch_size` **together** so accumulation stays 1;
 the learning rate re-derives itself from the effective batch.
+
+**Reading the log.** Two lines are easy to misread:
+
+```
+Step 1200 | epoch=10 batch=45 loss=5.67 | CE=5.67 = KL 0.29 + H 5.38 | ... loop_blocked=8.1%
+```
+
+- `loss` is a cross entropy, so `CE = H(teacher) + KL(teacher‖student)`. Under
+  Sinkhorn centering `H` is set by the normaliser, `K`, `B_teacher` and the
+  temperature schedule — **none of which is the student learning**. On the
+  published run 80 % of the total loss drop was `H` falling and the final loss was
+  94.8 % irreducible target entropy. **Read `KL`.** An arm that changes the
+  centering moves `H` directly, so its raw loss is not comparable to another
+  arm's.
+- `loop_blocked` is the share of wall clock the *loop* spent inside the
+  dataloader. Nothing synchronises inside the step, so the queued GPU work drains
+  during that window — it upper-bounds idleness rather than measuring it. For the
+  real figure, add `experiment.training.measure_gpu_busy=true` (one stall per
+  logging interval; leave it off for the production run).
+
+**What the run records about itself.** It writes `summary.json` beside the
+checkpoints: the resolved augmentation, the view geometry, the effective batch,
+the LR provenance, every objective-side flag, the final `KL`, and a **corpus
+fingerprint** — a SHA-256 over the sorted dataset-relative path list plus the
+sample, class and source-group counts. That last one exists because the published
+encoder turned out to have been self-distilled on **8,173** crops while everything
+downstream used 9,357, with nothing on disk recording it. `eval-pretrain` reads
+the fingerprint back and prints a prominent mismatch line when the corpora differ.
 
 **On two GPUs**, and on any platform that ends the session before the run does:
 
@@ -283,6 +321,60 @@ decide whether stage 1 earned its cost are `dino_epoch100` against
 `imagenet_init`; the two that decide whether the *epochs* earned theirs are
 `dino_epoch25`/`dino_epoch50` against `dino_epoch100`. Interpretation and the
 recommendations that follow: [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md).
+
+Three columns added after the stage-1 audit, and what they are for:
+
+| Column | Read it as |
+| --- | --- |
+| `nuisance_photo_above_chance` | how much **photograph nuisance** survives, class held constant. The shipped run cut it from +10.0 pp (ImageNet) to +3.5 pp — the one axis stage 1 demonstrably moved. Read **jointly** with the readout: an encoder that discards everything scores chance |
+| `oof_probe_sub_accuracy_at_stage3` | the same headline probe at `layers.2` rather than the pooled output stage 2 consumes. `layers.2` scored +3.25 pp in the audit, and the ordering held for the plain ImageNet weights too |
+| the `handcrafted_floor` row | ten image statistics under the identical protocol. They reach 0.5360, which is 15.6 pp **above** an untrained 48.96 M trunk. A deep encoder that does not clear this comfortably is not doing much |
+
+### 3.3c Two screens that need no training at all
+
+Both are one forward pass per row, cached by checkpoint digest afterwards, and
+neither writes a checkpoint or touches the published handoff.
+
+```bash
+# Which INITIALISATION transfers best? The evaluation's own decomposition is
+# random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO: the initialisation is
+# worth 79x what the 13.34-hour run bought, and was never treated as a variable.
+python main.py screen-backbones
+
+# The reference every stage-1 arm must beat: the chosen trunk, frozen, no
+# in-domain training. If no arm beats it by more than a fold SD, stage 1 as an
+# OBJECTIVE is not earning its compute.
+python main.py eval-frozen
+```
+
+`screen-backbones` downloads several timm checkpoints, so run it while the box has
+network. The row to look at first is `base_in1k`: Base capacity at the *same*
+IN-1k corpus, which separates **capacity** from **the IN-22k corpus**. ≈0.63 means
+capacity (and Tiny is then the efficient choice — it is −0.32 pp pooled and
+**+0.69 pp at `layers.2`** against Small for half the FLOPs); ≈0.61 means the
+corpus. **Do not adopt Base before that row has run.**
+
+### 3.3d Stage-1 arm suites
+
+```bash
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --dry-run
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml     --experiment pretrain_swinv2_tiny_dino
+```
+
+Each arm trains, then evaluates, into its own directory under
+`${SEED_OUTPUT_DIR}/stage1_arms/<arm>/`, with `experiment.training.save_path`,
+`shared_backbone_path` and `experiment.evaluation.save_path` **all** pinned per
+arm. That is the whole reason the script exists: left at their defaults, every arm
+publishes over `outputs/checkpoints/dinov2_swinv2_pretrained.pth` and the last one
+to finish silently becomes the encoder every stage-2 run reads.
+
+Do **not** shard arms across GPUs. A stage-1 arm saturates one device, so two
+concurrent arms halve each other's throughput; use both devices *within* an arm
+(`python main.py pretrain --gpus 2` with `effective_batch_size` pinned).
+
+The suite writes `stage1_arms/stage1_arm_results.csv` and prints the same table.
+Judge on `oof_probe_sub_accuracy_testable_classes` with the fold SD — a single arm
+cannot resolve a difference below ~2 pp, which is why Phase 3 exists.
 
 ### 3.4 Stage 2 — single finetune run (smoke-test the head before the full suite)
 

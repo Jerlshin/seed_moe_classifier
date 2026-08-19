@@ -58,11 +58,13 @@ python -m pip install -e ".[tracking,dev]"
 ### Single stages
 
 ```bash
-python main.py pretrain       # stage 1: DINO self-supervised pretraining
-python main.py eval-pretrain  # score the stage-1 representation before stage 2
-python main.py finetune       # stage 2: hierarchical MoE finetuning
-python main.py ablation       # flat-classifier ablation
-python main.py smoke          # 2-batch dry run of both stages
+python main.py pretrain          # stage 1: DINO self-supervised pretraining
+python main.py eval-pretrain     # score the stage-1 representation before stage 2
+python main.py screen-backbones  # no training: which initialisation transfers best?
+python main.py eval-frozen       # no training: the reference stage 1 must beat
+python main.py finetune          # stage 2: hierarchical MoE finetuning
+python main.py ablation          # flat-classifier ablation
+python main.py smoke             # 2-batch dry run of both stages
 
 python main.py pretrain --gpus 2    # the same, as a 2-rank DDP job
 ```
@@ -75,12 +77,54 @@ Stage-1 variants, all config-driven:
 # 25 / 50 / 100
 python main.py pretrain
 
-# capacity control: the identical recipe on SwinV2-Base
+# capacity control: the identical recipe on SwinV2-Base at the SAME IN-1k corpus
 python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_base_dino
+
+# corpus control: SwinV2-Base pretrained on ImageNet-22k. NOT the same question
+# as the line above -- run `screen-backbones` first, which separates the two.
+python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_base_in22k_dino
+
+# half the FLOPs: SwinV2-Tiny, within 0.3 pp of Small on the frozen readout and
+# +0.7 pp at layers.2. Good for arm throughput.
+python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_tiny_dino
 
 # the stage-1 control (no stage 1 at all): ImageNet, frozen, straight to stage 2
 python -m src.trainers.moe_finetune experiment=control_imagenet_frozen
 ```
+
+Isolated stage-1 arms, all one override
+([`STAGE1_CHANGES.md`](STAGE1_CHANGES.md) has the evidence and the interaction
+map for each):
+
+```bash
+python main.py pretrain model.loss.koleo_scope=all_views     # the pre-audit KoLeo, as a control
+python main.py pretrain model.loss.lambda_koleo=0            # is KoLeo worth anything here?
+python main.py pretrain model.loss.koleo_space=backbone      # regularise the space stage 2 sees
+python main.py pretrain model.loss.centering=ema             # instead of Sinkhorn
+python main.py pretrain data.augmentation.match_view_lowpass=true
+python main.py pretrain data.augmentation.same_photo_local_views=2
+python main.py pretrain model.head.aux_stage=2               # a second head on layers.2
+```
+
+### Reading the stage-1 log
+
+Two metrics are easy to misread, and both were misread in the first revision.
+
+**`train/loss` is not a learning curve.** It is a cross entropy, so
+`loss = H(teacher) + KL(teacher‖student)`, and under Sinkhorn centering `H` is
+fixed by the normaliser, the prototype count, the teacher batch and the
+temperature schedule. On the shipped 100-epoch run **80 % of the total loss drop
+was `H` falling**, the final loss was **94.8 % irreducible target entropy**, and
+the learnable part was still improving at epoch 93 while the raw curve had been
+flat since epoch 20. Every step and epoch record therefore carries
+`teacher_student_kl` and `teacher_entropy_cross_view` alongside `loss`. **Read the
+KL.**
+
+**`loop_blocked_fraction` is not a GPU-idle fraction.** It is the share of wall
+clock the training loop spent inside the dataloader, and nothing synchronises
+inside the step, so the queued GPU work drains during that window — the metric
+upper-bounds idleness. Set `experiment.training.measure_gpu_busy=true` for a
+genuinely synchronised measurement, at the cost of one stall per logging interval.
 
 ### Evaluating stage 1 before committing to stage 2
 
@@ -104,9 +148,28 @@ milestones, the ImageNet-1k initialisation it started from, and an untrained
 trunk. It also recovers the stage-1 collapse diagnostics from the finished run's
 `events.jsonl`.
 
+Three measurements were added after the stage-1 audit and change how the report
+reads:
+
+- **`nuisance_decodability`** — with class identity held constant, how well can the
+  *source photograph* be recovered? That is the confound the photograph-disjoint
+  protocol punishes, and it is the one axis on which the shipped stage-1 run
+  demonstrably worked: +10.0 pp above chance from the ImageNet weights, +3.5 pp
+  after in-domain DINO. Read it *jointly* with the readout — an encoder that
+  discards everything scores chance.
+- **`handcrafted_floor`** — ten image statistics (log area, log aspect ratio,
+  mean/std RGB, mean/std grey) under the identical protocol. They score **0.5360**
+  27-way out-of-fold, which is 15.6 pp *above* an untrained 48.96 M-parameter
+  trunk. `random_init` answers "what does the architecture give for free"; this
+  answers the question a reviewer asks first.
+- **The stage-3 readout** — the headline probe is reported at `layers.2` as well
+  as at the pooled output stage 2 consumes. Self-distillation rewrote the last
+  stage (linear CKA 0.103 against its initialisation, against 0.390 at
+  `layers.2`), and `layers.2` scored +3.25 pp on the same protocol.
+
 Everything lands in `outputs/eval_pretrain/` (`summary.json`, `metrics.json`,
 `tables/*.csv`, 22 figures at 300 dpi, cached features, `provenance.json` with
-checkpoint SHA-256s). Results and the parameter/epoch recommendations that follow
+checkpoint SHA-256s **and the corpus fingerprint on both sides of the handoff**). Results and the parameter/epoch recommendations that follow
 from them: [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md). How it works and why
 these measurements:
 [`architecture/08_STAGE1_REPRESENTATION_EVALUATION.md`](architecture/08_STAGE1_REPRESENTATION_EVALUATION.md).
@@ -128,7 +191,26 @@ python main.py finetune data.batch_size=8 experiment.training.epochs=50
 python main.py finetune model.head.top_k=4                 # submitted routing
 python main.py finetune model.loss.lambda_kl=0.5 experiment.training.num_folds=5
 python main.py finetune model.backbone.freeze=false        # fine-tune end to end
+python main.py finetune model.backbone.feature_stage=stage3_pooled_2x2  # read layers.2
+python main.py finetune experiment.training.split_protocol=grouped_cv   # out-of-fold, all 27 classes
 ```
+
+Two of those deserve a sentence, because neither is comparable with a previously
+published number:
+
+- `feature_stage=stage3` reads `layers.2` (16×16×**384**, natively the paper's
+  `z`) instead of the pooled `layers.3` output. Self-distillation rewrote
+  `layers.3` — linear CKA 0.103 against its ImageNet initialisation, against 0.390
+  at `layers.2` — and on the photograph-disjoint out-of-fold probe `layers.2`
+  scored **+3.25 pp**. `stage3_pooled_2x2` restores the 64-token budget the MoE's
+  routing and the Eq. 11 cross-attention are sized for; plain `stage3` quadruples
+  the routing slots and makes the attention 16× as expensive.
+- `split_protocol=grouped_cv` drops the held-out split entirely and reports
+  out-of-fold predictions over **every** crop. The `grouped` default's test side
+  holds 14 of the 27 classes, so its macro-F1 is capped near 14/27 by the split
+  rather than by the model. `grouped_cv` is an estimate of the *recipe* (K models
+  contributed), not of one shipped model, and every split now reports
+  `classes_present_in_test` so the cap is visible either way.
 
 ### Experiment suites
 
@@ -141,6 +223,23 @@ python scripts/run_ablations.py   # six component-wise variants
 python scripts/run_baselines.py   # linear probe, ImageNet frozen/unfrozen, ResNet-50, Swin-T, hierarchical CCE
 python scripts/generate_plots.py  # figures + outputs/reports/summary_metrics.csv
 ```
+
+**Stage-1 arm suites have their own runner**, because a stage-1 arm *produces* an
+encoder and then needs a second process to evaluate it — and without per-arm
+paths, four arms silently overwrite each other's encoders and each other's
+`outputs/eval_pretrain/`:
+
+```bash
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase0.yaml  # no training
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml  # five arms + the frozen reference
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase3.yaml --seeds 42 43 44
+python scripts/report_raw_photographs.py    # source photographs that exist and were never cropped
+```
+
+The arms are **data, not code**: each manifest under `conf/stage1_arms/` names a
+base experiment, shared overrides, and one entry per arm. Adding an arm is adding
+an entry. See [`STAGE1_CHANGES.md`](STAGE1_CHANGES.md) for what each arm tests,
+what it is confounded with, and the sequence they must run in.
 
 With more than one GPU, prefer sharding the *suite* over the devices rather than
 running one variant across them: 18 variants x 5 seeds are already independent
@@ -169,7 +268,10 @@ The table below is the configured recipe. The **executed** 100-epoch run departe
 from it in three ways, all recorded in
 [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md) §1: physical batch 64 rather than
 32 (hence lr 1.25e-4 rather than 6.25e-5), and `data.num_workers=0`, which left
-the GPU idle for 91.6 % of the run.
+the training loop blocked in the dataloader for 91.6 % of its wall clock. (That
+is the loop-blocked share, **not** a GPU-idle fraction — nothing synchronises
+inside the step, so the queued GPU work drains during that window. See
+`STAGE1_CHANGES.md` A5.)
 
 | | Value | Note |
 | --- | --- | --- |

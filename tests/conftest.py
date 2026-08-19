@@ -37,9 +37,30 @@ PAPER_NUM_EXPERTS = 6          # Section 5.2
 SUBMITTED_TOP_K = 4
 REVISED_TOP_K = 2
 
-# Token grid emitted by swinv2_*_window16_256 at 256 px. Grid routing is the
-# revision default; `pooled` reproduces the submitted architecture.
-PAPER_TOKEN_GRID = 64
+# Token grid emitted by the trunk's FINAL stage. Grid routing is the revision
+# default; `pooled` reproduces the submitted architecture.
+#
+# This is per-trunk, not a universal constant, and the distinction became
+# load-bearing once the initialisation screen made a 192 px trunk a first-class
+# option: `swinv2_*_window16_256` emits 8x8 = 64 at 256 px, while
+# `swinv2_*_window12_192` emits 6x6 = 36 at 192 px. Stage 2's routing-slot count
+# moves with it, which matters for the load-balancing statistic's estimability at
+# small batch. All three figures are MEASURED, not derived --
+# `tests/test_stage1_changes.py` re-measures them.
+PAPER_TOKEN_GRID = 64            # swinv2_*_window16_256 @ 256 px, layers.3
+TOKEN_GRID_192 = 36              # swinv2_*_window12_192 @ 192 px, layers.3
+
+# `layers.2` grids, four times the final stage's. Reading them in `grid` mode is
+# what quadruples the MoE's routing slots and makes the Eq. 11 cross-attention
+# 16x as expensive, which is why `stage3_pooled_2x2` exists.
+STAGE3_TOKEN_GRID = 256          # swinv2_*_window16_256 @ 256 px, layers.2
+STAGE3_TOKEN_GRID_192 = 144      # swinv2_*_window12_192 @ 192 px, layers.2
+
+# `layers.2` channel widths, which are the widths the Eq. 4 projection sees under
+# `feature_stage=stage3`. Tiny and Small share 384 -- natively the paper's z --
+# and Base is 512.
+STAGE3_FEATURE_DIM_TINY_SMALL = 384
+STAGE3_FEATURE_DIM_BASE = 512
 
 PAPER_GLOBAL_CROPS = 2         # Table 1
 PAPER_LOCAL_CROPS = 4          # Table 1
@@ -125,8 +146,20 @@ DATASET_NUM_SOURCE_PHOTOGRAPHS = 81
 DATASET_NUM_CROPS = 9357
 DATASET_SINGLE_SOURCE_SUBVARIETIES = 5
 
-# 13 rice + 8 millet + 3 + 3 = 27, matching Section 3.
-SUBVARIETY_COUNTS = {"Millet": 8, "Mustard": 3, "Rice": 13, "Seasame": 3}
+# The REAL tree under `Cropped_Samples`: Amaranthus 3, Millet 8, Mustard 3,
+# Rice 13 = 27, matching Section 3.
+#
+# The names matter as much as the counts, and getting them wrong was a live
+# defect. This fixture previously used `Seasame` in place of `Amaranthus`, and
+# because the hierarchy is built from *sorted* directory names, that put the
+# 3-member class LAST instead of first: the synthetic parent->child map was
+# `[0]*8 + [1]*3 + [2]*13 + [3]*3` where production's is
+# `[0]*3 + [1]*8 + [2]*3 + [3]*13`. Every hierarchy fixture therefore exercised
+# a 4-parent tree with the right totals and the wrong grouping -- which is
+# exactly the class of bug the Eq. 10 KL aggregation matrix is most likely to
+# have, and the one the log-space `logsumexp` over each parent's children exists
+# to get right.
+SUBVARIETY_COUNTS = {"Amaranthus": 3, "Millet": 8, "Mustard": 3, "Rice": 13}
 
 
 @pytest.fixture(scope="session")

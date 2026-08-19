@@ -105,6 +105,30 @@ experiment:
         role: "control"
         description: "untrained trunk; fixes the floor a linear readout gets for free"
 
+      # ---------------------------------------------------------------
+      # The trivial-feature floor (STAGE1_CHANGES.md E1).
+      #
+      # `random_init` fixes what a linear readout gets from ARCHITECTURE alone.
+      # It does not answer the question a reviewer of a fine-grained paper asks
+      # first: how much does a deep encoder add over trivial image statistics?
+      #
+      # Ten numbers -- log crop area, log aspect ratio, mean and std RGB, mean
+      # and std grey -- score 0.5360 27-way out-of-fold under the identical
+      # folds, seed and probe. That is 15.6 pp ABOVE an untrained 48.96 M-
+      # parameter trunk and 9.2 pp below the shipped DINO encoder. This is a
+      # reporting obligation, not an optimisation.
+      #
+      # `kind: handcrafted` bypasses the backbone entirely; the features are
+      # read from the files at native resolution, because absolute crop size is
+      # part of what they encode.
+      # ---------------------------------------------------------------
+      - label: "handcrafted_floor"
+        kind: "handcrafted"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "10 image statistics (log area, log AR, mean/std RGB, mean/std grey) -- the floor a deep encoder must beat"
+
     # ---------------------------------------------------------------------
     # The EMA teacher.
     #
@@ -225,12 +249,62 @@ experiment:
       enabled: true
       k_values: [1, 5, 10]
 
+    # -------------------------------------------------------------------
+    # Which trunk stages get the HEADLINE out-of-fold readout, not just the
+    # layer-wise diagnostic below.
+    #
+    # Stage 2 consumes the pooled final stage, which is exactly the stage
+    # self-distillation rewrote: linear CKA against the ImageNet initialisation
+    # is 0.103 at `layers.3` against 0.390 at `layers.2`. On this protocol
+    # `layers.2` scored +3.25 pp (linear) / +3.90 pp (512-unit MLP) over the
+    # pooled output, and the ordering held for the plain ImageNet weights too.
+    #
+    # `pooled` stays first so a table written against the previous output still
+    # finds its column, and `oof_probe_sub_accuracy` keeps meaning the pooled
+    # number. The per-stage figures land in `readout_stages.csv` and in the
+    # `oof_probe_sub_accuracy_at_*` columns of `encoder_comparison.csv`.
+    #
+    # Set to ["pooled"] to reproduce the pre-audit output exactly.
+    # -------------------------------------------------------------------
+    readout:
+      stages: ["pooled", "stage3"]
+
     # Probe each SwinV2 stage's pooled output at fixed C. Answers "is the useful
     # signal in the last stage?" -- which decides whether stage 2 reading only the
     # final feature is leaving accuracy on the table.
+    #
+    # `all_encoders: true` captures the per-stage features for EVERY row rather
+    # than the two listed. It costs nothing extra -- the hooks run in the same
+    # forward pass -- and without it the milestone encoders' caches carry no
+    # stage arrays at all, so the stage-3 readout above silently falls back to
+    # `pooled` for them and the comparison is between different quantities.
     layerwise:
       enabled: true
+      all_encoders: true
       encoders: ["dino_epoch100", "imagenet_init"]
+
+    # -------------------------------------------------------------------
+    # Nuisance decodability (STAGE1_CHANGES.md E9).
+    #
+    # Every other measurement here asks how much SIGNAL the representation
+    # carries. This asks how much photograph nuisance it carries, with class
+    # identity held constant: nearest-class-mean recovery of the source
+    # photograph, restricted to photographs of the same sub-variety, averaged
+    # over the 22 classes with >= 2 photographs, against the per-class chance
+    # level.
+    #
+    # It is the one axis on which the shipped stage-1 run demonstrably worked --
+    # ImageNet sits at +10.0 pp above chance and DINO at +3.5 pp, a 65 %
+    # reduction that no existing figure or table showed. It is also the
+    # mandatory falsifier for `data.augmentation.same_photo_local_views`, which
+    # can win the probe by re-learning the confound.
+    #
+    # Read jointly with the readout, never alone: an encoder that discards
+    # everything scores exactly chance here.
+    # -------------------------------------------------------------------
+    nuisance:
+      enabled: true
+      folds: 3
 
     # Alignment/uniformity and augmentation consistency, measured over the STAGE-1
     # multi-crop augmentation (two global views), because that is the distribution
@@ -248,6 +322,15 @@ experiment:
     prototypes:
       enabled: true
       checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_milestone_epoch_0100.pth"
+      # F2. The head's 256-D bottleneck clusters the taxonomy better than the
+      # 768-D trunk output it is computed from (silhouette +0.172 against
+      # +0.115), and stage 1 discards it. This runs the identical out-of-fold
+      # readout over the bottleneck so "should the Eq. 4 projection be
+      # initialised from the head?" has a number rather than an intuition. The
+      # caveat travels with it: the bottleneck is L2-normalised and trained to
+      # serve the prototype task, so a better silhouette does not automatically
+      # mean a better input to a 9 M-parameter MoE head.
+      probe_bottleneck: true
 
     tsne:
       perplexity: 30.0

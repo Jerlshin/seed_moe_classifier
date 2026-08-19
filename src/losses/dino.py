@@ -59,6 +59,38 @@ normalised form, and ``K`` and ``B_teacher`` alongside, so a number in a log lin
 can be read without the config next to it. Nothing here labels high entropy
 "good" or low entropy "collapse"; both readings are wrong at the edges.
 
+KoLeo is per view, not across views
+-----------------------------------
+
+The KoLeo regulariser is a **uniformity** term over distinct instances. Applied
+to the two global views concatenated -- which is what this repository shipped
+until the stage-1 audit -- the two augmented views of one crop become each
+other's nearest neighbour, so the term's gradient pushes them apart. That is an
+explicit anti-alignment force acting on precisely the pair Eq. 1 exists to pull
+together, and on the shipped 100-epoch run it coincided with ``alignment``
+getting *worse* (0.638 -> 1.111) and ``same_image_minus_same_class`` landing at
+-0.028.
+
+:func:`grouped_koleo` chunks by view, as DINOv2's ``ssl_meta_arch.py`` does
+(*"we don't apply koleo loss between cls tokens of a same image"*).
+``model.loss.koleo_scope=all_views`` restores the old behaviour as a control, and
+``model.loss.lambda_koleo=0`` is the control that says whether the term is worth
+anything here at all.
+
+The loss is 95 % target entropy, so it is logged decomposed
+------------------------------------------------------------
+
+``CE(q, p) = H(q) + KL(q || p)``, and under Sinkhorn centering ``H(q)`` is a
+property of the normaliser, ``K``, ``B_teacher`` and the temperature schedule
+rather than of the student. Measured on the shipped run: the reported loss fell
+7.765 -> 5.671 and **80.0 % of that was ``H(q)`` falling**; the final loss is
+94.8 % irreducible target entropy; and ``KL(q || p)`` -- the only learnable part
+-- was still improving at epoch 93 while the raw curve had been flat since epoch
+20. :meth:`CustomDINOLoss.compute_dino_loss` therefore always emits
+``dino_cross_entropy``, ``teacher_entropy_cross_view`` and
+``teacher_student_kl`` as device tensors, and the trainer logs and epoch-averages
+all three. **Read ``train/teacher_student_kl``, not ``train/loss``.**
+
 Two things this module does *not* do any more
 ---------------------------------------------
 
@@ -86,7 +118,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -97,6 +129,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from src.utils.training.distributed import DistributedContext
 
 CENTERING_MODES = ("ema", "sinkhorn")
+
+#: How :func:`koleo_regularizer` is applied across the student's global views.
+#:
+#: ``per_view`` (the default, and the DINOv2 reference behaviour) computes the
+#: nearest-neighbour term **inside each global view's block separately**;
+#: ``all_views`` computes it over the two blocks concatenated, which is what this
+#: repository shipped before the stage-1 audit and is retained only as the
+#: control that measures what the change was worth. See :func:`koleo_regularizer`
+#: for why the difference is not cosmetic.
+KOLEO_SCOPES = ("per_view", "all_views")
+
+#: Reduction over the per-view KoLeo terms under ``koleo_scope="per_view"``.
+#:
+#: ``mean`` keeps ``lambda_koleo`` on the same scale as ``all_views``, so the two
+#: are a single-factor comparison. ``sum`` reproduces DINOv2's
+#: ``sum(self.koleo_loss(p) for p in student_cls_tokens.chunk(2))``, which at two
+#: global views is the identical term at twice the weight.
+KOLEO_REDUCTIONS = ("mean", "sum")
 
 
 def _at_least_float32(tensor: torch.Tensor) -> torch.Tensor:
@@ -150,6 +200,70 @@ def koleo_regularizer(features: torch.Tensor, epsilon: float = 1e-8) -> torch.Te
     diagonal = torch.eye(distances.shape[0], device=distances.device, dtype=torch.bool)
     nearest = distances.masked_fill(diagonal, float("inf")).amin(dim=-1)
     return -torch.log(nearest.clamp_min(epsilon)).mean()
+
+
+def grouped_koleo(
+    features: torch.Tensor,
+    num_groups: int,
+    scope: str = "per_view",
+    reduction: str = "mean",
+    epsilon: float = 1e-8,
+) -> torch.Tensor:
+    """KoLeo over ``num_groups`` view-major blocks, applied per block or across all.
+
+    **This is the A1 fix from ``STAGE1_CHANGES.md`` and it is not cosmetic.**
+    ``features`` arrives view-major, so rows ``[0:B]`` are global view 0 of every
+    image and rows ``[B:2B]`` are global view 1 of *the same* images in the same
+    order. Handing that whole block to :func:`koleo_regularizer` masks only the
+    diagonal, so row ``i`` and row ``B + i`` -- two augmented views of one crop --
+    are eligible neighbours of each other. Under a working DINO they are the
+    *closest* pair in the block, so they are the argmin, and the term's gradient
+    pushes them apart: an explicit **anti-alignment** force acting on exactly the
+    pair Eq. 1 exists to pull together.
+
+    DINOv2's reference does
+    ``sum(self.koleo_loss(p) for p in student_cls_tokens.chunk(2))`` with the
+    in-source comment *"we don't apply koleo loss between cls tokens of a same
+    image"*. ``scope="per_view"`` is that behaviour.
+
+    ``scope="all_views"`` restores the pre-audit behaviour. It is kept because
+    "the fix was worth X" is only a measurable claim if the unfixed version is
+    still runnable at a flag, not because either is a tuning knob.
+
+    Args:
+        features: ``[num_groups * B, dim]``, **view-major**. Any other layout
+            makes the grouping meaningless, which is why the trainer passes the
+            leading ``num_global_crops * B`` rows of the view-major bottleneck
+            and nothing else.
+        num_groups: Number of equal view blocks in ``features``.
+        scope: ``"per_view"`` or ``"all_views"``; see :data:`KOLEO_SCOPES`.
+        reduction: ``"mean"`` or ``"sum"`` over the per-view terms; see
+            :data:`KOLEO_REDUCTIONS`. Ignored under ``all_views``.
+        epsilon: Floor on the nearest-neighbour distance before the log.
+
+    Returns:
+        A scalar tensor. Zero when there are fewer than two rows per block, which
+        is the degenerate case a batch of 1 produces.
+    """
+    if scope not in KOLEO_SCOPES:
+        raise ValueError(f"koleo_scope must be one of {KOLEO_SCOPES}, got {scope!r}")
+    if reduction not in KOLEO_REDUCTIONS:
+        raise ValueError(f"koleo_reduction must be one of {KOLEO_REDUCTIONS}, got {reduction!r}")
+    if features.ndim != 2 or features.shape[0] < 2:
+        return features.new_zeros(())
+
+    groups = max(int(num_groups), 1)
+    if scope == "all_views" or groups <= 1:
+        return koleo_regularizer(features, epsilon=epsilon)
+    if features.shape[0] % groups != 0:
+        raise ValueError(
+            f"KoLeo received {features.shape[0]} rows, which is not divisible by "
+            f"num_groups={groups}; the global views must be stacked view-major."
+        )
+
+    terms = [koleo_regularizer(block, epsilon=epsilon) for block in features.chunk(groups, dim=0)]
+    total = torch.stack(terms).sum()
+    return total if reduction == "sum" else total / float(len(terms))
 
 
 @torch.no_grad()
@@ -266,7 +380,16 @@ class CustomDINOLoss(nn.Module):
         centering: ``"sinkhorn"`` (default) or ``"ema"``; see the module
             docstring.
         sinkhorn_iterations: Iterations for the Sinkhorn variant.
-        lambda_koleo: Weight on the KoLeo regulariser. ``0`` disables it.
+        lambda_koleo: Weight on the KoLeo regulariser. ``0`` disables it, which
+            is the control that says whether KoLeo is worth anything here at all.
+        koleo_scope: ``"per_view"`` (default) applies KoLeo **inside each global
+            view's block**, as DINOv2 does; ``"all_views"`` applies it over the
+            concatenated blocks, which makes the two views of one image each
+            other's nearest neighbour and turns the term into an anti-alignment
+            force. See :func:`grouped_koleo`.
+        koleo_reduction: ``"mean"`` (default) or ``"sum"`` over the per-view
+            terms. Mean keeps ``lambda_koleo`` on the same scale as
+            ``all_views``, so the two are a single-factor comparison.
         context: This rank's place in a distributed job, or ``None`` for a
             single process. Used for two things and no others:
 
@@ -307,6 +430,8 @@ class CustomDINOLoss(nn.Module):
         centering: str = "sinkhorn",
         sinkhorn_iterations: int = 3,
         lambda_koleo: float = 0.1,
+        koleo_scope: str = "per_view",
+        koleo_reduction: str = "mean",
         context: "DistributedContext | None" = None,
         distributed_sinkhorn: bool = False,
     ):
@@ -317,6 +442,12 @@ class CustomDINOLoss(nn.Module):
             raise ValueError(f"num_global_crops must be in [1, {num_crops}], got {num_global_crops}")
         if centering not in CENTERING_MODES:
             raise ValueError(f"centering must be one of {CENTERING_MODES}, got {centering!r}")
+        if koleo_scope not in KOLEO_SCOPES:
+            raise ValueError(f"koleo_scope must be one of {KOLEO_SCOPES}, got {koleo_scope!r}")
+        if koleo_reduction not in KOLEO_REDUCTIONS:
+            raise ValueError(
+                f"koleo_reduction must be one of {KOLEO_REDUCTIONS}, got {koleo_reduction!r}"
+            )
 
         self.student_temp = float(student_temp)
         self.center_momentum = float(center_momentum)
@@ -325,6 +456,8 @@ class CustomDINOLoss(nn.Module):
         self.centering = centering
         self.sinkhorn_iterations = int(sinkhorn_iterations)
         self.lambda_koleo = float(lambda_koleo)
+        self.koleo_scope = koleo_scope
+        self.koleo_reduction = koleo_reduction
         self.register_buffer("center", torch.zeros(1, out_dim))
 
         #: Plain attributes, not buffers: the process group is not model state
@@ -361,6 +494,17 @@ class CustomDINOLoss(nn.Module):
         """Teacher temperature for ``epoch`` under the Eq. 2 schedule."""
         index = min(max(int(epoch), 0), len(self.teacher_temp_schedule) - 1)
         return float(self.teacher_temp_schedule[index])
+
+    @property
+    def last_metric_tensors(self) -> dict[str, torch.Tensor]:
+        """Diagnostics from the last forward, still on the device.
+
+        Reading this does **not** synchronise, which is the whole point: the
+        trainer accumulates ``teacher_student_kl`` and ``dino_cross_entropy``
+        into device-resident epoch sums and converts once, at the epoch boundary.
+        Use :attr:`last_metrics` when host floats are actually wanted.
+        """
+        return dict(self._metric_tensors)
 
     @property
     def last_metrics(self) -> dict[str, float]:
@@ -412,9 +556,15 @@ class CustomDINOLoss(nn.Module):
         )
 
         if self.lambda_koleo > 0.0 and student_embeddings is not None:
-            koleo = koleo_regularizer(student_embeddings)
-            if self.metrics_enabled:
-                self._metric_tensors["koleo"] = koleo.detach()
+            koleo = grouped_koleo(
+                student_embeddings,
+                num_groups=self.num_global_crops,
+                scope=self.koleo_scope,
+                reduction=self.koleo_reduction,
+            )
+            # Always a device tensor, never a host float: `last_metrics` pays the
+            # synchronisation only when the trainer is about to log.
+            self._metric_tensors["koleo"] = koleo.detach()
             loss = loss + self.lambda_koleo * koleo
 
         if self.centering == "ema":
@@ -526,10 +676,42 @@ class CustomDINOLoss(nn.Module):
                 "DINO loss received no cross-view pairs; check num_crops, num_global_crops and the view ids."
             )
 
+        cross_entropy = (pair_losses * mask).sum() / loss_terms
+
+        # ------------------------------------------------------------------
+        # The loss is not a learning curve, and this is what makes it readable.
+        #
+        # `CE(q, p) = H(q) + KL(q || p)`. Under Sinkhorn centering `H(q)` is set
+        # by the normaliser, `K`, `B_teacher` and the temperature schedule --
+        # none of which is the student learning anything. On the shipped
+        # 100-epoch run, 80 % of the total loss drop was `H(q)` and the final
+        # loss was 94.8 % irreducible target entropy, while the learnable part
+        # was still falling at epoch 93 with the raw curve flat since epoch 20.
+        #
+        # Computed unconditionally rather than under `metrics_enabled`: these are
+        # two reductions over an already-materialised `[T*B, K]` tensor, they
+        # stay device tensors (no synchronisation), and the epoch-level mean has
+        # to see every micro-batch to be an epoch mean at all. The heavier
+        # prototype diagnostics below stay gated.
+        #
+        # `H` is weighted by each teacher view's share of the cross-view pairs,
+        # so the decomposition is exact for any mask -- not only the balanced
+        # 2 x 6 one. `teacher_entropy` keeps its historical definition (the plain
+        # mean over every teacher row) so a number logged before this change and
+        # one logged after mean the same thing; the two coincide whenever every
+        # teacher view takes part in the same number of pairs.
+        row_entropy = (
+            -teacher_probs * teacher_probs.clamp_min(1e-12).log()
+        ).sum(dim=-1).mean(dim=-1)  # [T]
+        pair_entropy = (row_entropy.unsqueeze(1) * mask).sum() / loss_terms
+        self._metric_tensors["dino_cross_entropy"] = cross_entropy.detach()
+        self._metric_tensors["teacher_entropy_cross_view"] = pair_entropy.detach()
+        self._metric_tensors["teacher_student_kl"] = (cross_entropy - pair_entropy).detach()
+
         if self.metrics_enabled:
             self._metric_tensors.update(self.collapse_metrics(teacher_probs_all))
             self._metric_scalars["cross_view_terms"] = float(loss_terms)
-        return (pair_losses * mask).sum() / loss_terms
+        return cross_entropy
 
     def entropy_bounds(self, teacher_batch: int) -> tuple[float, float]:
         """``(H_min, H_max)`` for one teacher row, given the batch it came from.
@@ -674,9 +856,34 @@ class CustomDINOLoss(nn.Module):
             return outputs
         return torch.cat(list(outputs), dim=0)
 
+    def loss_flags(self) -> dict[str, Any]:
+        """Every loss-side setting a stage-1 arm can move.
+
+        Written into ``summary.json``. Without it a ``koleo_scope=all_views``
+        control and the fixed default leave byte-identical machine-readable
+        traces, which is exactly the failure ``loss_flags()`` was added to stage
+        2 to prevent.
+        """
+        return {
+            "objective": "dino_self_distillation",
+            "centering": self.centering,
+            "sinkhorn_iterations": self.sinkhorn_iterations,
+            "distributed_sinkhorn": self.distributed_sinkhorn,
+            "student_temp": self.student_temp,
+            "center_momentum": self.center_momentum,
+            "lambda_koleo": self.lambda_koleo,
+            "koleo_scope": self.koleo_scope,
+            "koleo_reduction": self.koleo_reduction,
+            "num_crops": self.num_crops,
+            "num_global_crops": self.num_global_crops,
+            "prototypes": int(self.center.shape[-1]),
+            "teacher_temp_start": float(self.teacher_temp_schedule[0]),
+            "teacher_temp_final": float(self.teacher_temp_schedule[-1]),
+        }
+
     def extra_repr(self) -> str:
         return (
             f"num_crops={self.num_crops}, num_global_crops={self.num_global_crops}, "
             f"student_temp={self.student_temp}, centering={self.centering}, "
-            f"lambda_koleo={self.lambda_koleo}"
+            f"lambda_koleo={self.lambda_koleo}, koleo_scope={self.koleo_scope}"
         )

@@ -386,3 +386,120 @@ def test_worker_budget_is_shared_between_local_ranks():
     assert resolve_num_workers(0, paired) == 0
 
     assert resolve_num_workers("auto", paired) >= 1
+
+
+# ------------------------------- 6. stage-1 changes under a real 2-rank job
+
+
+def _koleo_worker(rank: int, world_size: int, init_file: str, tmp_dir: str) -> None:
+    """One rank: per-view KoLeo over its own shard of the global views."""
+    from src.losses.dino import grouped_koleo
+
+    _init(rank, world_size, init_file)
+
+    # The full job's two global views, view-major and identical on every rank.
+    generator = torch.Generator().manual_seed(99)
+    batch = WORLD_SIZE * BATCH_PER_RANK
+    view0 = torch.randn(batch, FEATURES, generator=generator)
+    view1 = view0 + 0.4 * torch.randn(batch, FEATURES, generator=generator)
+
+    # Images shard, views do not: a rank owns BOTH views of its own images,
+    # because Eq. 1 pairs a student view against the teacher's output for that
+    # same image.
+    shard = slice(rank * BATCH_PER_RANK, (rank + 1) * BATCH_PER_RANK)
+    local = torch.cat([view0[shard], view1[shard]], dim=0)
+
+    torch.save(
+        {
+            "per_view": grouped_koleo(local, WORLD_SIZE, "per_view").clone(),
+            "all_views": grouped_koleo(local, WORLD_SIZE, "all_views").clone(),
+        },
+        Path(tmp_dir) / f"result_{rank}.pt",
+    )
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="torch.distributed with the Gloo backend is required",
+)
+def test_per_view_koleo_is_a_purely_local_statistic(tmp_path):
+    """Each rank's KoLeo depends only on its own shard, and nothing all-reduces it.
+
+    That is deliberate and matches the reference implementation: KoLeo is a
+    nearest-neighbour statistic over the local view block, and it is already
+    computed per *micro-batch* under accumulation — so a rank holding the same
+    number of images computes the identical function a single-GPU run computes on
+    its micro-batch. Unlike Sinkhorn, it has no `distributed_*` switch.
+
+    The corollary is the one worth stating: splitting the batch across ranks
+    halves what KoLeo estimates from. If a second GPU is available, raise
+    `data.batch_size` per rank rather than splitting the configured batch.
+    """
+    from src.losses.dino import grouped_koleo
+
+    results = _run(_koleo_worker, WORLD_SIZE, tmp_path)
+
+    generator = torch.Generator().manual_seed(99)
+    batch = WORLD_SIZE * BATCH_PER_RANK
+    view0 = torch.randn(batch, FEATURES, generator=generator)
+    view1 = view0 + 0.4 * torch.randn(batch, FEATURES, generator=generator)
+
+    for rank, payload in enumerate(results):
+        shard = slice(rank * BATCH_PER_RANK, (rank + 1) * BATCH_PER_RANK)
+        local = torch.cat([view0[shard], view1[shard]], dim=0)
+        # Recomputed in a single process from that rank's shard alone.
+        assert payload["per_view"] == pytest.approx(
+            float(grouped_koleo(local, WORLD_SIZE, "per_view")), abs=1e-6
+        )
+        assert payload["all_views"] == pytest.approx(
+            float(grouped_koleo(local, WORLD_SIZE, "all_views")), abs=1e-6
+        )
+    # And the two scopes genuinely differ on this data, so the check is not vacuous.
+    assert results[0]["per_view"] != pytest.approx(results[0]["all_views"], abs=1e-3)
+
+
+def _decomposition_worker(rank: int, world_size: int, init_file: str, tmp_dir: str) -> None:
+    """One rank: the loss decomposition over its own shard, under Sinkhorn."""
+    from src.losses.dino import CustomDINOLoss
+
+    context = _init(rank, world_size, init_file)
+    criterion = CustomDINOLoss(
+        out_dim=FEATURES, num_crops=4, warmup_teacher_temp=0.04, teacher_temp=0.04,
+        warmup_teacher_temp_epochs=0, num_epochs=1, centering="sinkhorn",
+        lambda_koleo=0.0, context=context,
+    )
+    generator = torch.Generator().manual_seed(7 + rank)
+    student = [torch.randn(BATCH_PER_RANK, FEATURES, generator=generator) for _ in range(4)]
+    teacher = [torch.randn(BATCH_PER_RANK, FEATURES, generator=generator) for _ in range(2)]
+
+    total = criterion(student, teacher, epoch=0)
+    metrics = criterion.last_metrics
+    torch.save(
+        {
+            "loss": float(total),
+            "ce": metrics["dino_cross_entropy"],
+            "entropy": metrics["teacher_entropy_cross_view"],
+            "kl": metrics["teacher_student_kl"],
+        },
+        Path(tmp_dir) / f"result_{rank}.pt",
+    )
+    dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not dist.is_available() or not dist.is_gloo_available(),
+    reason="torch.distributed with the Gloo backend is required",
+)
+def test_the_loss_decomposition_holds_on_every_rank(tmp_path):
+    """`CE = H + KL` is a per-rank identity, so the trainer's device-tensor
+    accumulators are meaningful before the epoch-boundary all-reduce.
+
+    The trainer sums `teacher_student_kl` per micro-batch on the device and
+    all-reduces the *epoch mean* once. That is only the global mean if the
+    identity holds locally on each rank, which is what this pins.
+    """
+    for payload in _run(_decomposition_worker, WORLD_SIZE, tmp_path):
+        assert payload["ce"] == pytest.approx(payload["loss"], abs=1e-5)
+        assert payload["entropy"] + payload["kl"] == pytest.approx(payload["ce"], abs=1e-4)
+        assert payload["kl"] > -1e-5

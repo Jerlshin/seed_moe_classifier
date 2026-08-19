@@ -58,8 +58,56 @@ distributed_sinkhorn: false
 # ~100-step one, which is the least that makes the estimate meaningful.
 center_momentum: 0.99
 
+# ---------------------------------------------------------------------------
 # KoLeo regulariser (DINOv2): encourages uniform feature span within a batch, so
 # near-duplicate samples do not collapse onto each other. Particularly apt here,
 # where 27 sub-varieties of four crops are near-duplicates by construction.
-# Applied to the bottleneck, not the prototype logits.
+#
+# 0.0 is the control that answers "is KoLeo worth anything at all on this data?",
+# and it is a Phase-1 arm rather than a hypothetical -- see STAGE1_CHANGES.md C8.
+# ---------------------------------------------------------------------------
 lambda_koleo: 0.1
+
+# Scope: "per_view" | "all_views".  ** This default is a bug fix. **
+#
+# The student's global views arrive VIEW-MAJOR, so rows [0:B] are global view 0
+# of every image and rows [B:2B] are global view 1 of the SAME images in the same
+# order. Handing the whole block to the nearest-neighbour term masks only the
+# diagonal, so row i and row B+i -- two augmented views of one crop -- are
+# eligible neighbours. Under a working DINO they are the CLOSEST pair in the
+# block, so they are the argmin, and the gradient of -log(min distance) pushes
+# them apart. That is an explicit anti-alignment force acting on exactly the pair
+# Eq. 1 exists to pull together.
+#
+# On the shipped 100-epoch run this coincided with `alignment` getting WORSE
+# (0.638 -> 1.111) and `same_image_minus_same_class` landing at -0.028: the
+# objective's own invariance target was not achieved.
+#
+# "per_view" chunks by view and reduces, which is what DINOv2's ssl_meta_arch.py
+# does -- `sum(self.koleo_loss(p) for p in student_cls_tokens.chunk(2))`, with
+# the in-source comment "we don't apply koleo loss between cls tokens of a same
+# image".
+#
+# "all_views" restores the pre-audit behaviour. It is kept ONLY so "the fix was
+# worth X" is a measurable claim rather than an assertion; it is not a knob.
+koleo_scope: "per_view"
+
+# Reduction over the per-view terms: "mean" | "sum".
+#
+# "mean" keeps lambda_koleo on the same scale as `all_views`, so the two are a
+# single-factor comparison. "sum" reproduces DINOv2 literally, which at two
+# global views is the identical term at twice the weight.
+koleo_reduction: "mean"
+
+# Which space the uniformity is enforced in: "bottleneck" | "backbone".
+#
+# "bottleneck" is the DINO head's 256-D L2-normalised embedding -- the shipped
+# behaviour, and a space stage 2 never sees: only `student_backbone` ships. So
+# the regulariser currently acts on features that are discarded, and reaches the
+# published encoder only indirectly.
+#
+# "backbone" applies it to the pooled trunk feature of each global view instead,
+# which is what DINOv2 does (`x_norm_clstoken`) and the space downstream actually
+# consumes. `koleo_regularizer` L2-normalises internally, so what is regularised
+# is the direction, not the norm.
+koleo_space: "bottleneck"

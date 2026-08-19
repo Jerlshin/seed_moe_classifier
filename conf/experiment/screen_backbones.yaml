@@ -1,0 +1,137 @@
+# @package _global_
+#
+# Phase 0.5 -- the initialisation screen. NO TRAINING.
+#
+#   python main.py screen-backbones
+#   python -m src.trainers.pretrain_eval experiment=screen_backbones
+#
+# Every row is a frozen, ImageNet-supervised timm trunk with zero in-domain
+# training, scored by the identical transform, folds, seed and probe as the
+# stage-1 evaluation. It is Appendix 2 of STAGE1_CHANGES.md as a config file.
+#
+# Why this exists at all. The stage-1 evaluation's own decomposition is
+# `random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO`: the INITIALISATION is
+# worth 79x what the 13.34-hour self-distillation run bought, and it was never
+# treated as a variable. An IN-22k SwinV2-Base beats the shipped DINO encoder by
+# +2.24 pp pooled (+2.50 pp at a matched PCA width) at zero training cost.
+#
+# The control that decides the trunk. `swinv2_base_window16_256.ms_in1k` was
+# NOT in the original screen, so the Base advantage is not yet separated into
+# *capacity* versus *the IN-22k corpus*. It is the first row to look at:
+#
+#   ~0.63  ->  the effect is capacity. Tiny is then the efficient choice (it is
+#              -0.32 pp pooled and +0.69 pp at layers.2 against Small, for half
+#              the FLOPs), and Small is dominated either way.
+#   ~0.61  ->  the effect is the corpus, and IN-22k Base is the trunk to build
+#              on.
+#
+# Do not adopt Base until that row has run. `D6` of STAGE1_CHANGES.md is
+# explicit that capacity is NOT the binding constraint here -- scene diversity
+# is -- and this screen exists to keep the two arguments apart.
+#
+# Cost: one frozen forward pass per row over the corpus, minutes each, cached by
+# checkpoint digest afterwards. Nothing here writes a checkpoint or touches the
+# published handoff.
+
+defaults:
+  - eval_pretrain_representation
+
+experiment:
+  name: "screen_backbones"
+  group: "stage1_screen"
+
+  evaluation:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/screen_backbones"
+
+    # No stage-1 checkpoints are read, so nothing here depends on a finished run.
+    teacher:
+      enabled: false
+    prototypes:
+      enabled: false
+    dynamics:
+      enabled: false
+    invariance:
+      # Would need the multi-crop pipeline per trunk at its own resolution; the
+      # screen is about transfer, and the invariance question belongs to an arm.
+      enabled: false
+    efficiency:
+      enabled: false
+    figures:
+      enabled: false
+    shared_backbone_path: null
+
+    # Both readouts for every row: the audit's finding is that the ORDERING of
+    # the trunks differs between them (at layers.2 the IN-22k Base and the
+    # DINO-trained Small converge to within 0.23 pp), so a screen that reported
+    # only one would pick the wrong trunk half the time.
+    readout:
+      stages: ["pooled", "stage3"]
+    layerwise:
+      enabled: true
+      all_encoders: true
+      encoders: []
+
+    probe:
+      cv_encoders: []
+      low_shot_encoders: []
+    tsne:
+      encoders: []
+
+    encoders:
+      # The current trunk. Primary so the table has a reference row; it is not a
+      # recommendation -- the audit's finding is that Small IN-1k is DOMINATED,
+      # being -0.32 pp pooled and -0.69 pp at layers.2 against Tiny for twice the
+      # FLOPs.
+      - label: "small_in1k"
+        backbone: "swinv2_small_window16_256.ms_in1k"
+        image_size: 256
+        pretrained: true
+        role: "primary"
+        description: "swinv2_small_window16_256.ms_in1k -- the trunk conf/model/backbone/swinv2.yaml currently selects"
+
+      - label: "tiny_in1k"
+        backbone: "swinv2_tiny_window16_256.ms_in1k"
+        image_size: 256
+        pretrained: true
+        role: "control"
+        description: "half the FLOPs of Small; within 0.3 pp pooled and +0.7 pp at layers.2 in the audit"
+
+      # THE CONTROL THAT DECIDES B2: capacity or corpus?
+      - label: "base_in1k"
+        backbone: "swinv2_base_window16_256.ms_in1k"
+        image_size: 256
+        pretrained: true
+        role: "control"
+        description: "Base capacity at the SAME IN-1k corpus -- separates capacity from IN-22k"
+
+      - label: "base_in22k_ft_in1k"
+        backbone: "swinv2_base_window12to16_192to256.ms_in22k_ft_in1k"
+        image_size: 256
+        pretrained: true
+        role: "control"
+        description: "IN-22k -> IN-1k Base; +2.24 pp over the shipped DINO encoder in the audit, at zero training cost"
+
+      # B5: the same corpus at 192 px. The data has no content above ~52 px per
+      # side, so the extra output resolution is interpolation that costs
+      # quadratic attention. Measured statistically indistinguishable from 256 px
+      # for 1.78x fewer FLOPs -- but its 6x6 grid (layers.2: 12x12) changes
+      # stage 2's routing-slot count, which is a real downstream consequence.
+      - label: "base_in22k_192"
+        backbone: "swinv2_base_window12_192.ms_in22k"
+        image_size: 192
+        pretrained: true
+        role: "control"
+        description: "pure IN-22k at 192 px; 1.78x fewer FLOPs per view, and a 6x6 token grid"
+
+      - label: "random_init"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "untrained trunk; the architecture-only floor"
+
+      - label: "handcrafted_floor"
+        kind: "handcrafted"
+        checkpoint: null
+        pretrained: false
+        role: "control"
+        description: "10 image statistics -- the floor a deep encoder must beat (0.5360 in the audit)"

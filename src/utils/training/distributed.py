@@ -439,10 +439,22 @@ def available_cpus() -> int:
     return max(os.cpu_count() or 1, 1)
 
 
+#: Ceiling on what ``resolve_num_workers("auto")`` returns, per rank.
+#:
+#: Raised from 8 to 16 after the stage-1 audit. The 8 was chosen for a 4-vCPU
+#: Kaggle T4x2 instance and became the binding limit on every larger host: the
+#: shipped 13.34-hour run sat at a mean ``data_wait_fraction`` of 0.916 on a
+#: 48-physical-core machine. Callers pass ``data.num_workers_auto_cap`` so the
+#: ceiling is configurable rather than a constant a reader has to find in the
+#: source.
+DEFAULT_NUM_WORKERS_AUTO_CAP = 16
+
+
 def resolve_num_workers(
     requested: Any,
     context: DistributedContext,
     *,
+    auto_cap: int = DEFAULT_NUM_WORKERS_AUTO_CAP,
     logger: logging.Logger | None = None,
 ) -> int:
     """Per-rank dataloader worker count, budgeted across the ranks on this node.
@@ -453,20 +465,26 @@ def resolve_num_workers(
     8 would spawn 16 workers onto 4 cores, and the augmentation pipeline would
     spend its time context-switching rather than decoding.
 
-    ``"auto"`` resolves to the affinity-aware core count per rank, capped at 8;
-    an explicit integer is divided by ``local_world_size`` with a log line saying
-    so, because silently honouring it is the failure above and silently ignoring
-    it is worse.
+    ``"auto"`` resolves to the affinity-aware core count per rank, capped at
+    ``auto_cap``; an explicit integer is divided by ``local_world_size`` with a
+    log line saying so, because silently honouring it is the failure above and
+    silently ignoring it is worse.
+
+    Nothing here touches the objective. Workers change *who* computes an
+    augmentation, never what it is: the per-view RNG streams are seeded from the
+    loader generator either way, so a run at 0 workers and one at 16 optimise the
+    identical function.
     """
     log = logger or LOGGER
     cpus = available_cpus()
     per_rank_cpus = max(cpus // max(context.local_world_size, 1), 1)
+    cap = max(int(auto_cap), 0)
 
     if isinstance(requested, str) and requested.strip().lower() == "auto":
-        workers = min(per_rank_cpus, 8)
+        workers = min(per_rank_cpus, cap) if cap else per_rank_cpus
         log.info(
-            "Dataloader workers: auto -> %s per rank (%s usable CPUs / %s local ranks).",
-            workers, cpus, context.local_world_size,
+            "Dataloader workers: auto -> %s per rank (%s usable CPUs / %s local ranks, cap %s).",
+            workers, cpus, context.local_world_size, cap or "none",
         )
         return workers
 

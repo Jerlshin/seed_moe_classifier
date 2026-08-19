@@ -239,3 +239,61 @@ Add `conf/experiment/<name>.yaml` with `# @package _global_`, override the
 a runner's variant list. `baseline_hierarchical_cce` is the extreme worked
 example: it adds a whole baseline with **no Python at all**, purely by flipping
 four component toggles on the existing head.
+
+## Stage-1 artifacts and how to read the log
+
+`contrastive_pretrain.py` now writes **`summary.json`** beside its checkpoints, in
+the same `RunSummary` shape stage 2 uses, so `scripts/generate_plots.py` and the
+cross-run table render a stage-1 arm with no special case. It carries the resolved
+augmentation, the view geometry, the effective batch, the LR provenance,
+`CustomDINOLoss.loss_flags()`, the **corpus fingerprint**, the final `KL(q‖p)` and
+teacher entropy with its bounds, wall clock and peak VRAM. An interrupted run
+writes one too, flagged `completed: false` — on a preemptible platform that is the
+only path that ever executes.
+
+`scripts/run_stage1_ablations.py` reads exactly this file plus the evaluation's
+`tables/encoder_comparison.csv`. That is the same discipline the stage-2 suites
+follow: the table and the run must be produced by the same code path.
+
+Three log lines that are easy to misread:
+
+- **`loss` is not the learning curve.** It is a cross entropy, so
+  `CE = H(teacher) + KL(teacher‖student)`, and under Sinkhorn centering `H` is set
+  by the normaliser, `K`, `B_teacher` and the temperature schedule. On the shipped
+  run 80 % of the total loss drop was `H` falling and the final loss was 94.8 %
+  irreducible target entropy, while the KL was still improving at epoch 93. Every
+  step and epoch record carries `dino_cross_entropy`, `teacher_entropy_cross_view`
+  and `teacher_student_kl`, and the loss figure plots the KL first. `loss` is the
+  whole objective (KoLeo and the auxiliary head included); `dino_cross_entropy` is
+  the Eq. 1 term that decomposes exactly.
+- **`loop_blocked_fraction` is not a GPU-idle fraction.** Nothing synchronises
+  inside the step, so the queued GPU work drains while the loop blocks — it
+  upper-bounds idleness. `experiment.training.measure_gpu_busy=true` adds the real
+  measurement via CUDA events drained once per logging interval.
+  `data_wait_fraction` is still emitted as an alias.
+- **`Corpus | N images in C classes from G source photographs, digest ...`** is the
+  provenance check. `experiment.training.corpus_check` is `warn` (default),
+  `error` or `off`, and checks the class count — stage-2 label indices come from
+  sorted directory names, so a corpus with a different class set produces an
+  encoder whose downstream indices refer to different classes.
+
+## `split_protocol: grouped_cv` in stage 2
+
+A third protocol beside `grouped` and `stratified`, and **opt-in**: there is no
+held-out test split at all. `StratifiedGroupKFold` partitions every crop into
+photograph-disjoint folds, each fold's finished model scores its own held-out
+half, and `merge_out_of_fold` concatenates the predictions — in dataset order — 
+into one out-of-fold set covering every crop and every class.
+
+It exists because `grouped`'s `GroupShuffleSplit` takes 20 % of the 81 photographs
+*unstratified*, and most sub-varieties have crops from only ~3, so the test side
+holds **14 of the 27 classes** and a 27-way macro-F1 on it is capped near 14/27 by
+the split rather than by the model. It is also the same protocol
+`grouped_cv_readout` uses in `pretrain_eval.py`, which makes the stage-1 and
+stage-2 headline numbers directly comparable.
+
+Two things it is **not**: it is an estimate of the *recipe* (K different models
+contributed), not any single shipped model's test score, and it is not comparable
+with a `grouped` number — which is why it is not the default. Every split now
+reports `classes_present_in_test` next to the metrics so the cap is visible either
+way.

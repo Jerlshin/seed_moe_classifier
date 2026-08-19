@@ -11,6 +11,15 @@
 root_path: "${oc.env:SEED_DATA_ROOT,data/Hierarchical_SeedData/Cropped_Samples}"
 dataset_format: "image_folder"   # or "pickle_batches" for flattened-RGB batch files
 
+# Optional `RAW_Samples` tree, for the coverage audit only. Nothing reads pixels
+# from it: when set, the trainers and the stage-1 evaluation report which source
+# photographs exist and were never cropped, because SCENE count -- not crop
+# count -- is the binding constraint on photograph-disjoint generalisation.
+# 18 of 99 photographs are uncropped on the shipped corpus. Cropping them is a
+# deliberate re-baseline (every published accuracy moves), which is why this key
+# reports and never acts. See scripts/report_raw_photographs.py.
+raw_photographs_root: "${oc.env:SEED_RAW_DATA_ROOT,null}"
+
 # Must match the backbone's window resolution (256 for swinv2_*_window16_256).
 image_size: 256
 local_crop_size: 101
@@ -28,7 +37,7 @@ save_csv_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/metadata/seed_dataset.csv"
 # batch_size 16 that is 96 augmentation chains per batch, against a single
 # backbone forward the GPU finishes in well under a second. Two workers cannot
 # keep up, and the symptom is exactly the one this pipeline showed: a GPU at
-# ~40 % power draw. The trainer logs `data_wait_fraction` every logging step --
+# ~40 % power draw. The trainer logs `loop_blocked_fraction` every logging step --
 # the share of wall clock spent blocked waiting for a batch. Raise num_workers
 # until it stops falling; the useful ceiling is roughly the physical core count.
 #
@@ -41,13 +50,29 @@ save_csv_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/metadata/seed_dataset.csv"
 #
 # num_workers is PER PROCESS, so under DDP the configured value is spawned once
 # per rank. "auto" resolves to the affinity-aware usable core count divided by
-# the number of local ranks, capped at 8 -- which is the configured 8 on a
-# server and 2 per rank on a Kaggle T4x2 instance (4 vCPUs, 2 ranks), where the
-# literal 8 would put 16 augmentation workers on 4 cores and spend the epoch
+# the number of local ranks, capped at `num_workers_auto_cap` below -- 16 on a
+# server and 2 per rank on a Kaggle T4x2 instance (4 vCPUs, 2 ranks), where a
+# literal 16 would put 32 augmentation workers on 4 cores and spend the epoch
 # context-switching. An explicit integer is divided by the local rank count with
 # a log line saying so.
 # ---------------------------------------------------------------------------
 num_workers: "auto"
+
+# Ceiling on what `num_workers: "auto"` resolves to, per rank.
+#
+# Raised from 8 to 16. The 8 was chosen for a 4-vCPU Kaggle T4x2 and became a
+# limiter everywhere else: the shipped 13.34-hour stage-1 run carried
+# `num_workers=0` on a 48-physical-core host and spent a mean 91.6 % of its wall
+# clock blocked in the dataloader. One sample costs six independent PIL chains,
+# so the per-image CPU cost is ~59 ms and the loader -- not the GPU -- sets the
+# throughput.
+#
+# This changes who computes an augmentation, never what it is: the objective,
+# the RNG streams and every reported number are unaffected. Watch
+# `epoch/loop_blocked_fraction` in epoch 1; if it does not fall below ~0.3 the
+# bottleneck is elsewhere and every cost estimate has to be redone.
+num_workers_auto_cap: 16
+
 persistent_workers: true
 prefetch_factor: 4
 
@@ -98,6 +123,55 @@ augmentation:
   # SwinV2 windows require a fixed input size, so local crops are resized back
   # up to `image_size` after being cropped at `local_crop_size`.
   resize_local_to_global: true
+
+  # -------------------------------------------------------------------------
+  # Put the GLOBAL crops through the same downsample-to-`local_crop_size`-then-
+  # upsample cycle the local crops necessarily undergo, so the resolution
+  # artefact stops identifying a view as local.
+  #
+  # The gap it closes is measured: over all 9,357 crops (median 52 x 51 px) a
+  # global view is a median 5.7x upsample and a local view 10.5x (p95: 9.9x vs
+  # 22.1x). The student can satisfy part of Eq. 1 by detecting "this is a local
+  # view" and predicting the corresponding marginal, which substitutes for the
+  # local-to-global correspondence multi-crop exists to teach. The per-view blur
+  # probabilities (1.0 / 0.1 / 0.5) add a second identifying signal.
+  #
+  # Off by default because it changes the submitted recipe, and because it
+  # low-passes the globals too on data that already has almost no high-frequency
+  # content -- the argument for it is theoretical and the argument against it is
+  # measurable. It is the C2 arm; run it isolated.
+  #
+  # This key exists so `data.augmentation.match_view_lowpass=true` works. It was
+  # documented in architecture/02 and STAGE1_EVALUATION.md while being absent
+  # from this group, so Hydra's struct mode rejected the documented override and
+  # the error looked like a typo.
+  # -------------------------------------------------------------------------
+  match_view_lowpass: false
+
+  # -------------------------------------------------------------------------
+  # Provenance-derived positives (STAGE1_CHANGES.md F1). Replace this many of
+  # the `local_crops_number` local views with local crops of *other crops from
+  # the same source photograph*, which is parsed from the filename
+  # (`IMG_0502_bbox137.png`) and involves no labels.
+  #
+  # The view count is unchanged, so nothing downstream moves. What changes is
+  # the invariance being taught: DINO's positives are augmented views of one
+  # crop, so it learns invariance to crop/blur/colour, while the downstream task
+  # needs invariance to *which individual seed*. Two crops of one photograph are
+  # by construction two individuals of the same variety.
+  #
+  # The risk is self-detecting and must be checked before believing any gain:
+  # same-photograph crops share lighting, background and sensor noise, so the
+  # objective can be satisfied by learning photograph identity -- exactly what
+  # the photograph-disjoint protocol punishes. The evaluation's
+  # `nuisance/within_class_photo_accuracy_above_chance` is the gate (the shipped
+  # DINO encoder sits at +3.5 pp against ImageNet's +10.0 pp); an arm that
+  # pushes it back up learned the confound rather than the variety.
+  #
+  # 0 disables it, which is the default and the only setting any published
+  # number was produced under.
+  # -------------------------------------------------------------------------
+  same_photo_local_views: 0
 
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]

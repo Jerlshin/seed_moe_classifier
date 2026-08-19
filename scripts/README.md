@@ -7,6 +7,8 @@
 | `verify_runtime.py` | Does *this* machine still make the fast paths exact? Capabilities, parity, AMP, DDP |
 | `bench_pretrain_step.py` | A/B micro-benchmark of the stage-1 training step (sdpa / compile / batch geometry / rank count), no dataset |
 | `diagnose_sdpa_parity.py` | Per-module SwinV2→SDPA parity report (errors at fp32/TF32/fp64, gradients, shapes, guard verdicts) |
+| `run_stage1_ablations.py` | A **stage-1** arm suite from a YAML manifest: train each arm, evaluate it, collect one table |
+| `report_raw_photographs.py` | Which source photographs exist and were never cropped (reports only; never touches the data) |
 | `run_ablations.py` | The six component-wise ablation variants, optionally one per GPU |
 | `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |
@@ -126,6 +128,82 @@ had its own self-supervised initialisation, the table would partly measure that
 instead of the architectural change under test — and the resulting numbers would
 look entirely normal. `--allow-missing-checkpoint` waives the requirement for
 smoke runs and prints a warning; results from such a run are not comparable.
+
+## `run_stage1_ablations.py`
+
+```bash
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase0.yaml
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --dry-run
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml     --experiment pretrain_swinv2_tiny_dino
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase3.yaml --seeds 42 43 44
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --collect-only
+```
+
+**Why `run_ablations.py` could not be reused.** That script runs stage-2 head
+variants: one trainer, one output tree, one shared encoder every variant *reads*.
+A stage-1 suite is the opposite shape — each arm **produces** an encoder and then
+needs a second process to evaluate it, and both write to paths the other arms
+would otherwise overwrite. Without per-arm `experiment.training.save_path`,
+`shared_backbone_path` and `experiment.evaluation.save_path`, four arms silently
+overwrite each other's `outputs/eval_pretrain/` and each other's
+`outputs/checkpoints/dinov2_swinv2_pretrained.pth`, and the resulting table
+compares one encoder against itself.
+
+**The arms are data, not code.** A manifest under `conf/stage1_arms/` names a base
+Hydra experiment, overrides applied to every arm, and one entry per arm. Adding an
+arm is adding an entry.
+
+| Manifest | Phase | What it runs |
+| --- | --- | --- |
+| `phase0.yaml` | 0 | No training. The readout screen and the initialisation screen |
+| `phase1.yaml` | 1 | The frozen reference plus five 50-epoch arms (baseline, KoLeo per view, `lambda_koleo=0`, crop scales, EMA centering) |
+| `phase2.yaml` | 2 | Template: the Phase-1 winner, plus `match_view_lowpass`, the auxiliary stage head, and a 100-epoch re-run |
+| `phase3.yaml` | 3 | The winner and the baseline at three seeds each, plus the frozen reference |
+
+Three arm shapes: `train: true` (train then evaluate), `train: false` with
+`evaluate_frozen: true` (the reference — the chosen trunk, frozen, no in-domain
+training), and `train: false` with an explicit `eval_experiment` (a Phase-0
+screen).
+
+**Only `data.*` overrides carry into the evaluation.** They describe the corpus
+and the augmentation, both of which the alignment measurement must reproduce;
+`experiment.training.*` has no meaning in an evaluation config and Hydra's struct
+mode rejects it.
+
+**Multiple GPUs are not sharded across arms.** A stage-1 arm is a full
+self-distillation run and saturates one device, so two concurrent arms halve each
+other's throughput. Use both devices *within* an arm instead
+(`python main.py pretrain --gpus 2` with `effective_batch_size` pinned).
+
+The collected table headlines `oof_probe_sub_accuracy_testable_classes`, and
+carries `final_teacher_student_kl` (the **learnable** half of the objective — the
+raw DINO loss is ~95 % target entropy and is not comparable across arms that move
+the centering) and `nuisance_photo_above_chance` (an arm that *raises* it may have
+won the probe by re-learning the photograph confound the protocol punishes).
+
+## `report_raw_photographs.py`
+
+```bash
+python scripts/report_raw_photographs.py
+python scripts/report_raw_photographs.py --raw ../Dataset/Hierarchical_SeedData/RAW_Samples
+```
+
+Set-difference between the `RAW_Samples` stems and the `_bbox` prefixes under
+`Cropped_Samples`. **Reports only; it never touches the dataset.**
+
+The binding constraint here is the number of *scenes*, not crops: 9,357 crops come
+from 81 photographs, and within one photograph 89–98 % of crops have a neighbour
+above cosine 0.95 at 32×32 grey. `RAW_Samples` holds **99**, so 18 exist uncropped
+— +22 % scenes at zero acquisition cost, concentrated on classes that currently
+have two or three. It does *not* fix the five single-photograph sub-varieties;
+that needs a camera.
+
+Two things before acting on it: look at the photographs (they may have been
+excluded for blur or exposure, and an out-of-focus frame in the SSL corpus is
+worse than nothing), and treat re-cropping as a **re-baseline** — every published
+accuracy moves, so do it before a phase, not between arms. The corpus SHA-256 in
+each run's `summary.json` keeps the before and after distinguishable.
 
 ## `run_baselines.py`
 

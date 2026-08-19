@@ -3,12 +3,14 @@ from __future__ import annotations
 import bisect
 import csv
 import glob
+import hashlib
 import logging
 import multiprocessing
 import os
 import pickle
 import re
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -27,6 +29,11 @@ LOGGER = logging.getLogger(__name__)
 #: same sensor noise, often the same individual seed photographed at overlapping
 #: bounding boxes.
 SOURCE_IMAGE_PATTERN = re.compile(r"^(?P<source>.+?)_bbox\d+$", re.IGNORECASE)
+
+#: File extensions the corpus fingerprint and the raw-photograph audit consider.
+IMAGE_EXTENSIONS = frozenset(
+    {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+)
 
 
 def source_image_id(image_path: str | os.PathLike[str]) -> str:
@@ -47,6 +54,180 @@ def source_image_id(image_path: str | os.PathLike[str]) -> str:
     match = SOURCE_IMAGE_PATTERN.match(path.stem)
     source = match.group("source") if match else path.stem
     return f"{path.parent.name}/{source}"
+
+
+def corpus_fingerprint(
+    root: str | os.PathLike[str],
+    relative_paths: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """A stable, machine-readable identity for the corpus a stage actually read.
+
+    Why this exists. The stage-1 -> stage-2 handoff is a bare ``state_dict`` with
+    no record of what it was trained on, and that gap was not hypothetical: the
+    shipped 100-epoch encoder was self-distilled on **8,173** crops while the
+    evaluation, stage 2 and every published number use **9,357**. Nothing on disk
+    said so, and it was recoverable only by cross-reading two log lines against
+    ``metrics.json``. ``provenance.json`` already records the checkpoint's
+    SHA-256, the git commit and the library versions; the one thing it could not
+    recover is the corpus.
+
+    The digest is over the sorted list of dataset-relative POSIX paths, so it is
+    stable across machines, mount points and filesystem enumeration order, and it
+    changes the moment a file is added, removed or renamed. Counts and the
+    per-class histogram travel with it because a digest alone cannot say *how*
+    two corpora differ.
+
+    Args:
+        root: Dataset root. Used to make the paths relative and to enumerate them
+            when ``relative_paths`` is not supplied.
+        relative_paths: Pre-enumerated paths (absolute or relative). Pass the
+            dataset's own sample list so the fingerprint describes what the
+            dataset will actually read rather than what the directory happens to
+            contain.
+
+    Returns:
+        ``num_samples``, ``num_classes``, ``num_source_groups``,
+        ``samples_per_class`` (sorted by name), ``sha256`` and ``root``.
+    """
+    base = Path(root)
+    if relative_paths is None:
+        candidates = [
+            path
+            for path in sorted(base.rglob("*"))
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        names = sorted(path.relative_to(base).as_posix() for path in candidates)
+    else:
+        names = sorted(
+            (
+                Path(item).relative_to(base).as_posix()
+                if Path(item).is_absolute()
+                else Path(item).as_posix()
+            )
+            for item in relative_paths
+        )
+
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\n")
+
+    per_class = Counter(
+        Path(name).parent.as_posix() or "." for name in names
+    )
+    groups = {source_image_id(name) for name in names}
+    return {
+        "root": str(base),
+        "num_samples": len(names),
+        "num_classes": len(per_class),
+        "num_source_groups": len(groups),
+        "samples_per_class": dict(sorted(per_class.items())),
+        "sha256": digest.hexdigest(),
+    }
+
+
+def describe_fingerprint_mismatch(
+    left: Mapping[str, object],
+    right: Mapping[str, object],
+    left_name: str = "stage 1",
+    right_name: str = "this run",
+) -> str:
+    """One human-readable line saying how two corpora differ, or ``""`` if they do not.
+
+    Returns the empty string when the digests match, so a caller can branch on
+    truthiness and log nothing in the (normal) matching case.
+    """
+    if not left or not right:
+        return ""
+    if str(left.get("sha256")) == str(right.get("sha256")):
+        return ""
+
+    left_counts = dict(left.get("samples_per_class") or {})
+    right_counts = dict(right.get("samples_per_class") or {})
+    changed = sorted(
+        key
+        for key in set(left_counts) | set(right_counts)
+        if left_counts.get(key, 0) != right_counts.get(key, 0)
+    )
+    detail = ", ".join(
+        f"{key}: {left_counts.get(key, 0)} -> {right_counts.get(key, 0)}" for key in changed[:6]
+    )
+    if len(changed) > 6:
+        detail += f", and {len(changed) - 6} more"
+    return (
+        f"CORPUS MISMATCH: {left_name} used {left.get('num_samples')} images from "
+        f"{left.get('num_source_groups')} source photographs (digest "
+        f"{str(left.get('sha256'))[:16]}), {right_name} has {right.get('num_samples')} from "
+        f"{right.get('num_source_groups')} (digest {str(right.get('sha256'))[:16]})."
+        + (f" Classes that differ -- {detail}." if detail else "")
+    )
+
+
+def raw_photograph_coverage(
+    raw_root: str | os.PathLike[str],
+    cropped_root: str | os.PathLike[str],
+) -> dict[str, object]:
+    """Which source photographs exist but were never cropped.
+
+    The binding constraint on this dataset is the number of *scenes*, not the
+    number of crops: 9,357 crops come from 81 photographs, and within one
+    photograph 89-98 % of crops have a neighbour above cosine 0.95 at 32x32 grey.
+    ``RAW_Samples`` holds 99 photographs, so 18 exist and were never cropped --
+    which is +22 % scenes at zero acquisition cost, concentrated on classes that
+    currently have two or three.
+
+    This function only *reports*. Cropping happens outside this repository, and
+    republishing the corpus moves every published accuracy, so it must be a
+    deliberate re-baseline rather than a side effect of running a script. The
+    corpus fingerprint above is what keeps the before and after distinguishable.
+
+    Matching is on the file **stem**, scoped by sub-variety directory, which is
+    the same key :func:`source_image_id` builds -- so a photograph counts as used
+    exactly when some crop names it.
+
+    Returns ``{}`` when ``raw_root`` does not exist, so a caller with no raw tree
+    degrades to reporting nothing rather than raising.
+    """
+    raw = Path(raw_root)
+    cropped = Path(cropped_root)
+    if not raw.exists() or not cropped.exists():
+        return {}
+
+    used: dict[str, set[str]] = {}
+    for path in sorted(cropped.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        match = SOURCE_IMAGE_PATTERN.match(path.stem)
+        used.setdefault(path.parent.name, set()).add(
+            (match.group("source") if match else path.stem)
+        )
+
+    per_class: dict[str, dict[str, object]] = {}
+    total_raw = 0
+    total_unused = 0
+    for path in sorted(raw.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        sub_variety = path.parent.name
+        entry = per_class.setdefault(
+            sub_variety, {"raw_photographs": 0, "used": 0, "unused": []}
+        )
+        entry["raw_photographs"] = int(entry["raw_photographs"]) + 1
+        total_raw += 1
+        if path.stem in used.get(sub_variety, set()):
+            entry["used"] = int(entry["used"]) + 1
+        else:
+            entry["unused"].append(path.stem)  # type: ignore[union-attr]
+            total_unused += 1
+
+    return {
+        "raw_root": str(raw),
+        "cropped_root": str(cropped),
+        "num_raw_photographs": total_raw,
+        "num_used_photographs": total_raw - total_unused,
+        "num_unused_photographs": total_unused,
+        "per_sub_variety": {name: per_class[name] for name in sorted(per_class)},
+    }
 
 
 class PretrainImageFolderDataset(ImageFolder):
@@ -74,14 +255,47 @@ class PretrainImageFolderDataset(ImageFolder):
         cache_images: bool = False,
         cache_limit_mb: float = 4096.0,
         logger: logging.Logger | None = None,
+        same_photo_local_views: int = 0,
+        seed: int = 0,
         **kwargs,
     ):
         super().__init__(root=root, transform=transform, **kwargs)
         self._cache_buffer: np.ndarray | None = None
         self._cache_meta: list[tuple[int, int, int]] | None = None
         self.cache_bytes = 0
+        self.same_photo_local_views = max(int(same_photo_local_views), 0)
+        self._seed = int(seed)
+        self._source_members: dict[str, list[int]] | None = None
+        self._source_of: list[str] | None = None
+        if self.same_photo_local_views:
+            self._build_source_index()
         if cache_images:
             self._build_cache(float(cache_limit_mb), logger or LOGGER)
+
+    # ------------------------------------------------- provenance positives
+
+    def _build_source_index(self) -> None:
+        """Map each source photograph to the indices of the crops cut from it."""
+        self._source_of = [source_image_id(path) for path, _ in self.samples]
+        members: dict[str, list[int]] = {}
+        for index, key in enumerate(self._source_of):
+            members.setdefault(key, []).append(index)
+        self._source_members = members
+
+    def corpus_fingerprint(self) -> dict[str, object]:
+        """Identity of the corpus this dataset will actually read. See
+        :func:`corpus_fingerprint`."""
+        return corpus_fingerprint(self.root, [path for path, _ in self.samples])
+
+    def source_groups(self) -> np.ndarray:
+        """Integer group id per sample, keyed on the source photograph.
+
+        The same key :meth:`HierarchicalSeedDataset.source_groups` builds, so a
+        stage-1 group count and a stage-2 one are the same quantity.
+        """
+        keys = [source_image_id(path) for path, _ in self.samples]
+        ordering = {key: index for index, key in enumerate(sorted(set(keys)))}
+        return np.array([ordering[key] for key in keys], dtype=np.int64)
 
     def _build_cache(self, limit_mb: float, logger: logging.Logger) -> None:
         limit_bytes = int(limit_mb * 1024 * 1024)
@@ -126,13 +340,52 @@ class PretrainImageFolderDataset(ImageFolder):
         view = self._cache_buffer[offset : offset + height * width * 3].reshape(height, width, 3)
         return Image.fromarray(view)
 
+    def _partner_indices(self, index: int, count: int) -> list[int]:
+        """``count`` other crops of the same source photograph, or ``[]``.
+
+        Drawn from a generator seeded on ``(seed, index, epoch-free)``, so the
+        partner set is a deterministic function of the sample rather than of
+        worker scheduling -- two runs at one seed see the same pairs, and a
+        dataloader worker cannot change them. A photograph with only one crop
+        yields nothing and the caller falls back to augmenting the anchor, which
+        keeps the view count constant.
+        """
+        if not count or self._source_members is None or self._source_of is None:
+            return []
+        pool = self._source_members.get(self._source_of[index], ())
+        others = [item for item in pool if item != index]
+        if not others:
+            return []
+        rng = np.random.default_rng((self._seed, int(index)))
+        return [int(others[i]) for i in rng.integers(0, len(others), size=int(count))]
+
     def __getitem__(self, index):
         path, target = self.samples[index]
         image = self._decode(index, path)
         if self.transform is None:
-            original, crops = image, []
-        else:
+            return image, [], target, path
+
+        partners = self._partner_indices(index, self.same_photo_local_views)
+        if not partners:
             original, crops = self.transform(image)
+            return original, crops, target, path
+
+        # F1: replace the trailing local views with *other crops of the same
+        # photograph*, augmented by the same local pipeline. DINO's positives are
+        # augmented views of one crop, so the invariance it teaches is to
+        # crop/blur/colour; the invariance the downstream task needs is to *which
+        # individual seed*, and two crops of one photograph are by construction
+        # two individuals of the same variety. No labels are involved -- the
+        # provenance key is parsed from the filename.
+        #
+        # The self-detecting risk is that same-photograph crops share lighting,
+        # background and sensor noise, so the objective can be satisfied by
+        # learning photograph identity -- exactly what the photograph-disjoint
+        # protocol punishes. `nuisance_decodability` in the stage-1 evaluation is
+        # the gate: if this arm raises within-class photograph decodability, it
+        # learned the confound.
+        partner_images = [self._decode(other, self.samples[other][0]) for other in partners]
+        original, crops = self.transform(image, partner_images=partner_images)
         return original, crops, target, path
 
 
@@ -415,8 +668,26 @@ class HierarchicalSeedDataset(Dataset):
         ordering = {key: index for index, key in enumerate(sorted(set(keys)))}
         return np.array([ordering[key] for key in keys], dtype=np.int64)
 
-    def group_report(self) -> dict[str, object]:
+    def corpus_fingerprint(self) -> dict[str, object]:
+        """Identity of the corpus this dataset reads. See :func:`corpus_fingerprint`.
+
+        The stage-1 trainer records the same quantity for the corpus it
+        self-distilled on, and ``pretrain_eval`` compares the two. That
+        comparison is the only thing that would have caught the shipped
+        encoder being trained on 8,173 crops while everything downstream used
+        9,357.
+        """
+        return corpus_fingerprint(self.root_dir, [path for path, _, _ in self.samples])
+
+    def group_report(self, raw_root: str | os.PathLike[str] | None = None) -> dict[str, object]:
         """Diagnostics describing how much provenance the tree actually has.
+
+        Args:
+            raw_root: Optional ``RAW_Samples`` tree. When supplied, the report
+                additionally names the source photographs that exist and were
+                never cropped -- 18 of 99 on the shipped corpus, i.e. +22 %
+                scenes available at zero acquisition cost. Reporting only; see
+                :func:`raw_photograph_coverage`.
 
         Reported at the top of every run because it decides what the headline
         accuracy can mean. ``single_group_sub_varieties`` is the number that
@@ -428,12 +699,17 @@ class HierarchicalSeedDataset(Dataset):
         _, sub_names = self.get_ordered_class_names()
         groups = self.source_groups()
         per_sub: dict[str, set[int]] = {name: set() for name in sub_names}
+
         for (_, _, sub_label), group in zip(self.samples, groups):
             per_sub[sub_names[sub_label]].add(int(group))
 
         sizes = Counter(groups.tolist())
         singletons = sorted(name for name, ids in per_sub.items() if len(ids) < 2)
+        coverage = (
+            raw_photograph_coverage(raw_root, self.root_dir) if raw_root else {}
+        )
         return {
+            **({"raw_photograph_coverage": coverage} if coverage else {}),
             "num_samples": len(self.samples),
             "num_source_groups": len(sizes),
             "mean_crops_per_source": len(self.samples) / max(len(sizes), 1),
@@ -464,6 +740,8 @@ def get_pretrain_dataloader(
     logger: logging.Logger | None = None,
     world_size: int = 1,
     rank: int = 0,
+    same_photo_local_views: int = 0,
+    seed: int = 0,
 ):
     """Build the stage-1 multi-crop loader.
 
@@ -483,6 +761,14 @@ def get_pretrain_dataloader(
         cache_images: Hold every decoded image in RAM; see
             :class:`PretrainImageFolderDataset`. Silently ignored when workers
             would not share it (see below).
+        same_photo_local_views: Replace this many local views with crops of
+            *other crops from the same source photograph* -- the F1 arm of
+            ``STAGE1_CHANGES.md``. ``0`` (the default) is plain DINO multi-crop
+            and is what every published number was produced under. Only the
+            ``image_folder`` format carries the provenance needed for it.
+        seed: Seeds the per-sample partner draw, so the pairing is a
+            deterministic function of the sample rather than of which worker
+            happened to build it.
         generator: Seeds the shuffling order.
         world_size / rank: Shard the dataset with a ``DistributedSampler`` when
             ``world_size > 1``. **Images** are sharded, never views: every view
@@ -525,8 +811,16 @@ def get_pretrain_dataloader(
             cache_images=cache_images,
             cache_limit_mb=cache_limit_mb,
             logger=log,
+            same_photo_local_views=int(same_photo_local_views),
+            seed=int(seed),
         )
     elif dataset_format == "pickle_batches":
+        if int(same_photo_local_views) > 0:
+            raise ValueError(
+                "same_photo_local_views needs the source-photograph provenance that only the "
+                "image_folder layout carries (filenames like IMG_0502_bbox137.png); the "
+                "pickle_batches format has none."
+            )
         dataset = PickleBatchSeedDataset(root_dir=data_dir, image_size=image_size, transform=transform)
     else:
         raise ValueError(f"Unsupported pretraining dataset format: {dataset_format}")

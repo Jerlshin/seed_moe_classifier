@@ -73,7 +73,7 @@ The teacher gets the same treatment over its two global views, under
 from __future__ import annotations
 
 import copy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any
 
 import timm
@@ -253,28 +253,50 @@ class _StudentPass(nn.Module):
     attribute (a bound method is not an ``nn.Module``, so it registers nothing).
     """
 
-    def __init__(self, backbone: nn.Module, head: nn.Module, resolve, pool):
+    def __init__(self, backbone: nn.Module, head: nn.Module, resolve, pool, owner=None, aux_head=None):
         super().__init__()
         self.backbone = backbone
         self.head = head
+        # Registered so DDP owns the auxiliary head's parameters too. `None`
+        # under the default configuration, in which case nothing is registered
+        # and the wrapper is byte-identical to what it was before.
+        if aux_head is not None:
+            self.aux_head = aux_head
         self._resolve = resolve
         self._pool = pool
+        #: Plain attribute: the owning DINO is already this wrapper's parent, and
+        #: registering it would recurse and rename every state-dict key.
+        self._owner = owner
 
     def forward(
         self,
         views: torch.Tensor,
         return_bottleneck: bool = False,
         chunk_size: int | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_features: bool = False,
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         backbone = self._resolve("student_backbone")
         head = self._resolve("student_head")
-        if not chunk_size or chunk_size >= views.shape[0]:
-            features = self._pool(backbone(views))
+        capture = self._owner.capture_aux("student") if return_aux else nullcontext()
+        with capture:
+            if not chunk_size or chunk_size >= views.shape[0]:
+                features = self._pool(backbone(views))
+            else:
+                features = torch.cat(
+                    [self._pool(backbone(part)) for part in views.split(int(chunk_size))], dim=0
+                )
+        outputs: list[torch.Tensor] = []
+        logits = head(features, return_bottleneck=return_bottleneck)
+        if return_bottleneck:
+            outputs.extend(logits)
         else:
-            features = torch.cat(
-                [self._pool(backbone(part)) for part in views.split(int(chunk_size))], dim=0
-            )
-        return head(features, return_bottleneck=return_bottleneck)
+            outputs.append(logits)
+        if return_features:
+            outputs.append(features)
+        if return_aux:
+            outputs.append(self._owner.apply_aux_head("student"))
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
 class DINO(nn.Module):
@@ -317,6 +339,9 @@ class DINO(nn.Module):
         projection_use_batch_norm: bool | str = "layer",
         projection_norm_last_layer: bool = True,
         freeze_last_layer_epochs: int = 1,
+        aux_stage: int | None = None,
+        aux_out_dim: int | None = None,
+        aux_weight: float = 1.0,
     ):
         super().__init__()
         # Self-supervised pretraining is standardised on SwinV2. Validating here means a
@@ -355,6 +380,42 @@ class DINO(nn.Module):
         self.teacher_backbone = copy.deepcopy(self.student_backbone)
         self.teacher_head = DINOHead(**head_kwargs)
         self.teacher_head.load_state_dict(self.student_head.state_dict())
+
+        # ------------------------------------------------- auxiliary stage head
+        #
+        # The C4 arm of STAGE1_CHANGES.md. `aux_stage=2` attaches a SECOND DINO
+        # head to the mean-pooled output of `layers.2`, with its own prototypes,
+        # and the trainer sums the two losses at `aux_weight`.
+        #
+        # The reason is measurable rather than aesthetic. Reading `layers.2`
+        # downstream (`model.backbone.feature_stage=stage3`) fixes *where* stage 2
+        # reads; it does not fix the fact that the stage-1 gradient reaches
+        # `layers.2` only through two blocks being optimised for a 2,048-way
+        # prototype task. Linear CKA against the ImageNet initialisation was 0.103
+        # at `layers.3` and 0.390 at `layers.2` on the shipped run: the objective
+        # consumed the last stage. Supervising `layers.2` directly means the layer
+        # that ships is the layer that was trained.
+        #
+        # Off by default (`aux_stage: null`). It adds parameters, prototypes to
+        # keep alive, and a weight to tune, so it is an isolated arm rather than a
+        # recipe change, and it confounds the `feature_stage` decision if run
+        # simultaneously with it.
+        self.aux_stage = None if aux_stage is None else int(aux_stage)
+        self.aux_weight = float(aux_weight)
+        self.student_aux_head: DINOHead | None = None
+        self.teacher_aux_head: DINOHead | None = None
+        self._aux_capture: dict[str, list[torch.Tensor]] = {"student": [], "teacher": []}
+        if self.aux_stage is not None:
+            aux_dim = self._stage_channels(self.aux_stage)
+            aux_kwargs = {
+                **head_kwargs,
+                "in_dim": aux_dim,
+                "out_dim": int(aux_out_dim or out_dim),
+            }
+            self.student_aux_head = DINOHead(**aux_kwargs)
+            self.teacher_aux_head = DINOHead(**aux_kwargs)
+            self.teacher_aux_head.load_state_dict(self.student_aux_head.state_dict())
+            deactivate_requires_grad(self.teacher_aux_head)
 
         # Stochastic depth is a property of the learner, not of the target. The
         # deepcopy inherited it; this takes it back out. Recorded because "did
@@ -503,6 +564,13 @@ class DINO(nn.Module):
             self._compiled["teacher_head"] = maybe_compile(
                 self.teacher_head, True, compile_mode, logger
             )
+            if self.student_aux_head is not None:
+                self._compiled["student_aux_head"] = maybe_compile(
+                    self.student_aux_head, True, compile_mode, logger
+                )
+                self._compiled["teacher_aux_head"] = maybe_compile(
+                    self.teacher_aux_head, True, compile_mode, logger
+                )
             applied["compiled"] = sorted(self._compiled)
             applied["compile_mode"] = compile_mode
 
@@ -574,9 +642,16 @@ dino.yaml`` already documents for the EMA, now with a second reason.
         # module's state from rank 0, and the teacher is not in that module.
         broadcast_module_state(self.teacher_backbone, context)
         broadcast_module_state(self.teacher_head, context)
+        if self.teacher_aux_head is not None:
+            broadcast_module_state(self.teacher_aux_head, context)
 
         student = _StudentPass(
-            self.student_backbone, self.student_head, self._module, self._pool
+            self.student_backbone,
+            self.student_head,
+            self._module,
+            self._pool,
+            owner=self,
+            aux_head=self.student_aux_head,
         )
         kwargs: dict[str, Any] = {
             **buffer_sync_kwarg(False),
@@ -633,7 +708,78 @@ dino.yaml`` already documents for the EMA, now with a second reason.
 
     def student_parameters(self) -> list[nn.Parameter]:
         """Parameters the optimizer should own (the teacher is EMA-only)."""
-        return list(self.student_backbone.parameters()) + list(self.student_head.parameters())
+        parameters = list(self.student_backbone.parameters()) + list(self.student_head.parameters())
+        if self.student_aux_head is not None:
+            parameters += list(self.student_aux_head.parameters())
+        return parameters
+
+    # ---------------------------------------------- auxiliary stage capture
+
+    def _stage_channels(self, index: int) -> int:
+        """Channel count of ``feature_info[index]`` on the student trunk."""
+        info = getattr(self.student_backbone, "feature_info", None)
+        if info is None:
+            raise AttributeError(
+                f"{self.backbone_name!r} exposes no `feature_info`, so aux_stage={index} "
+                "cannot resolve its input width."
+            )
+        channels = (
+            info.channels() if hasattr(info, "channels") else [entry["num_chs"] for entry in info]
+        )
+        if index >= len(channels):
+            raise ValueError(
+                f"{self.backbone_name!r} has {len(channels)} stages; aux_stage={index} is out of range."
+            )
+        return int(channels[index])
+
+    @contextmanager
+    def capture_aux(self, side: str):
+        """Collect ``layers[aux_stage]``'s pooled output during one forward.
+
+        A forward hook rather than a second forward: the auxiliary objective
+        supervises the *same* activations the primary one produces, so
+        recomputing them would double the trunk cost and -- under stochastic
+        depth -- would not even produce the same tensor.
+
+        A no-op when no auxiliary head is configured, which is the default, so
+        nothing is registered and nothing is captured on the shipped path.
+        """
+        if self.aux_stage is None:
+            yield
+            return
+        backbone = getattr(self, f"{side}_backbone")
+        layers = getattr(backbone, "layers", None)
+        if layers is None or self.aux_stage >= len(layers):
+            raise AttributeError(
+                f"{self.backbone_name!r} exposes no layers[{self.aux_stage}] to hook."
+            )
+        bucket = self._aux_capture[side]
+        bucket.clear()
+        handle = layers[self.aux_stage].register_forward_hook(
+            lambda _module, _inputs, output: bucket.append(self._pool(output))
+        )
+        try:
+            yield
+        finally:
+            handle.remove()
+
+    def apply_aux_head(self, side: str) -> torch.Tensor:
+        """Prototype logits from the auxiliary head over the captured stage.
+
+        Concatenates in capture order, which is the chunk order the caller used,
+        so the result stays view-major exactly as the primary head's output does.
+        """
+        head = getattr(self, f"{side}_aux_head")
+        if head is None:
+            raise RuntimeError("No auxiliary head is configured; set model.head.aux_stage.")
+        captured = self._aux_capture[side]
+        if not captured:
+            raise RuntimeError(
+                "The auxiliary stage was not captured. The forward must run inside "
+                "`capture_aux(side)`."
+            )
+        features = captured[0] if len(captured) == 1 else torch.cat(captured, dim=0)
+        return self._module(f"{side}_aux_head")(features)
 
     def parameter_summary(self) -> dict[str, int]:
         """Parameter counts, split the way the cost table reports them.
@@ -655,15 +801,20 @@ dino.yaml`` already documents for the EMA, now with a second reason.
 
         backbone = count(self.student_backbone)
         head = count(self.student_head)
+        aux = count(self.student_aux_head) if self.student_aux_head is not None else 0
+        teacher_aux = count(self.teacher_aux_head) if self.teacher_aux_head is not None else 0
         return {
             "backbone": backbone,
             "dino_head": head,
-            "student_total": backbone + head,
+            "dino_aux_head": aux,
+            "student_total": backbone + head + aux,
             "student_trainable": (
-                count(self.student_backbone, True) + count(self.student_head, True)
+                count(self.student_backbone, True)
+                + count(self.student_head, True)
+                + (count(self.student_aux_head, True) if self.student_aux_head is not None else 0)
             ),
             "student_backbone_trainable": count(self.student_backbone, True),
-            "teacher_total": count(self.teacher_backbone) + count(self.teacher_head),
+            "teacher_total": count(self.teacher_backbone) + count(self.teacher_head) + teacher_aux,
             "prototype_layer": count(self.student_head.last_layer),
         }
 
@@ -707,10 +858,13 @@ dino.yaml`` already documents for the EMA, now with a second reason.
 
     def ema_pairs(self) -> list[tuple[nn.Module, nn.Module]]:
         """``(student, teacher)`` module pairs the EMA advances, in order."""
-        return [
+        pairs = [
             (self.student_backbone, self.teacher_backbone),
             (self.student_head, self.teacher_head),
         ]
+        if self.student_aux_head is not None and self.teacher_aux_head is not None:
+            pairs.append((self.student_aux_head, self.teacher_aux_head))
+        return pairs
 
     # -------------------------------------------------------------- forward
 
@@ -767,8 +921,18 @@ dino.yaml`` already documents for the EMA, now with a second reason.
         views: torch.Tensor,
         return_bottleneck: bool = False,
         chunk_size: int | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_features: bool = False,
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Prototype logits for a stacked ``[V * B, C, H, W]`` view tensor.
+
+        ``return_bottleneck``, ``return_features`` and ``return_aux`` append, in
+        that order, the head's L2-normalised bottleneck, the **pooled trunk
+        feature** and the auxiliary stage head's prototype logits. The trunk
+        feature is what ``model.loss.koleo_space=backbone`` regularises: KoLeo is
+        currently applied to a 256-D bottleneck that stage 2 never sees, and
+        DINOv2 applies it to ``x_norm_clstoken`` -- the backbone output -- for
+        exactly that reason.
 
         The blocks must be **view-major** -- all of view 0, then all of view 1 --
         because :class:`~src.losses.dino.CustomDINOLoss` chunks the output back
@@ -787,19 +951,46 @@ dino.yaml`` already documents for the EMA, now with a second reason.
         """
         student = self._ddp.get("student")
         if student is not None:
-            return student(views, return_bottleneck=return_bottleneck, chunk_size=chunk_size)
-        features = self._backbone_features("student_backbone", views, chunk_size)
-        return self._module("student_head")(features, return_bottleneck=return_bottleneck)
+            return student(
+                views,
+                return_bottleneck=return_bottleneck,
+                chunk_size=chunk_size,
+                return_features=return_features,
+                return_aux=return_aux,
+            )
+        with self.capture_aux("student") if return_aux else nullcontext():
+            features = self._backbone_features("student_backbone", views, chunk_size)
+        outputs: list[torch.Tensor] = []
+        logits = self._module("student_head")(features, return_bottleneck=return_bottleneck)
+        if return_bottleneck:
+            outputs.extend(logits)
+        else:
+            outputs.append(logits)
+        if return_features:
+            outputs.append(features)
+        if return_aux:
+            outputs.append(self.apply_aux_head("student"))
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
     @torch.no_grad()
     def forward_teacher_views(
         self,
         views: torch.Tensor,
         chunk_size: int | None = None,
-    ) -> torch.Tensor:
-        """Prototype logits for the teacher's stacked global views, under ``no_grad``."""
-        features = self._backbone_features("teacher_backbone", views, chunk_size)
-        return self._module("teacher_head")(features)
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Prototype logits for the teacher's stacked global views, under ``no_grad``.
+
+        With ``return_aux`` the auxiliary stage head's targets come back too, so
+        the C4 arm scores its second objective against an EMA teacher exactly as
+        the primary one does rather than against the student's own output.
+        """
+        with self.capture_aux("teacher") if return_aux else nullcontext():
+            features = self._backbone_features("teacher_backbone", views, chunk_size)
+        logits = self._module("teacher_head")(features)
+        if not return_aux:
+            return logits
+        return logits, self.apply_aux_head("teacher")
 
 
 def build_dino(backbone_cfg: Any, head_cfg: Any, freeze_last_layer_epochs: int = 1) -> DINO:
@@ -838,4 +1029,15 @@ def build_dino(backbone_cfg: Any, head_cfg: Any, freeze_last_layer_epochs: int =
         projection_use_batch_norm=getattr(head_cfg, "use_batch_norm", "layer"),
         projection_norm_last_layer=bool(getattr(head_cfg, "norm_last_layer", True)),
         freeze_last_layer_epochs=int(freeze_last_layer_epochs),
+        aux_stage=(
+            None
+            if getattr(head_cfg, "aux_stage", None) is None
+            else int(head_cfg.aux_stage)
+        ),
+        aux_out_dim=(
+            None
+            if getattr(head_cfg, "aux_out_dim", None) is None
+            else int(head_cfg.aux_out_dim)
+        ),
+        aux_weight=float(getattr(head_cfg, "aux_weight", 1.0) or 1.0),
     )

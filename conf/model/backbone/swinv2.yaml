@@ -47,6 +47,39 @@ pretrained: false
 
 dynamic_img_size: true
 
+# ---------------------------------------------------------------------------
+# Which trunk stage the encoder reads: "final" | "stage3" | "stage3_pooled_2x2".
+#
+# "final" is `forward_features` -- layers.3 after the trunk's own norm, an 8x8
+# grid of 768 channels. It is what every published number here was produced
+# under and it stays the default.
+#
+# "stage3" reads layers.2 instead: a 16x16 grid of 384 channels, which is
+# NATIVELY the paper's z in R^384 (Eq. 4), so the projection stops being an
+# information bottleneck.
+#
+# The reason to consider it is measured, not aesthetic. Linear CKA between the
+# shipped DINO encoder and its ImageNet initialisation is 0.103 at layers.3 and
+# 0.390 at layers.2: self-distillation rewrote the last stage to serve its
+# 2,048-prototype head, and that is the stage stage 2 currently consumes. On the
+# photograph-disjoint 27-way out-of-fold probe, layers.2 scored +3.25 pp (linear)
+# and +3.90 pp (512-unit MLP) over the pooled final stage -- and the ordering
+# held for the plain ImageNet weights too, so it is not an artefact of this
+# checkpoint. Concatenating all four stages scored no better than layers.2
+# alone, so this is a REPLACEMENT, not a multi-scale fusion.
+#
+# The cost, and why "stage3_pooled_2x2" exists. 256 tokens instead of 64
+# quadruples the MoE's routing slots and makes the Eq. 11 cross-attention
+# 256x256 -- 16x its current cost. "stage3_pooled_2x2" average-pools the 16x16
+# grid to 8x8, keeping the token budget and the 384 width. Try that first.
+#
+# Note what the +3.25 pp was measured on: the MEAN-POOLED stage-3 feature. Grid
+# routing over the stage-3 tokens is a different measurement, so this is
+# evidence for running the experiment, not proof the gain transfers. Compare
+# with `experiment.training.split_protocol: grouped` at a fixed seed.
+# ---------------------------------------------------------------------------
+feature_stage: "final"
+
 # Stochastic depth (timm's `drop_path_rate`). This is timm's own per-block
 # DropPath -- there is no second mechanism in this repository, and there must
 # not be one.

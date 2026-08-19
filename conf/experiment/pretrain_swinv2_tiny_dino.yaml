@@ -1,0 +1,42 @@
+# @package _global_
+#
+# Stage-1 on SwinV2-Tiny: the cheap arm-throughput trunk.
+#
+#   python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_tiny_dino
+#
+# Inherits every hyperparameter from `pretrain_swinv2_dino` and changes the trunk
+# and the two paths it writes to. Nothing else moves, so a Tiny/Small comparison
+# is a trunk comparison.
+#
+# Why Tiny is a serious option rather than a downgrade. On the frozen
+# photograph-disjoint readout, with no in-domain training at all, Tiny scored
+# 0.6021 pooled and 0.6243 at layers.2 against Small's 0.6053 and 0.6174 -- so it
+# is -0.32 pp on the readout stage 2 currently uses and **+0.69 pp** on the one
+# the audit recommends, for **half the FLOPs** (13.32 vs 25.56 GFLOPs/view). The
+# stage-1 evaluation's own Finding 2.11 agrees that capacity is not the binding
+# constraint here; scene diversity is (81 photographs). There is no configuration
+# in which the current Small is the right choice.
+#
+# Use this trunk when the goal is arm throughput -- a five-arm Phase 1 at half
+# the per-view cost -- and settle the trunk question properly first with
+# `experiment=screen_backbones`, which separates capacity from pretraining
+# corpus.
+
+defaults:
+  - pretrain_swinv2_dino
+
+experiment:
+  name: "pretrain_swinv2_tiny_dino"
+
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_swinv2_tiny_dino"
+    # A DIFFERENT publication path, for the same reason the Base control uses
+    # one: writing the shared file would swap the trunk under every stage-2
+    # variant, and `checkpoint_strict: false` would report the mismatch as one
+    # line about missing keys.
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_tiny_pretrained.pth"
+
+model:
+  backbone:
+    name: "swinv2_tiny_window16_256"
+    feature_dim: 768

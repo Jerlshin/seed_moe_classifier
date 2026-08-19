@@ -207,3 +207,39 @@ fills.
 Supports `cuda` / `mps` / `cpu` with `auto` detection, so the code runs on Apple
 Silicon. AMP is gated on `device.type == "cuda"`, and `pin_memory` is likewise
 forced off unless CUDA.
+
+## `representation.py` — two additions after the stage-1 audit
+
+**`nuisance_decodability`** asks the mirror image of every other measurement in
+the module: with class identity held constant, how well can the **source
+photograph** be recovered? That is exactly the confound the photograph-disjoint
+protocol punishes, and what an in-domain SSL stage should remove. Restricted to
+photographs of the same sub-variety, one class at a time, so an encoder that
+separates the classes perfectly and the photographs not at all scores exactly
+chance. Nearest-class-mean in cosine space over stratified folds — no fitted
+hyperparameter, so the number cannot be moved by a regularisation choice, and it
+is comparable across encoders of different width.
+
+It matters because it is the one axis on which the shipped stage-1 run
+demonstrably worked: ImageNet at +10.0 pp above chance, DINO at +3.5 pp, a 65 %
+reduction that no other metric reported. **Read it jointly with the readout** —
+an encoder that discards everything scores chance, so low alone is not good.
+
+**`handcrafted_image_features`** returns ten numbers per crop: `log(w·h)`,
+`log(w/h)`, mean and std RGB, mean and std grey. They score **0.5360** 27-way
+out-of-fold under the identical protocol — 15.6 pp *above* an untrained 48.96 M
+trunk and 9.2 pp below the shipped encoder. Computed from the file at its
+**native** resolution, deliberately: absolute crop size is part of what they
+encode and the resized tensor the encoders see has thrown it away.
+
+## `evaluation.py` — the stage-1 dynamics summary
+
+`PretrainDynamics.summary()` reports `teacher_student_kl_{initial,final,min}` and
+`teacher_entropy_share_of_loss_{final,improvement}` alongside the loss figures,
+because the reported DINO loss is ~95 % target entropy and only the KL is the
+student learning. Runs recorded before the decomposition existed come back as
+**NaN** rather than as a silently wrong number.
+
+`loop_blocked_fraction_mean` falls back to `epoch/data_wait_fraction` for those
+runs, and `gpu_busy_fraction_mean` is NaN unless the run opted into the
+synchronised measurement.

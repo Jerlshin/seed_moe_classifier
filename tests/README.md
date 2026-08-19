@@ -174,3 +174,52 @@ Put paper-derived numbers in `conftest.py` rather than inline. If a test asserts
 something the paper states, quote the sentence in the docstring — that is what
 makes a future failure diagnosable as drift rather than as flakiness. If it
 asserts something the *revision* changed, say so and name the constant.
+
+## `test_stage1_changes.py`
+
+Every test in this module pins a behaviour the stage-1 audit
+(`STAGE1_CHANGES.md`) found either **wrong** or **unmeasurable**, and the
+distinction matters when one fails:
+
+- A **KoLeo** or **loss-decomposition** failure is a regression of a *correctness*
+  fix. The pre-audit behaviour is still reachable behind a flag, so a failure here
+  means the default silently moved back to it.
+- A **provenance**, **split** or **nuisance** failure is a regression of an
+  *instrument*. Nothing about the model changes, but a number becomes
+  uninterpretable — which is how the shipped encoder came to be trained on 8,173
+  of 9,357 crops with no record anywhere.
+
+The file is organised by the audit's own section letters, so a failure names the
+item it belongs to:
+
+| Section | What it pins |
+| --- | --- |
+| A1 | KoLeo is applied **per global view**; the across-views form repels the two views of one image, measured on both the value *and* the gradient |
+| A4 | `CE = H(q) + KL(q‖p)` holds exactly under both centerings, and the decomposition is emitted even on a non-logging step (the epoch mean has to see every micro-batch) |
+| A2 / E2 | The corpus fingerprint counts what the run will read, is path-independent, and changes when one crop is removed |
+| A6 | Stage 1's `summary.json` round-trips and carries the corpus |
+| A7 | *(in `conftest.py`)* the fixture taxonomy matches the real tree — `Amaranthus, Millet, Mustard, Rice`, not `Millet, Mustard, Rice, Seasame` |
+| B1 | `feature_stage` reads `layers.2`, reports its own width, and `forward_intermediates` matches the hook fallback bitwise |
+| B3 / G1 | The `auto` worker cap is 16 and configurable |
+| B4 / E6 | Raw-photograph coverage names the uncropped photographs |
+| C4 | The auxiliary head is not allocated unless asked for, and never renames the published state dict |
+| E1 | The handcrafted floor is ten numbers encoding size and colour |
+| E5 | `grouped_cv` holds out every crop exactly once, keeps folds photograph-disjoint, and `merge_out_of_fold` restores dataset order |
+| E9 | Nuisance decodability is at chance for a class-only representation and ~1 for a photograph-encoding one |
+| F1 | Provenance-derived positives keep the view count and draw partners from the same photograph, deterministically in the seed |
+
+Plus four cross-cutting groups: multi-view ordering (the collate's view-major
+layout is what makes per-view KoLeo meaningful — the two facts are tied together
+in one test), backward-compatible checkpoint loading, distributed execution (the
+DDP wrapper must not rename the published keys), and evaluation reproducibility.
+
+**The `conftest.py` taxonomy fix is load-bearing.** `SUBVARIETY_COUNTS` previously
+used `Seasame` in place of `Amaranthus`, and because the hierarchy is built from
+*sorted* directory names that put the 3-member class last instead of first: the
+synthetic parent→child map was `[0]*8 + [1]*3 + [2]*13 + [3]*3` where
+production's is `[0]*3 + [1]*8 + [2]*3 + [3]*13`. Every hierarchy fixture
+exercised a 4-parent tree with the right totals and the wrong grouping — exactly
+the class of bug the Eq. 10 KL aggregation is most likely to have. Tests that
+depended on the old ordering now derive their expectations from
+`SUBVARIETY_COUNTS` rather than restating them as literals, so the two cannot
+agree with each other and disagree with production again.

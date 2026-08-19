@@ -139,6 +139,21 @@ The trainer cross-checks the discovered class counts against `data.*` and refuse
 to start on a mismatch, which would otherwise surface only as unexplained
 metrics.
 
+## The stage-1 arm manifests are not a Hydra group
+
+`conf/stage1_arms/*.yaml` are **plain YAML**, read by
+`scripts/run_stage1_ablations.py`, not composed by Hydra. Each names a base
+Hydra experiment, a list of overrides applied to every arm, and one entry per
+arm; the runner turns each entry into a `contrastive_pretrain` command and a
+`pretrain_eval` command with per-arm paths pinned.
+
+They live under `conf/` because they *are* configuration — the point of
+`STAGE1_CHANGES.md` requirement is that the arms are data rather than a Python
+list, so adding an arm is adding an entry — but they are not a config group and
+`experiment=phase1` is not a thing. Phases 0-3 of the audit's sequence ship as
+`phase0.yaml` … `phase3.yaml`, and each carries in its comments the rules about
+what may and may not be combined (four genuine confounds; see the manifest).
+
 ## Paper-critical values
 
 Every value below is asserted by `tests/test_configs.py`, each assertion citing
