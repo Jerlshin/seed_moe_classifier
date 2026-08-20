@@ -28,6 +28,7 @@ import pytest
 from omegaconf import OmegaConf
 from PIL import Image
 
+from tests.conftest import DATASET_NUM_CROPS
 from src.datasets.transforms import (
     TORCHVISION_CROP_RATIO,
     DataAugmentationDINO,
@@ -47,14 +48,20 @@ from src.utils.training.representation_probe import (
     stratified_readout,
 )
 
-#: A stand-in for the real corpus: median 52 x 51 px, 96.6 % non-square, spanning
-#: 21x22 to 881x413. Drawn from a fixed seed so the geometry assertions below are
-#: reproducible without the dataset on disk.
+#: A stand-in for the LEGACY corpus: median 52 x 51 px, 96.6 % non-square,
+#: spanning 21x22 to 881x413. Drawn from a fixed seed so the geometry assertions
+#: below are reproducible without the dataset on disk.
+#:
+#: Deliberately still the legacy shape. These tests assert *orderings* that the
+#: non-square corpus makes visible -- above all the deterministic-fallback
+#: behaviour that `crop_ratio` exists for, which is only exercisable on a source
+#: distribution that is not square. `_synthetic_refined_sizes` is the canonical
+#: corpus's shape, and the two are used side by side.
 _RNG = np.random.default_rng(20260819)
 
 
 def _synthetic_source_sizes(count: int = 4000) -> list[tuple[int, int]]:
-    """Sizes with the measured shape of ``Cropped_Samples``.
+    """Sizes with the measured shape of ``Cropped_Samples`` (the legacy corpus).
 
     Log-normal around a 52 x 51 median with an aspect spread matching the
     measured p5/p95 of 0.52 / 1.98. Not the real corpus, but close enough that
@@ -66,6 +73,16 @@ def _synthetic_source_sizes(count: int = 4000) -> list[tuple[int, int]]:
     widths = np.clip(side * np.sqrt(aspect), 21, 881).astype(int)
     heights = np.clip(side / np.sqrt(aspect), 22, 413).astype(int)
     return list(zip(widths.tolist(), heights.tolist()))
+
+
+def _synthetic_refined_sizes(count: int = 4000) -> list[tuple[int, int]]:
+    """Sizes with the measured shape of ``Refined_Samples`` (canonical).
+
+    Square by construction -- that is the property under test -- log-normal
+    around a 61 px side spanning the measured p1/p99 of 35 / 174 px.
+    """
+    side = np.clip(np.exp(_RNG.normal(np.log(61.0), 0.48, count)), 32, 343).astype(int)
+    return list(zip(side.tolist(), side.tolist()))
 
 
 def _image(width: int = 52, height: int = 51) -> Image.Image:
@@ -188,7 +205,7 @@ def test_rotation90_is_a_pixel_permutation():
     """No interpolation, no resampling, no black corners.
 
     ``T.RandomRotation`` would interpolate every pixel and leave corners empty.
-    On images whose entire content is ~52 x 51 native pixels already upsampled
+    On images whose entire content is ~61 x 61 native pixels already upsampled
     5x, that is not an augmentation worth paying for -- which is why the dihedral
     elements go through ``PIL.Image.transpose`` instead.
     """
@@ -551,8 +568,10 @@ def test_v2_pretraining_declares_the_corpus_and_selects_on_the_probe(conf_dir):
 
     cfg = build(conf_dir, "experiment=pretrain_dino")
     # The failure this guards against already happened: 8,173 crops trained, and
-    # 9,357 used everywhere downstream.
-    assert cfg.data.expected_num_samples == 9357
+    # 9,357 used everywhere downstream. The count moved with the corpus
+    # re-baseline; asserting the constant rather than a literal is what keeps
+    # this test a statement about the canonical corpus.
+    assert cfg.data.expected_num_samples == DATASET_NUM_CROPS
     assert cfg.experiment.training.corpus_check == "error"
 
     assert cfg.model.backbone.name == "swinv2_tiny_window16_256"
@@ -578,7 +597,12 @@ def test_v2_data_policy_preserves_colour_and_the_object(conf_dir):
     # Geometry: views must depict the same object.
     assert list(augmentation.local_crops_scale) == [0.30, 0.70]
     assert list(augmentation.global_crops_scale) == [0.70, 1.00]
-    assert list(augmentation.crop_ratio) == [0.5, 2.0]
+    # Torchvision's range, not the legacy corpus's wide one. The refined crops
+    # are square, where the wide range RAISES the deterministic-fallback rate
+    # (4.8 % against 0.3 %) instead of lowering it, and applies up to a 2x
+    # anisotropic rescale to a seed whose proportions the square crops exist to
+    # preserve.
+    assert list(augmentation.crop_ratio) == pytest.approx(list(TORCHVISION_CROP_RATIO))
 
     # Colour: pigmentation is class signal here (mean RGB alone scores 0.3169 on
     # the 27-way task), so the cue is not deleted or inverted.
@@ -632,8 +656,17 @@ def test_view_design_arms_are_single_factor_against_the_full_recipe():
 
     # Each ablation touches exactly one config subtree.
     subtrees = {
+        # `crop_ratio` is NOT part of this arm any more: the canonical policy and
+        # DINO's reference now share torchvision's range, because the refined
+        # crops are square. It moved to `legacy_corpus`, where it belongs -- the
+        # aspect range a source needs is a property of the SOURCE, not of the
+        # view recipe.
         "wo_view_redesign": {"data.local_crop_size", "data.augmentation.global_crops_scale",
-                             "data.augmentation.local_crops_scale", "data.augmentation.crop_ratio"},
+                             "data.augmentation.local_crops_scale"},
+        "legacy_view_coverage": {"data.augmentation.global_crops_scale",
+                                 "data.augmentation.local_crops_scale"},
+        "legacy_corpus": {"data.root_path", "data.expected_num_samples",
+                          "data.augmentation.crop_ratio"},
         "wo_dihedral": {"data.augmentation.vertical_flip_prob",
                         "data.augmentation.rotation90_prob"},
         "koleo_bottleneck": {"model.loss.koleo_space"},

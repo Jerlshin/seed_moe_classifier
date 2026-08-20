@@ -1,5 +1,8 @@
 """Stage launcher -- the one entry point for every stage of the pipeline.
 
+    python main.py extract-seeds      # stage 0: RAW_Samples -> the refined corpus
+    python main.py validate-seeds     # audit that extraction against the legacy boxes
+    python main.py benchmark-corpus   # is the refined corpus actually better?
     python main.py validate-data      # the corpus, the splits, the view geometry
     python main.py eval-frozen        # the frozen-trunk bar stage 1 must clear
     python main.py pretrain           # stage 1: DINO self-distillation
@@ -32,6 +35,15 @@ the milestone encoders the pretraining stage already published:
 
     python main.py eval-pretrain
     python main.py eval-pretrain experiment.evaluation.split.protocol=grouped
+
+Stage 0 builds the corpus itself and takes ``conf/segmentation.yaml`` overrides:
+
+    python main.py extract-seeds segmentation.crop.margin=0.20
+    python main.py validate-seeds audit.iou_threshold=0.5
+    python main.py benchmark-corpus --encoders handcrafted
+
+``benchmark-corpus`` takes argparse flags rather than Hydra overrides, because it
+compares two directories and composes no experiment.
 
 For the full suites, use the dedicated runners instead, which handle output
 layout, shared-checkpoint reuse and result aggregation:
@@ -107,7 +119,31 @@ VALIDATE_DATA = [
     [sys.executable, "scripts/report_raw_photographs.py"],
 ]
 
+# STAGE 0 -- build the corpus. Reads `RAW_Samples`, writes `Refined_Samples`,
+# never writes under the raw tree and never touches a checkpoint.
+#
+# It is a *re-baseline*, not an increment: republishing the corpus moves every
+# accuracy the pipeline reports, and the corpus SHA-256 in each run's
+# `summary.json` is what keeps results from the two corpora distinguishable
+# afterwards. Run it once, before a phase.
+#
+# `validate-seeds` is not optional afterwards. It recovers the exact bounding
+# boxes of the legacy crops by template matching -- they are byte-identical
+# sub-images of the raw photographs, which is what makes them a reference rather
+# than a guess -- and reports recall, duplication and every rejected detection
+# with its reason.
+EXTRACT_SEEDS = [sys.executable, "-m", "src.segmentation.extract"]
+VALIDATE_SEEDS = [sys.executable, "-m", "src.segmentation.audit"]
+
+# Is the refined corpus actually better? Two corpora, the same frozen encoders,
+# the same protocols, no training -- plus a size- and source-matched control, so
+# "more crops" cannot be mistaken for "better crops".
+BENCHMARK_CORPUS = [sys.executable, "-m", "src.segmentation.benchmark"]
+
 COMMANDS: dict[str, list[list[str]]] = {
+    "extract-seeds": [EXTRACT_SEEDS],
+    "validate-seeds": [VALIDATE_SEEDS],
+    "benchmark-corpus": [BENCHMARK_CORPUS],
     "validate-data": VALIDATE_DATA,
     "eval-frozen": [EVAL_FROZEN],
     "screen-backbones": [SCREEN_BACKBONES],

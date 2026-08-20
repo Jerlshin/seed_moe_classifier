@@ -14,6 +14,13 @@ $SEED_DATA_ROOT/
       *.png | *.jpg | *.jpeg | *.bmp | *.tif | *.tiff | *.webp
 ```
 
+The canonical corpus is `Refined_Samples` — 13,492 square, one-seed-per-file
+crops cut from 96 of the 99 photographs in `RAW_Samples` by
+[`src/segmentation/`](../segmentation/README.md). It replaces `Cropped_Samples`
+(9,357 hand-curated, 96.6 %-non-square crops from 81 photographs), which is still
+on disk and still runnable as a control. Nothing in this package knows which one
+it is reading; `corpus_fingerprint` is what records the answer.
+
 `HierarchicalSeedDataset` walks the tree and assigns indices from **sorted**
 directory names. `__getitem__` returns `(image, seed_label, sub_label)`, or
 additionally the path when `include_path=True`.
@@ -41,11 +48,16 @@ Passing `save_csv_path` writes a manifest of every sample with both labels.
 
 `DataAugmentationDINO` returns `(original_tensor, [global_1, global_2, *locals])`.
 
-| View | Count | Crop scale | Pipeline |
+| View | Count | Crop scale (paper) | Pipeline |
 | --- | --- | --- | --- |
 | Global 1 | 1 | (0.4, 1.0) | resized crop → flip → jitter → **blur p=1.0** → normalize |
 | Global 2 | 1 | (0.4, 1.0) | resized crop → flip → jitter → **blur p=0.1** → **solarize p=0.2** → normalize |
 | Local | 4 | (0.05, 0.4) | resized crop → flip → jitter → **blur p=0.5** → normalize → resize |
+
+The canonical policy in `conf/data/hierarchical_seeds.yaml` uses (0.70, 1.00) and
+(0.30, 0.70) with torchvision's aspect range, sized against a source that is a
+square window holding one seed at a median 61 × 61 px. `scripts/report_view_geometry.py`
+measures what any policy actually builds a view from.
 
 Colour jitter magnitudes are the paper's: brightness ±0.4, contrast ±0.4,
 saturation ±0.2, hue ±0.1.
@@ -67,36 +79,46 @@ asymmetry is enforced in the trainer, not here.
 the measurement behind every value; read it before changing one.
 
 The problem it solves is that `scale` is a fraction of the **source** area, and
-the source here is one seed at a median 52 × 51 px — not a scene. Measured over
-all 9,357 crops through torchvision's own `get_params`:
+the source here is one seed in a square window at a median 61 × 61 px — not a
+scene. Measured over all 13,492 crops through torchvision's own `get_params`:
 
 | view recipe | native px p5/p50/p95 | upsample to 256 | real content |
 | --- | --- | --- | --- |
-| local `(0.05, 0.40)` at 101 px | 132 / **598** / 2,585 | 10.5× | 0.91 % |
-| local `(0.30, 0.70)` at 160 px, ratio `(0.5, 2.0)` | 483 / **1,419** / 4,730 | 6.8× | 2.17 % |
-| global `(0.40, 1.00)`, ratio `(0.75, 1.33)` | 648 / 1,845 / 5,680 | 6.0× | 2.82 % |
-| global `(0.70, 1.00)`, ratio `(0.5, 2.0)` | 928 / 2,484 / 7,564 | 5.1× | 3.79 % |
+| local `(0.05, 0.40)` at 101 px | 180 / **864** / 5,550 | 8.7× | 1.32 % |
+| local `(0.30, 0.70)` at 160 px | 638 / **1,935** / 10,812 | 5.8× | 2.95 % |
+| global `(0.40, 1.00)` | 837 / 2,491 / 14,070 | 5.1× | 3.80 % |
+| global `(0.70, 1.00)` | 1,178 / 3,009 / 16,641 | 4.7× | 4.59 % |
 
 **80 % of Eq. 1's cross-view terms are anchored on a local view**, so the first
 row is what the objective was mostly being asked to learn from.
+
+Native pixels are not the whole story. The refined crops carry a 12 % paper ring,
+so the seed occupies a median 50.5 % of a crop against 79.9 % in the tight boxes
+that preceded them, and the quantity that transfers across the corpus change is
+the share of the seed's bounding box inside the view — at unchanged scales, a
+global view's seed coverage rose from a median 0.875 to **1.000**.
 
 Three keys carry the policy, and each is separately switchable so an arm stays
 single-factor:
 
 `crop_ratio`
-: The aspect range `RandomResizedCrop` samples. After ten failed (area, aspect)
-  draws `get_params` returns a **deterministic centre crop**, and only 3.4 % of
-  these crops are square — so raising the scale floor trades randomness for
-  content unless the ratio widens with it. Measured global fallback rates: 3.5 %
-  at `(0.40, 1.00)`/`(0.75, 1.33)`, **22.0 %** at `(0.70, 1.00)`/`(0.75, 1.33)`,
-  10.2 % at `(0.70, 1.00)`/`(0.5, 2.0)`.
+: The aspect range `RandomResizedCrop` samples, and the one view key the corpus
+  re-baseline moved. After ten failed (area, aspect) draws `get_params` returns a
+  **deterministic centre crop**, and whether that fires depends on the *source's*
+  aspect ratio. On the 3.4 %-square legacy corpus, `(0.70, 1.00)` with
+  torchvision's `(0.75, 1.33)` fell back **22.0 %** of the time and the fix was
+  widening to `(0.5, 2.0)` (10.2 %). The refined crops are 100 % square, which
+  inverts it: `(0.75, 1.33)` gives **0.3 %** and `(0.5, 2.0)` gives **4.8 %** —
+  and the wide range also applies up to a 2× *anisotropic* rescale to a seed
+  whose proportions the square crops exist to preserve. Put `[0.5, 2.0]` back
+  when pointing `root_path` at the legacy tree.
 
 `min_native_pixels`
 : A floor on the source pixels behind a view, raising the lower scale bound *per
   image* to `max(scale_lo, floor / area)`. It never lowers it, so it can only
   make views less destructive, and `0` is a plain `RandomResizedCrop` exactly.
-  At 900 it lifts the local p5 by **+72 %** and the median by 1.1 % — a tail
-  intervention, which is the whole claim.
+  At 900 it acts on the smallest classes only — FingerMillet and ProsaMillet at
+  a median 41 px side — which is the whole claim.
 
 `rotation90_prob` / `vertical_flip_prob`
 : The dihedral group of order 8, via `PIL.Image.transpose` — a pixel

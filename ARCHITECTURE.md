@@ -8,6 +8,7 @@ files are the code-level narrative; [`README.md`](README.md) is how to *run* it.
 | Topic | Detail |
 | --- | --- |
 | Overview, revision record, cross-cutting invariants | [`architecture/00_OVERVIEW.md`](architecture/00_OVERVIEW.md) |
+| **Stage 0 — photographs to corpus, and its audit** | [`src/segmentation/README.md`](src/segmentation/README.md) |
 | Dataset, splits, multi-crop augmentation | [`architecture/01_DATA_PIPELINE.md`](architecture/01_DATA_PIPELINE.md) |
 | **Backbone and stage-1 self-supervision** | [`architecture/02_BACKBONE_AND_SSL.md`](architecture/02_BACKBONE_AND_SSL.md) |
 | Mixture-of-Experts routing | [`architecture/03_MOE_MODULE.md`](architecture/03_MOE_MODULE.md) |
@@ -25,6 +26,14 @@ named **control** (a comparison the results table needs) or an **ablation** (one
 override off the primary), and each file's header says which.
 
 ```text
+STAGE 0  (src/segmentation/extract.py)            python main.py extract-seeds
+
+  99 photographs ─▶ illumination field + paper region ─▶ two-channel foreground
+                    score ─▶ components ─▶ verified watershed split ─▶ square
+                    crops at native resolution
+                    96 used, 13,492 crops, 0 duplicates, 99.71 % recall of the
+                    9,050 legacy boxes that have a recoverable reference
+
 STAGE 1  (src/trainers/contrastive_pretrain.py)   experiment=pretrain_dino
 
   ImageNet-1k ─▶ SwinV2-Tiny ─▶ DINO self-distillation ─▶ domain-adapted encoder
@@ -107,7 +116,7 @@ The three decisions that are specific to *this* corpus rather than inherited fro
 DINO, each with a measurement behind it:
 
 - **View geometry.** `scale` is a fraction of the source area and the source is
-  one seed at a median 52 × 51 px, so DINO's `(0.05, 0.40)` builds a local view
+  one seed at a median 61 × 61 px, so DINO's `(0.05, 0.40)` builds a local view
   from a median **598 native pixels** — 0.91 % real content — and 8 of the 10
   cross-view terms in Eq. 1 are anchored on one. `(0.30, 0.70)` at 160 px takes
   that to 1,419.
@@ -140,9 +149,10 @@ python -m src.trainers.contrastive_pretrain experiment=pretrain_dino_base     # 
 | Split | **Crop-level stratified** (primary), with `grouped_cv` as the photograph-disjoint diagnostic |
 
 The split is the one place where the honest number and the reported number differ
-by a measured amount: 9,357 crops come from 81 photographs, and under an
-identical frozen encoder the crop-level 27-way probe sits **+18.65 pp** above the
-photograph-disjoint one. Every run reports `shared_source_groups`,
+by a measured amount: 13,492 crops come from 96 photographs, and under an
+identical frozen ImageNet trunk the crop-level 27-way probe sits **+17.59 pp**
+above the photograph-disjoint one (0.8599 against 0.6840; it was +18.13 pp on the
+9,357-crop / 81-photograph corpus this replaced). Every run reports `shared_source_groups`,
 `leaked_test_fraction` and `classes_present_in_test`, and
 `experiment=finetune_grouped_diagnostic` measures the gap on the encoder being
 reported rather than quoting it from another one.

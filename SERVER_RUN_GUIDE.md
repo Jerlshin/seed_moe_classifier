@@ -40,7 +40,7 @@ Confirm the install:
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python -m pytest tests/ -q          # 640 tests, no network, ~50s on CPU
+python -m pytest tests/ -q          # 666 tests, no network, ~60s on CPU
 python scripts/dry_run.py           # synthetic pipeline, no dataset needed
 ```
 
@@ -87,16 +87,27 @@ Expected layout, read by `HierarchicalSeedDataset` (`src/datasets/dataset.py`):
   split protocol can put any of their crops on both sides; the trainer logs
   this at startup and records it in `summary.json`. This is a dataset
   property, not a bug to chase.
-- Images are **small and non-square**: median 52x51 px, all under 256px on
-  both sides, only 3.4% square. The pipeline resizes with a `(H, W)` tuple and
-  upsamples ~5x before the backbone sees anything — expected.
+- Images are **small but square**: median 61x61 px, 99.8 % under 256px on both
+  sides, **100 % square**. The pipeline resizes with a `(H, W)` tuple and
+  upsamples ~4x before the backbone sees anything — expected, and on this corpus
+  that resize is a uniform rescale rather than an orientation-dependent stretch.
 - Supported extensions: `.png .jpg .jpeg .bmp .tif .tiff .webp`.
 
 Point the trainer at the dataset with an environment variable (no code change
 needed):
 
 ```bash
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_RAW_DATA_ROOT=/workspace/data/Hierarchical_SeedData/RAW_Samples
+export SEED_REFINED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
+export SEED_DATA_ROOT=$SEED_REFINED_DATA_ROOT
+```
+
+If `Refined_Samples` is not on the box yet, build it — it is stage 0, it takes
+about 2.5 minutes on one CPU core and needs no GPU:
+
+```bash
+python main.py extract-seeds      # RAW_Samples -> Refined_Samples (13,492 crops from 96 photos)
+python main.py validate-seeds     # audit: recall vs the legacy boxes, duplicates, rejection census
 ```
 
 ---
@@ -120,7 +131,7 @@ any driver or torch upgrade.
 ### 3.2 Environment variables (set once per shell / put in the launch script)
 
 ```bash
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
 export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dino_pretrained_encoder.pth"
 mkdir -p "${SEED_OUTPUT_DIR}"
@@ -137,12 +148,12 @@ and what the failure modes look like; [`README.md`](README.md) carries the
 reasoning and the measurement behind each configured value.
 
 ```bash
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
 mkdir -p "${SEED_OUTPUT_DIR}"
 
 # --- pre-flight, no GPU needed, ~3 minutes total ---------------------------
-python -m pytest tests/ -q                          # 640 tests
+python -m pytest tests/ -q                          # 666 tests
 python main.py validate-data                        # corpus + view geometry + uncropped scenes
 python main.py pretrain \
     data.batch_size=4 data.num_workers=0 experiment.training.effective_batch_size=4 \
@@ -341,7 +352,7 @@ automatically except the two flags that tell the run about the limit:
 
 ```bash
 !cd /kaggle/working/seed-moe-classifier && \
-  SEED_DATA_ROOT=/kaggle/input/<dataset>/Cropped_Samples \
+  SEED_DATA_ROOT=/kaggle/input/<dataset>/Refined_Samples \
   SEED_OUTPUT_DIR=/kaggle/working/outputs \
   python scripts/launch.py pretrain --gpus 2 \
       experiment.training.resume=auto \
@@ -532,7 +543,7 @@ under `outputs/eval_pretrain/` and does not need `generate_plots.py`.
 
 ```bash
 tmux new -s seedmoe
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
 python main.py pretrain
 # Ctrl-b d to detach; `tmux attach -t seedmoe` to come back
@@ -541,7 +552,7 @@ python main.py pretrain
 **nohup, for a scripted end-to-end sequence:**
 
 ```bash
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
 mkdir -p "${SEED_OUTPUT_DIR}/logs"
 

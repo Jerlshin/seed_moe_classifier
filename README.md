@@ -44,7 +44,7 @@ override off the primary), and each says which it is in its own header.
 > experts rather than 4; **SwinV2 is the only encoder** (the comparative ViT-S/14
 > path was removed); stage 1 runs **SwinV2-Tiny from ImageNet-1k** rather than
 > SwinV2-Base from random initialisation for 300 epochs; the multi-crop scales
-> are sized for a 52 × 51 px source rather than for ImageNet; and the ArcFace
+> are sized for a 61 × 61 px source rather than for ImageNet; and the ArcFace
 > scale is the analytic AdaCos value 4.61 rather than 30. Almost all of it is
 > reversible by override — see [Reproducing the submitted
 > configuration](#reproducing-the-submitted-configuration).
@@ -56,6 +56,7 @@ override off the primary), and each says which it is in its own header.
 1. [Install](#1-install)
 2. [Environment variables](#2-environment-variables)
 3. [Data layout](#3-data-layout)
+3a. [Stage 0 — building the corpus from the photographs](#3a-stage-0--building-the-corpus-from-the-photographs)
 4. [Validate the dataset before spending a GPU-hour](#4-validate-the-dataset-before-spending-a-gpu-hour)
 5. [The canonical workflow, end to end](#5-the-canonical-workflow-end-to-end)
 6. [Stage 0 — the bar stage 1 must clear](#stage-0--the-bar-stage-1-must-clear)
@@ -92,16 +93,18 @@ GPU box.
 
 | Variable | Meaning | Default |
 | --- | --- | --- |
-| `SEED_DATA_ROOT` | Dataset root (`Cropped_Samples`) | `data/Hierarchical_SeedData/Cropped_Samples` |
+| `SEED_DATA_ROOT` | Dataset root — the corpus every stage reads | `data/Hierarchical_SeedData/Refined_Samples` |
 | `SEED_OUTPUT_DIR` | Root for run dirs, checkpoints, metadata | `outputs` |
 | `SEED_PRETRAIN_BACKBONE` | The encoder every downstream run loads — the **only** handoff between the stages | `$SEED_OUTPUT_DIR/checkpoints/dino_pretrained_encoder.pth` |
-| `SEED_RAW_DATA_ROOT` | Optional `RAW_Samples` tree, for the coverage audit only | unset |
+| `SEED_RAW_DATA_ROOT` | `RAW_Samples` tree — stage 0's input, and the coverage audit's | `data/Hierarchical_SeedData/RAW_Samples` |
+| `SEED_REFINED_DATA_ROOT` | Where stage 0 *writes* the corpus. Normally the same path as `SEED_DATA_ROOT` | `data/Hierarchical_SeedData/Refined_Samples` |
 | `SEED_RUN_ID` | Shared Hydra run-directory suffix; the launcher pins it so every rank agrees | timestamp |
 
 ```bash
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_RAW_DATA_ROOT=/workspace/data/Hierarchical_SeedData/RAW_Samples
+export SEED_REFINED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
+export SEED_DATA_ROOT=$SEED_REFINED_DATA_ROOT
 export SEED_OUTPUT_DIR=/workspace/outputs
-export SEED_RAW_DATA_ROOT=/workspace/data/Hierarchical_SeedData/RAW_Samples   # optional
 ```
 
 `SEED_RUN_ID` matters under `torchrun`: Hydra evaluates `${now:...}` *per
@@ -113,15 +116,23 @@ bare `torchrun` is correct too — this just makes it tidy as well.
 ## 3. Data layout
 
 ```text
-$SEED_DATA_ROOT/
+$SEED_RAW_DATA_ROOT/            # 99 photographs -- the only irreplaceable artifact
+  Rice/Chinnar/         IMG_0689.JPG ...
+        │
+        │   python main.py extract-seeds       (stage 0, see section 3a)
+        ▼
+$SEED_DATA_ROOT/                # 13,492 square one-seed crops from 96 of them
   Rice/
-    Chinnar/            IMG_0502_bbox137.png ...
+    Chinnar/            IMG_0689_bbox0007.png ...
     Chithrakar/         ...
   Millet/
     Baryard/            ...
   Amaranthus/ ...
   Mustard/ ...
 ```
+
+The `_bbox<n>` suffix is not decoration: `source_image_id` parses it, and the
+photograph-disjoint split protocol groups crops by the stem in front of it.
 
 Labels come from **sorted** directory names, and sub-variety labels are
 **global** (0..26 across all seed types, not per seed type). The
@@ -133,19 +144,147 @@ discovered counts disagree with `data.num_seed_types` / `num_sub_varieties`.
 **Three properties of this corpus decide almost every design choice below, so
 they are stated once here.**
 
-* **It is 81 photographs, not 9,357 images.** `Cropped_Samples` holds 9,357 crops
-  cut from 81 source photographs — a mean of 115.5 crops per source, encoded in
-  the filenames (`IMG_0502_bbox137.png`). Crops from one photograph share the
-  tray, the lighting and the sensor noise, and their bounding boxes frequently
-  overlap.
-* **The crops are tiny and not square.** Median **52 × 51 px**, all under 256, so
-  every image is upsampled ~5×; only **3.4 %** are square (aspect p5/p95 =
-  0.52 / 1.98) and 51 % have both sides under 64 px.
+* **It is 96 photographs, not 13,492 images.** `Refined_Samples` holds 13,492
+  crops cut from 96 source photographs — a mean of 140.5 crops per source,
+  encoded in the filenames. Crops from one photograph share the tray, the
+  lighting and the sensor noise. Scene count, not crop count, is what a
+  photograph-disjoint protocol can resolve.
+* **The crops are small, and square.** Median **61 × 61 px**, 99.8 % under 256,
+  so every image is upsampled ~4×; **100 %** are square, so `Resize((256, 256))`
+  is a uniform rescale and the seed's true proportions reach the encoder. The
+  seed itself occupies a median 50.5 % of its crop — the rest is the paper ring
+  that makes the boundary visible.
 * **Five sub-varieties have crops from exactly one photograph** (Baryard,
-  Browntop, FingerMillet, PearlMillet, ProsaMillet — 1,387 crops, 14.8 % of the
-  dataset). For those classes *no* protocol on this dataset measures
-  across-photograph generalisation. That is a property of the data, and the fix
-  is a camera rather than a splitter.
+  Browntop, FingerMillet, PearlMillet, ProsaMillet). For those classes *no*
+  protocol on this dataset measures across-photograph generalisation. Stage 0 did
+  not change this and could not: each genuinely has one raw photograph, and the
+  fix is a camera rather than a splitter.
+
+> **The corpus was re-baselined.** Every number published before this was
+> produced on `Cropped_Samples` — 9,357 hand-curated, 96.6 %-non-square crops
+> from 81 photographs — and those numbers are **not** comparable with numbers
+> from `Refined_Samples`. The corpus SHA-256 in every `summary.json` is what
+> keeps the two distinguishable. Section 3a is the whole story; the legacy corpus
+> is still on disk and still runnable as a control.
+
+## 3a. Stage 0 — building the corpus from the photographs
+
+```bash
+python main.py extract-seeds      # RAW_Samples -> Refined_Samples + manifest + overlays
+python main.py validate-seeds     # recall, duplicates, coverage, rejection census
+python main.py benchmark-corpus   # is it actually better? (no training, ~25 min)
+```
+
+Run once, before a phase. It never writes under `SEED_RAW_DATA_ROOT`, never
+resamples a crop, and refuses to write into a populated output root unless told
+to (`segmentation.output.overwrite=true`). Full detail:
+[`src/segmentation/README.md`](src/segmentation/README.md).
+
+### What it produced
+
+| | |
+| --- | --- |
+| photographs read | 99 |
+| photographs used | **96** (3 excluded — see below) |
+| detections adjudicated | 24,218 |
+| crops written | **13,492** |
+| detections rejected, with a stated reason | 10,726 |
+| from touching seeds separated by watershed | 76 |
+| with a neighbouring seed inpainted out | 870 |
+| duplicate detections | **0** |
+| wall clock, whole corpus, one CPU core | 136 s |
+
+The three excluded photographs are not trays of seeds: `Poosa33/IMG_0667` is a
+near-empty sheet, `Poosa33/IMG_0668` is a paper packet standing on a wooden
+table, and `Kullakar/IMG_0713` is a labelled ziplock bag held up to the camera.
+They are identified from their support fraction (0.58 / 0.63 / 0.65, against
+0.76–1.00 for every genuine tray), not from a list, and they are named in
+`extraction_summary.json` with the measurement that excluded them.
+
+**Nothing is discarded silently.** Every connected component gets a row in
+`manifest.csv`, an outline in its photograph's overlay, and — if it was not
+written — one of the reasons in `REJECTION_REASONS`. The census:
+
+| reason | count | what it is |
+| --- | --- | --- |
+| `too_small` | 9,660 | dust, chaff and paper fibre below 0.35 median seeds |
+| `scene_rejected` | 3,319 | every detection in the three non-tray photographs |
+| `out_of_frame` | 1,035 | seeds clipped by the photograph's own border |
+| `irregular` | 214 | solidity far below this photograph's own median |
+| `unresolved_cluster` | 117 | merged seeds the watershed declined to split |
+| `implausible_shape` | 107 | slivers: too little area for their perimeter |
+| `too_large` | 68 | paper edges, pen marks, piles |
+| `blurred` / `touches_support_edge` / `low_contrast` | 72 | see the module docs |
+
+### Evidence that seeds were not missed or duplicated
+
+The legacy crops are **byte-identical sub-images** of the raw photographs, so
+their exact bounding boxes are recoverable by template matching. That turns the
+usual unanswerable question into a measurement, and `python main.py validate-seeds`
+runs it:
+
+| | |
+| --- | --- |
+| legacy crops with a recoverable box | 9,050 of 9,357 |
+| recall of them by the refined detector | **99.71 %** (9,024) |
+| legacy-only, i.e. possibly missed | **26**, individually listed and pictured |
+| refined-only, i.e. newly found in the same photographs | **1,439** |
+| duplicate pairs (one seed, two files) | **0** refined, **0** legacy |
+
+The other 307 legacy crops belong to four photographs — `Chithrakar/IMG_0161`,
+`IMG_0162`, `Kullakar/IMG_0711`, `IMG_0712` — whose raw file was replaced by a
+differently oriented version after the crops were cut (mean absolute pixel
+difference 15–22 at the recovered location, against exactly 0 everywhere else).
+Their boxes describe nothing, so they are named and excluded from the
+denominator rather than scored. Of the 26 legacy-only cases, roughly a fifth are
+legacy crops of the **wooden table or a paper edge** rather than of a seed;
+`outputs/segmentation/figures/legacy_only_seeds.png` shows all of them at native
+resolution.
+
+### Is the refined corpus better?
+
+`python main.py benchmark-corpus` runs both corpora through the same frozen
+encoders under the same protocols, with no training, and includes a size- and
+source-matched control by default — because "more crops" is not "better crops".
+
+Frozen ImageNet-1k SwinV2-Tiny, 27-way linear probe:
+
+| protocol | legacy 9,357 / 81 photos | refined 13,492 / 96 | refined, matched to 9,347 / 81 |
+| --- | --- | --- | --- |
+| crop-level probe | 0.8007 | **0.8599** | 0.8449 |
+| crop-level macro-F1 | 0.8004 | 0.8416 | 0.8424 |
+| crop-level k-NN (no fitted parameters) | 0.7099 | 0.7629 | 0.7235 |
+| photograph-disjoint, out-of-fold | 0.6194 | **0.6840** | 0.6371 |
+
+The matched column isolates the crops themselves: **+4.42 pp** crop-level and
+**+1.77 pp** photograph-disjoint from the redefinition alone, with the remainder
+coming from the 15 extra photographs — the axis this dataset is genuinely short
+of.
+
+The two shortcut floors move the *other* way, which is the result worth having:
+
+| encoder (crop-level) | legacy | refined | gap to `imagenet_init` |
+| --- | --- | --- | --- |
+| `handcrafted` (10 scalars) | 0.5075 | 0.4983 | +29.3 pp → **+36.2 pp** |
+| `random_init` | 0.5903 | 0.5169 | +21.0 pp → **+34.3 pp** |
+
+Ten trivial statistics score *lower* on the refined corpus, largely because
+`log(aspect ratio)` — a real shape cue that used to sit in the file's dimensions —
+is now constant. The cue did not disappear: it moved into the pixels,
+undistorted, where an encoder has to look at the seed to use it.
+
+### Running against the legacy corpus
+
+It is still on disk and still a first-class control. Two overrides, and neither
+is cosmetic:
+
+```bash
+SEED_DATA_ROOT=/path/to/Hierarchical_SeedData/Cropped_Samples \
+python main.py pretrain data.expected_num_samples=9357 \
+    data.augmentation.crop_ratio=[0.5,2.0]
+```
+
+`conf/stage1_arms/view_design.yaml` runs it as the `legacy_corpus` arm.
 
 ## 4. Validate the dataset before spending a GPU-hour
 
@@ -172,49 +311,87 @@ python scripts/report_view_geometry.py --csv outputs/reports/view_geometry.csv
 python scripts/report_view_geometry.py data.augmentation.min_native_pixels=900
 ```
 
-`reference` is DINO's ImageNet geometry, kept as a *measurement* baseline (it is
-what the `wo_view_redesign` arm trains). Measured over all 9,357 crops:
+Each `--policy` name matches an arm in `conf/stage1_arms/view_design.yaml`:
+`reference` is DINO's ImageNet geometry (what `wo_view_redesign` trains),
+`legacy_coverage` is the range that reproduces the legacy corpus's view
+statistics on the refined one, and `wide_ratio` is the aspect range the legacy
+corpus needed. Measured over all 13,492 refined crops, 40k draws at seed 7:
 
 | view recipe | native px p5/50/95 | upsample | real content | centre-crop fallback |
 | --- | --- | --- | --- | --- |
-| global `(0.40,1.00)` r=`(0.75,1.33)` — reference | 648 / 1,845 / 5,680 | 6.0× | 2.82 % | 3.5 % |
-| local `(0.05,0.40)` r=`(0.75,1.33)` — reference | 132 / **598** / 2,585 | 10.5× | 0.91 % | 0.0 % |
-| global `(0.70,1.00)` r=`(0.50,2.00)` — **canonical** | 928 / 2,484 / 7,564 | 5.1× | 3.79 % | 10.2 % |
-| local `(0.30,0.70)` r=`(0.50,2.00)` — **canonical** | 483 / **1,419** / 4,730 | 6.8× | 2.17 % | 0.1 % |
+| global `(0.40,1.00)` — reference | 837 / 2,491 / 14,070 | 5.1× | 3.80 % | 0.1 % |
+| local `(0.05,0.40)` — reference | 180 / **864** / 5,550 | 8.7× | 1.32 % | 0.0 % |
+| global `(0.70,1.00)` — **canonical** | 1,178 / 3,009 / 16,641 | 4.7× | 4.59 % | 0.3 % |
+| local `(0.30,0.70)` — **canonical** | 638 / **1,935** / 10,812 | 5.8× | 2.95 % | 0.0 % |
 
-Under the reference ranges a local view is a median **24 × 24 px** fragment of
+Under the reference ranges a local view is a median **29 × 29 px** fragment of
 one seed inflated to 65,536 output pixels — and **8 of the 10 cross-view terms**
-in Eq. 1 are anchored on such a view. The canonical policy takes that to 1,419
-native pixels (2.37×) and cuts the local upsample from 10.5× to 6.8×, which also
+in Eq. 1 are anchored on such a view. The canonical policy takes that to 1,935
+native pixels (2.24×) and cuts the local upsample from 8.7× to 5.8×, which also
 narrows the local-vs-global resolution gap the student can use as a shortcut.
 
-The **fallback** column is why `crop_ratio` is a config key. `get_params` retries
-the (area, aspect) draw ten times and then returns a *deterministic centre crop*.
-Only 3.4 % of these crops are square, so a high-area box in torchvision's
-`(0.75, 1.33)` often does not fit: raising the scale floor without widening the
-aspect range costs **22.0 %** deterministic global views. Widening to
-`(0.5, 2.0)` brings it to 10.2 % *and* raises the median content (2,484 vs
-2,310 px), so it is strictly better on both axes. The trainer measures this at
-startup and warns above 15 %.
+**Native pixels are not the whole story.** A view can carry plenty of sensor data
+and little seed: the refined crops include a 12 % paper ring, so the seed occupies
+a median 50.5 % of a crop against 79.9 % in the legacy tight boxes. The quantity
+that transfers between the two corpora is the share of the seed's own bounding
+box inside the view — measured on 9,024 matched seeds:
+
+| corpus | family | scale | seed coverage p5 / median | whole seed (≥95 %) |
+| --- | --- | --- | --- | --- |
+| legacy | global | `(0.70,1.00)` | 0.66 / 0.875 | 24 % |
+| refined | global | `(0.70,1.00)` | 0.88 / **1.000** | 78 % |
+| legacy | local | `(0.30,0.70)` | 0.37 / 0.560 | 0.1 % |
+| refined | local | `(0.30,0.70)` | 0.48 / **0.768** | 9 % |
+
+At unchanged settings the re-baseline therefore makes views *less* destructive,
+in the same direction the view redesign already moved: a teacher target now shows
+the whole seed on median. The scale ranges were kept, because moving them would
+confound the corpus change with a view-policy change — and
+`legacy_view_coverage` is the arm that measures whether they should have moved.
+
+The **fallback** column is why `crop_ratio` is a config key, and it is the one
+view constant the re-baseline moved. `get_params` retries the (area, aspect) draw
+ten times and then returns a *deterministic centre crop*, and whether that fires
+depends on the **source's** aspect ratio:
+
+| corpus | square | fallback @ `(0.70,1.00)` × `(0.75,1.33)` | @ `(0.50,2.00)` |
+| --- | --- | --- | --- |
+| `Cropped_Samples` (legacy) | 3.4 % | **22.0 %** | 10.2 % |
+| `Refined_Samples` (canonical) | 100 % | **0.3 %** | 4.8 % |
+
+On the legacy corpus the wide range fixed the fallback; on the refined one it
+*causes* it, and it also applies up to a 2× **anisotropic** rescale to a seed
+whose proportions the square crops exist to preserve. The canonical policy is
+therefore torchvision's `(0.75, 1.33)`, and the legacy corpus needs
+`data.augmentation.crop_ratio=[0.5,2.0]` back. The trainer measures the realised
+rate at startup and warns above 15 % either way.
 
 `report_raw_photographs.py` needs `SEED_RAW_DATA_ROOT` and reports which source
-photographs exist and were never cropped — **18 of 99** on the shipped corpus,
-i.e. +22 % *scenes* at zero acquisition cost. It never touches the dataset:
-re-cropping moves every published accuracy, so it is a deliberate re-baseline,
-and the corpus fingerprint (§13) is what keeps before and after distinguishable.
+photographs exist and were never cropped — **3 of 99** now, and all three on
+purpose (§3a). It reported 18 on the legacy corpus, of which 15 were ordinary
+trays that had simply never been cropped. It never touches the dataset;
+`main.py extract-seeds` is what acts, and the corpus fingerprint (§13) is what
+keeps before and after distinguishable.
 
 ## 5. The canonical workflow, end to end
 
 ```bash
 # ---- setup ---------------------------------------------------------------
 python -m pip install -e ".[tracking,dev]"
-export SEED_DATA_ROOT=/path/to/Hierarchical_SeedData/Cropped_Samples
+export SEED_RAW_DATA_ROOT=/path/to/Hierarchical_SeedData/RAW_Samples
+export SEED_REFINED_DATA_ROOT=/path/to/Hierarchical_SeedData/Refined_Samples
+export SEED_DATA_ROOT=$SEED_REFINED_DATA_ROOT
 export SEED_OUTPUT_DIR=/path/to/outputs
 
-# ---- 0. check the machine and the data ----------------------------------
-python -m pytest tests/ -q            # 640 tests, no network, ~50 s
+# ---- 0. check the machine ------------------------------------------------
+python -m pytest tests/ -q            # 666 tests, no network, ~60 s
 python scripts/dry_run.py             # synthetic end-to-end pipeline check, no dataset
 python scripts/verify_runtime.py      # are the fast paths exact on THIS machine?
+
+# ---- 0a. build the corpus, once, before a phase (~2.5 min) --------------
+python main.py extract-seeds          # RAW_Samples -> Refined_Samples
+python main.py validate-seeds         # recall vs the legacy boxes, duplicates, census
+python main.py benchmark-corpus       # optional: price the re-baseline, no training
 python main.py validate-data          # corpus, view geometry, uncropped photographs
 
 # ---- 1. the bar stage 1 must clear (no training at all) -----------------
@@ -787,7 +964,7 @@ have interrupted.
 On a rented server:
 
 ```bash
-export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
+export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Refined_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
 GPUS=2   scripts/train_distributed.sh pretrain      # DDP over 2 GPUs
 GPUS=1   scripts/train_distributed.sh eval-pretrain
@@ -905,7 +1082,8 @@ as a measured one.
 ## 14. Testing and verification
 
 ```bash
-python -m pytest tests/ -q                 # 640 tests, no network access, ~50 s
+python -m pytest tests/ -q                 # 666 tests, no network access, ~60 s
+python -m pytest tests/test_segmentation.py -q        # stage 0: detection, splitting, crop policy, audit
 python -m pytest tests/test_stage1_pipeline.py -q     # view geometry, protocol, artifacts
 python -m pytest tests/test_stage1_correctness.py -q  # KoLeo, loss decomposition, provenance
 python scripts/dry_run.py                  # real encoder, synthetic data, full pipeline
@@ -919,8 +1097,14 @@ Top-2 routing, τ_t 0.04 → 0.07, momentum 0.996, gradient clip 3.0 — so a fa
 means the code has drifted from the paper. Paper constants live in
 `tests/conftest.py` and mostly come in **pairs** (`SUBMITTED_TOP_K` /
 `REVISED_TOP_K`, `SUBMITTED_GLOBAL_CROPS_SCALE` / `CANONICAL_GLOBAL_CROPS_SCALE`,
-…), so a test asserting a bare number cannot silently become a claim about
-whichever value the reader assumed.
+`LEGACY_NUM_CROPS` / `DATASET_NUM_CROPS`, `LEGACY_CROP_RATIO` /
+`CANONICAL_CROP_RATIO`, …), so a test asserting a bare number cannot silently
+become a claim about whichever value — or whichever corpus — the reader assumed.
+
+`tests/test_segmentation.py` runs stage 0 against a **synthetic photograph** built
+to the measured properties of the real one — illumination gradient, sensor noise,
+dust, a paper-edge band and a touching pair at a known position — so the whole of
+stage 0 is exercised with ground truth and without the dataset on disk.
 
 An end-to-end pre-flight on the real dataset, without a GPU:
 
@@ -938,6 +1122,7 @@ python main.py pretrain data.batch_size=4 data.num_workers=0 \
 
 | Path | Contents |
 | --- | --- |
+| [`src/segmentation/`](src/segmentation/README.md) | **Stage 0**: photographs → the one-seed-per-file corpus, its audit and its benchmark |
 | [`src/models/`](src/models/README.md) | SwinV2 encoder, hierarchical head, MoE / cross-attention / ArcFace, supervised baselines |
 | [`src/losses/`](src/losses/README.md) | DINO, ArcFace, KL hierarchy, MoE regularisation, cosine compactness |
 | [`src/datasets/`](src/datasets/README.md) | Hierarchical image-folder dataset and the DINO multi-crop pipeline |

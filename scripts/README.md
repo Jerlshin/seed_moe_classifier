@@ -9,6 +9,7 @@
 | `diagnose_sdpa_parity.py` | Per-module SwinV2→SDPA parity report (errors at fp32/TF32/fp64, gradients, shapes, guard verdicts) |
 | `run_stage1_ablations.py` | A **stage-1** arm suite from a YAML manifest: train each arm, evaluate it, collect one table |
 | `report_raw_photographs.py` | Which source photographs exist and were never cropped (reports only; never touches the data) |
+| `report_view_geometry.py` | What each DINO view is actually built from, per named view policy |
 | `run_ablations.py` | The component-wise ablation variants, five seeds each, optionally one per GPU |
 | `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |
@@ -18,6 +19,8 @@
 The intended order for a full experimental campaign:
 
 ```bash
+python main.py extract-seeds          # stage 0: build the corpus from RAW_Samples
+python main.py validate-seeds         # audit it against the recovered legacy boxes
 python scripts/dry_run.py             # verify the pipeline runs at all
 python scripts/verify_runtime.py      # verify the fast paths are exact HERE
 python scripts/bench_pretrain_step.py --scaling 1,2   # pick the launch geometry

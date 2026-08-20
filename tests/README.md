@@ -1,7 +1,7 @@
 # `tests/` — pytest suite
 
 ```bash
-python -m pytest tests/ -q             # all 640, ~50s
+python -m pytest tests/ -q             # all 666, ~60s
 python -m pytest tests/ -k arcface     # one topic
 python -m pytest tests/test_models.py  # one file
 ```
@@ -11,6 +11,7 @@ No network access, no weight downloads, no dependency on the real dataset.
 | File | Covers |
 | --- | --- |
 | `conftest.py` | Paper constants, synthetic dataset tree, stub encoder, shared fixtures |
+| `test_segmentation.py` | **Stage 0** on a synthetic photograph with ground truth: illumination field, support region, the two-channel foreground score, the three-signal split rule, the square crop policy, distractor suppression, the scene gate, and the audit's matching primitives |
 | `test_moe_layer.py` | Top-2 routing, dispatch weights, sparse/dense equivalence, dormant-parameter arithmetic, the dense bypass |
 | `test_components.py` | Cross-attention, ArcFace margin, projections, classifier heads |
 | `test_losses.py` | Bounds, KL direction, ArcFace stability, DINO schedule, ablation toggles |

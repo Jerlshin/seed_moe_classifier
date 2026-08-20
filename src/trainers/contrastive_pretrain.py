@@ -1181,14 +1181,14 @@ def report_view_geometry(
     """Measure and record what each view family is actually built from.
 
     ``RandomResizedCrop``'s ``scale`` is a *fraction of the source area*, and on
-    this corpus the source is one seed at a median 52x51 px. A configuration
+    this corpus the source is one seed in a square window at a median 61x61 px. A configuration
     therefore does not say how much of a seed a view contains -- only the
     *product* of the scale range and the source-size distribution does, and
     nothing was measuring it. Under the submitted recipe the answer is a median
     **598 native pixels** per local view rendered into 65,536, with **8 of the 10
     cross-view terms** in Eq. 1 anchored on one.
 
-    Runs at startup against the real file headers, costs ~2 s for 9,357 files,
+    Runs at startup against the real file headers, costs ~2 s for 13,492 files,
     and writes ``csv/view_geometry.csv`` plus a ``view_geometry`` event. Returns
     ``{}`` when the dataset cannot report its source sizes (the ``pickle_batches``
     format has no per-image files), which is a skipped diagnostic, not an error.

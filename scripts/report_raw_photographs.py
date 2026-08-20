@@ -8,13 +8,15 @@
 **This script only reports. It never touches the dataset.**
 
 Why it matters more than the crop count suggests. The binding constraint on this
-dataset is the number of *scenes*, not the number of crops: 9,357 crops come from
-81 source photographs, and within one photograph 89-98 % of crops have a
-neighbour above cosine 0.95 at 32x32 grey, so the effective sample count is far
-below 9,357. ``RAW_Samples`` holds **99** photographs, so 18 exist and were never
-cropped -- +22 % scenes at zero acquisition cost, concentrated on classes that
-currently have two or three (Poosa33 3 of 8, KodoMillet 2 of 5, LittleMillet 2 of
-5, Jagnath 3 of 5).
+dataset is the number of *scenes*, not the number of crops: within one photograph
+89-98 % of crops have a neighbour above cosine 0.95 at 32x32 grey, so the
+effective sample count is far below the file count.
+
+On the canonical corpus (``Refined_Samples``, built by ``main.py extract-seeds``)
+this reports **3 of 99** uncropped, and all three are excluded on purpose: they
+are not trays of seeds. It reported **18** on the hand-curated
+``Cropped_Samples``, of which 15 were ordinary trays that had simply never been
+cropped -- which is what stage 0 recovered.
 
 It does **not** fix the five single-photograph sub-varieties (Baryard, Browntop,
 FingerMillet, PearlMillet, ProsaMillet -- 14.8 % of the crops). Each genuinely
@@ -25,8 +27,9 @@ there is a camera, not a splitter.
 Two things to do before acting on this report:
 
 1. **Look at the photographs.** They may have been excluded deliberately -- blur,
-   exposure, a different tray. An out-of-focus photograph added to the SSL corpus
-   is worse than nothing.
+   exposure, a different tray, or not a tray at all. An out-of-focus photograph
+   added to the SSL corpus is worse than nothing, and stage 0's scene gate
+   excludes three frames for exactly this reason.
 2. **Treat re-cropping as a re-baseline, not an increment.** Every published
    accuracy moves, so it must happen before a phase rather than between arms, and
    the two corpora must stay distinguishable afterwards. They do: stage 1 records
@@ -50,8 +53,9 @@ from src.datasets.dataset import raw_photograph_coverage  # noqa: E402
 
 
 def default_cropped() -> str:
+    """The corpus to audit coverage *of* -- the canonical one unless told otherwise."""
     return os.environ.get(
-        "SEED_DATA_ROOT", str(PROJECT_ROOT / "data/Hierarchical_SeedData/Cropped_Samples")
+        "SEED_DATA_ROOT", str(PROJECT_ROOT / "data/Hierarchical_SeedData/Refined_Samples")
     )
 
 
@@ -68,7 +72,10 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--raw", default=default_raw(), help="RAW_Samples tree.")
-    parser.add_argument("--cropped", default=default_cropped(), help="Cropped_Samples tree.")
+    parser.add_argument(
+        "--cropped", default=default_cropped(),
+        help="The corpus tree to audit (default: $SEED_DATA_ROOT, i.e. Refined_Samples).",
+    )
     parser.add_argument("--json", default=None, help="Also write the report as JSON.")
     arguments = parser.parse_args()
 

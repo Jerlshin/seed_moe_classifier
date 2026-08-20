@@ -24,26 +24,32 @@ What the source images actually are, and why the view recipe was redesigned
 
 ``RandomResizedCrop`` samples a fraction of the **source image's** area. On
 ImageNet the source is a whole scene and a 5 % crop is still a recognisable
-object part. Here the source is already a tight crop of *one seed* at a median
-52x51 px, so the same recipe is not sampling a part of a scene -- it is
+object part. Here the source is a square window holding *one seed* at a median
+61x61 px, so the same recipe is not sampling a part of a scene -- it is
 shredding the object.
 
-Measured over all 9,357 crops (``scripts/report_view_geometry.py`` reproduces
+Measured over all 13,492 crops (``scripts/report_view_geometry.py`` reproduces
 every row, 40,000 draws at seed 7):
 
 ===================================== ============================= =============
 view recipe                           native px behind it p5/50/95  upsample to 256
 ===================================== ============================= =============
-global ``scale=(0.40, 1.00)``         648 / 1,845 / 5,680           6.0x median
-local  ``scale=(0.05, 0.40)``         132 / **598** / 2,585         **10.5x**
-local  ``scale=(0.30, 0.70)`` canonical  483 / **1,419** / 4,730     6.8x
+global ``scale=(0.40, 1.00)``         837 / 2,491 / 14,070          5.1x median
+local  ``scale=(0.05, 0.40)``         180 / **864** / 5,550         **8.7x**
+local  ``scale=(0.30, 0.70)`` canonical  638 / **1,935** / 10,812    5.8x
 ===================================== ============================= =============
 
-A local view under DINO's reference ranges is a median **24x24 px** fragment of a
-single seed inflated to 65,536 output pixels -- 0.9 % real content -- and **8 of
+A local view under DINO's reference ranges is a median **29x29 px** fragment of a
+single seed inflated to 65,536 output pixels -- 1.3 % real content -- and **8 of
 the 10 cross-view terms** in Eq. 1 are anchored on one. That is the single
 largest mismatch between the objective and this data, and it is what the view
 policy in ``conf/data/hierarchical_seeds.yaml`` exists to fix.
+
+A second quantity matters as much and is easy to miss: a view can carry plenty of
+native pixels and little *seed*. The refined crops include a 12 % paper ring, so
+the seed occupies a median 50.5 % of a crop against 79.9 % in the tight boxes
+that preceded them, and at unchanged scales a global view's seed coverage rose
+from a median 0.875 to 1.000.
 
 Three mechanisms carry the fix, and each is separately switchable so the arms
 stay single-factor:
@@ -183,8 +189,8 @@ class RandomRotation90:
 
     ``T.RandomRotation`` resamples: it interpolates every pixel and leaves black
     corners wherever the rotated rectangle does not cover the frame. On images
-    whose *entire* information content is a median 52x51 native pixels already
-    upsampled 5x, that is a destructive operation to apply for the sake of an
+    whose *entire* information content is a median 61x61 native pixels already
+    upsampled 4x, that is a destructive operation to apply for the sake of an
     augmentation.
 
     ``PIL.Image.transpose`` with a ``ROTATE_*`` constant is a pure index
@@ -220,8 +226,8 @@ class NativeFloorRandomResizedCrop(T.RandomResizedCrop):
 
     ``RandomResizedCrop``'s ``scale`` is a **fraction of the source area**, which
     is the right parameterisation when every source is the same size and wrong
-    when they span 21x22 to 881x413 as they do here. A fixed ``scale=(0.30,
-    0.70)`` takes 795-1,856 px from the median 52x51 crop and 12,600-29,400 px
+    when they span 32x32 to 343x343 as they do here. A fixed ``scale=(0.30,
+    0.70)`` takes 1,116-2,604 px from the median 61x61 crop and 35,000-82,000 px
     from a large one: the same nominal augmentation strength, two entirely
     different amounts of destruction.
 
@@ -915,6 +921,53 @@ def view_geometry_report(
     }
 
 
+class PadToSquare:
+    """Letterbox an image to a square with a replicated border, losslessly.
+
+    A no-op on the canonical corpus, which is 100 % square by construction, and
+    the reason it exists is the other one. ``Cropped_Samples`` is 96.6 %
+    non-square with aspect ratios spanning 0.17 to 3.48, and the only way to
+    batch it is ``Resize((H, W))`` -- which stretches each crop to a square by a
+    factor that depends on the seed's *orientation in the photograph*. A rice
+    grain lying flat has a 3:1 box and is compressed 3x along its length; the
+    same grain at 45 degrees has a square box and is not compressed at all. That
+    turns a rigid rotation of the object into a shape change, on a task whose
+    classes differ by shape.
+
+    Padding instead of stretching keeps the aspect ratio, so a control run on the
+    legacy corpus can isolate "the crops changed" from "the distortion changed":
+
+        SEED_DATA_ROOT=.../Cropped_Samples python main.py finetune \
+            data.expected_num_samples=9357 experiment.training.pad_to_square=true
+
+    ``edge`` replication rather than a constant fill: these crops are a seed on
+    paper, so the border pixels *are* paper and replicating them extends the
+    background the seed already sits on. A zero or grey fill would introduce a
+    hard edge at a distance from the seed that depends on the seed's aspect
+    ratio -- reintroducing, as a border artefact, exactly the orientation cue the
+    padding removes.
+    """
+
+    def __init__(self, padding_mode: str = "edge"):
+        self.padding_mode = str(padding_mode)
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        width, height = image.size
+        if width == height:
+            return image
+        side = max(width, height)
+        left = (side - width) // 2
+        top = (side - height) // 2
+        return T.functional.pad(
+            image,
+            [left, top, side - width - left, side - height - top],
+            padding_mode=self.padding_mode,
+        )
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(padding_mode={self.padding_mode!r})"
+
+
 def get_supervised_transforms(
     image_size: int,
     train: bool = True,
@@ -924,22 +977,27 @@ def get_supervised_transforms(
     random_resized_crop_scale: Sequence[float] | None = (0.8, 1.0),
     vertical_flip_prob: float = 0.0,
     rotation_degrees: float = 0.0,
+    pad_to_square: bool = False,
 ):
     """Stage-2 transforms for finetuning (``train=True``) and evaluation.
 
     **The resize is an explicit ``(H, W)`` pair, and that is load-bearing.**
-    ``T.Resize(int)`` resizes the shorter side and preserves aspect ratio; only
-    3.4 % of the crops under ``Cropped_Samples`` are square (aspect ratios span
-    0.17 to 3.48), so the integer form would emit variable-width tensors and
-    ``default_collate`` would raise on the first mixed batch. Passing the tuple
-    squashes every crop to a square, which distorts aspect ratio -- a real but
-    deliberate trade, and the honest alternative (pad-to-square) is available by
-    editing this one call site.
+    ``T.Resize(int)`` resizes the shorter side and preserves aspect ratio, so the
+    integer form emits variable-width tensors and ``default_collate`` raises on
+    the first mixed batch. The tuple form always emits a square.
 
-    Note also that the crops are **small**: median 52x51 px, and 100 % of them
-    have both sides under 256. Every image is therefore upsampled ~5x to reach
-    the backbone's window resolution, so "fine-grained texture" here means
-    texture the sensor resolved at ~50 px, not texture recovered by the resize.
+    On the canonical corpus the tuple is also **distortion-free**, which it was
+    not before. ``Refined_Samples`` is 100 % square (aspect p5/p95 = 1.00/1.00),
+    so ``Resize((256, 256))`` is a uniform rescale and the seed reaches the
+    backbone with its true proportions. ``Cropped_Samples`` was 3.4 % square with
+    aspect ratios spanning 0.17 to 3.48, so the same call stretched each crop by
+    an orientation-dependent factor. ``pad_to_square`` is the option that removes
+    that for a control run on the legacy corpus; see :class:`PadToSquare`.
+
+    The crops are still **small**: median 61x61 px, and 99.8 % of them have both
+    sides under 256. Every image is therefore upsampled ~4x to reach the
+    backbone's window resolution, so "fine-grained texture" here means texture
+    the sensor resolved at ~60 px, not texture recovered by the resize.
 
     Augmentation, revised
     ---------------------
@@ -970,9 +1028,15 @@ def get_supervised_transforms(
             tray have no canonical up, so this is safe here; it is off by default
             only because the submitted pipeline did not use it.
         rotation_degrees: Random rotation range in degrees, ``0`` to disable.
+        pad_to_square: Letterbox to a square with a replicated border *before*
+            the resize, so a non-square corpus is not stretched. A no-op on the
+            canonical corpus and off by default, because turning it on would
+            silently change what every legacy-corpus control measures.
     """
     interpolation = T.InterpolationMode.BICUBIC
     steps: list[Any] = []
+    if pad_to_square:
+        steps.append(PadToSquare())
 
     if train and random_resized_crop_scale is not None:
         steps.append(

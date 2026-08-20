@@ -230,7 +230,7 @@ written down yet.
 | `model.loss.center_momentum` | **0.99** | Eq. 3 says 0.9 |
 | `model.head.out_dim` (DINO) | **2,048** | Table 1 says 65,536; `K/B_teacher` is the quantity that matters |
 | `data.augmentation` crops | 2 global + 4 local | Table 1 |
-| crop scales | **(0.70, 1.00) / (0.30, 0.70)**, aspect (0.5, 2.0) | Table 1 says (0.4, 1.0) / (0.05, 0.4) — sized for a 52 x 51 px source |
+| crop scales | **(0.70, 1.00) / (0.30, 0.70)**, aspect (0.75, 1.33) | Table 1 says (0.4, 1.0) / (0.05, 0.4) — sized for a 61 x 61 px square source |
 | `model.head.embed_dim` | 384 | Eq. 4 |
 | `model.head.num_experts` | 6 | Section 5.2 |
 | `model.head.top_k` | **2** | revision (paper: 4) |
@@ -285,3 +285,22 @@ timestamped tree.
 
 `hydra.job.chdir` is left at its default of `false`, so relative paths in configs
 resolve against the directory you launched from, not the run directory.
+
+## `conf/segmentation.yaml` — stage 0, and why it is not a group
+
+The one configuration for building the corpus out of `RAW_Samples`:
+
+```bash
+python main.py extract-seeds segmentation.crop.margin=0.20
+python main.py validate-seeds audit.iou_threshold=0.5
+```
+
+It is a **standalone root config**, not a group composed into `conf/config.yaml`.
+Extraction runs before any training, reads no checkpoint and writes no tensor, so
+composing it in would put a node in every run's `summary.json` that no run uses —
+and would make every trainer's config depend on a stage that has already
+finished.
+
+`tests/test_segmentation.py` asserts that its three parameter blocks match the
+fields of `DetectionParams`, `CropPolicy` and `SceneGate` exactly, so a config key
+that no dataclass accepts cannot become a silently ignored knob.

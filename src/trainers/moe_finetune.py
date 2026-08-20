@@ -202,7 +202,7 @@ def split_dataset(
 
     ``protocol="grouped"`` (default) keeps every crop of one source photograph on
     one side of the boundary. This matters here more than in most datasets: the
-    9,357 crops under ``Cropped_Samples`` come from **81 source photographs**,
+    13,492 crops under ``Refined_Samples`` come from **96 source photographs**,
     a mean of 115 crops per source. Under crop-level splitting, near-duplicate
     views of the same physical seeds -- same lighting, same background, same
     sensor noise, overlapping bounding boxes -- appear in both train and test,
@@ -1351,9 +1351,19 @@ def main(cfg: DictConfig) -> None:
         crop_scale = OmegaConf.select(
             cfg, "experiment.training.random_resized_crop_scale", default=[0.8, 1.0]
         )
+        # Letterbox before the resize. A no-op on the canonical corpus, which is
+        # 100 % square; the switch exists so a control run on the legacy
+        # `Cropped_Samples` tree can drop the orientation-dependent stretch that
+        # `Resize((H, W))` applies to a non-square crop. Applied to BOTH the
+        # training and the evaluation transform, because a train/eval mismatch
+        # here would be a geometry change between fitting and scoring.
+        pad_to_square = bool(
+            OmegaConf.select(cfg, "experiment.training.pad_to_square", default=False)
+        )
         transform = get_supervised_transforms(
             image_size=int(cfg.data.image_size),
             train=True,
+            pad_to_square=pad_to_square,
             normalize_mean=cfg.data.augmentation.normalize_mean,
             normalize_std=cfg.data.augmentation.normalize_std,
             horizontal_flip_prob=float(
@@ -1374,6 +1384,7 @@ def main(cfg: DictConfig) -> None:
             train=False,
             normalize_mean=cfg.data.augmentation.normalize_mean,
             normalize_std=cfg.data.augmentation.normalize_std,
+            pad_to_square=pad_to_square,
         )
         dataset = get_finetune_dataset(
             data_dir=cfg.data.root_path,

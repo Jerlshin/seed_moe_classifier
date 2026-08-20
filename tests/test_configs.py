@@ -45,6 +45,7 @@ from tests.conftest import (
     SUBMITTED_DINO_OUT_DIM,
     PAPER_EMBED_DIM,
     CANONICAL_CROP_RATIO,
+    LEGACY_CROP_RATIO,
     CANONICAL_GLOBAL_CROPS_SCALE,
     CANONICAL_LOCAL_CROPS_SCALE,
     CANONICAL_LOCAL_CROP_SIZE,
@@ -427,14 +428,14 @@ def test_dino_head_normalisation_decouples_teacher_from_student(pretrain_cfg):
 
 
 def test_multi_crop_view_counts_match_table_1_and_the_scales_do_not(pretrain_cfg):
-    """2 global + 4 local views, at crop ranges sized for a 52 x 51 px source.
+    """2 global + 4 local views, at crop ranges sized for a 61 x 61 px source.
 
     The view *counts* are the paper's and are not negotiable -- the loss's
     cross-view pairing is written against them. The *scales* deliberately are
     not: `scale` is a fraction of the SOURCE area, and on ImageNet the source is
-    a scene while here it is already one seed, so DINO's (0.05, 0.40) builds a
-    local view from a median 598 native pixels (0.91 % real content) rather than
-    from a recognisable object part.
+    a scene while here it is one seed in a square window, so DINO's (0.05, 0.40)
+    builds a local view from a median 864 native pixels (1.32 % real content)
+    rather than from a recognisable object part.
 
     `conf/stage1_arms/view_design.yaml`'s `wo_view_redesign` arm is the control
     that measures what the change bought, and it restores exactly the three
@@ -445,9 +446,16 @@ def test_multi_crop_view_counts_match_table_1_and_the_scales_do_not(pretrain_cfg
     assert list(augmentation.global_crops_scale) == CANONICAL_GLOBAL_CROPS_SCALE
     assert list(augmentation.local_crops_scale) == CANONICAL_LOCAL_CROPS_SCALE
     assert pretrain_cfg.data.local_crop_size == CANONICAL_LOCAL_CROP_SIZE
-    # Not a paper knob at all: without it, raising the scale floor pushes 22 % of
-    # global draws into torchvision's deterministic centre crop.
-    assert list(augmentation.crop_ratio) == CANONICAL_CROP_RATIO
+    # Not a paper knob at all, and the one view constant the corpus re-baseline
+    # moved. `crop_ratio` exists because `get_params` falls back to a
+    # deterministic centre crop when a high-area box will not fit the source's
+    # aspect ratio -- 22 % of global draws on the 96.6 %-non-square legacy
+    # corpus, which is why that corpus needs LEGACY_CROP_RATIO. The refined
+    # crops are square, where the wide range is what CAUSES the fallback
+    # (4.8 % against 0.3 %) and also applies a 2x anisotropic rescale to a seed
+    # whose true proportions the square crops exist to preserve.
+    assert list(augmentation.crop_ratio) == pytest.approx(CANONICAL_CROP_RATIO)
+    assert list(augmentation.crop_ratio) != LEGACY_CROP_RATIO
 
 
 def test_blur_is_symmetric_across_the_three_view_families(pretrain_cfg):

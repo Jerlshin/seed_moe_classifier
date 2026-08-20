@@ -5,7 +5,7 @@
 #     python main.py pretrain
 #     python main.py pretrain --gpus 2
 #
-# SwinV2-Tiny, a view geometry sized for 52 x 51 px crops, colour preserved, and
+# SwinV2-Tiny, a view geometry sized for 61 x 61 px square crops, colour preserved, and
 # an epoch budget decided by a representation probe instead of by a loss curve.
 #
 # WHY EACH CHOICE, AND ON WHAT EVIDENCE

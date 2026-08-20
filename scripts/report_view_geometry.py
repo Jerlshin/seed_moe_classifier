@@ -9,21 +9,33 @@
 ``RandomResizedCrop``'s ``scale`` is a fraction of the **source area**, so a
 configuration does not say how much of a seed a view contains -- only the product
 of the scale range and the source-size distribution does. On this corpus the
-source is one seed at a median 52 x 51 px, and DINO's reference ranges build each
-local view from a median **598 native pixels** rendered into 65,536 output
-pixels, with 8 of the 10 cross-view terms in Eq. 1 anchored on such a view. The
-canonical policy in ``conf/data/hierarchical_seeds.yaml`` takes that to 1,419.
+source is a square window holding one seed at a median 61 x 61 px, and DINO's
+reference ranges build each local view from a median **864 native pixels**
+rendered into 65,536 output pixels, with 8 of the 10 cross-view terms in Eq. 1
+anchored on such a view. The canonical policy in
+``conf/data/hierarchical_seeds.yaml`` takes that to 1,935.
 
 ``--policy`` measures named override sets against the one data group, so there is
-no second config file for the two policies to drift apart in.
+no second config file for the policies to drift apart in. Each name matches an
+arm in ``conf/stage1_arms/view_design.yaml``.
 
-This reads the real file headers (~2 s for 9,357 files, no decode) and drives
+This reads the real file headers (~2 s for 13,492 files, no decode) and drives
 torchvision's own ``RandomResizedCrop.get_params``, so the numbers are what the
 dataloader will produce rather than a model of it. That matters for one result
 in particular: ``get_params`` retries the (area, aspect) draw ten times and then
-returns a **deterministic centre crop**, and on a corpus that is 96.6 %
-non-square, raising the scale floor pushes it into that fallback. The rate is
-reported per view family and is the reason ``crop_ratio`` is a config key.
+returns a **deterministic centre crop**. On the legacy corpus, which was 96.6 %
+non-square, raising the scale floor pushed 22 % of global draws into that
+fallback and the fix was a wider ``crop_ratio``; on the refined corpus, which is
+100 % square, the wide range is what *causes* it (4.8 % against 0.3 %). The rate
+is reported per view family and is the reason ``crop_ratio`` is a config key
+rather than a constant.
+
+**A view's information content is its native pixel count -- but a view can carry
+plenty of pixels and little seed.** The refined crops include a 12 % paper ring,
+so the seed occupies a median 50.5 % of a crop; the ``legacy_coverage`` policy is
+the scale range that puts the realised seed coverage back where the legacy corpus
+had it, and it is the honest comparison when reading a scale range across the two
+corpora.
 
 Reads nothing but the dataset and the config, writes nothing but the CSV it is
 asked for, and never touches a checkpoint.
@@ -41,17 +53,29 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 #: Named view policies, as overrides on the single ``data`` group. ``canonical``
-#: is whatever ``conf/data/hierarchical_seeds.yaml`` currently says; ``reference``
-#: is DINO's ImageNet geometry, kept here as a MEASUREMENT baseline rather than as
-#: a runnable configuration -- it is what the ``wo_view_redesign`` arm trains.
+#: is whatever ``conf/data/hierarchical_seeds.yaml`` currently says; the others
+#: are MEASUREMENT baselines rather than runnable configurations, each matching
+#: an arm in ``conf/stage1_arms/view_design.yaml``.
 POLICIES: dict[str, list[str]] = {
     "canonical": [],
+    # DINO's ImageNet geometry -- what `wo_view_redesign` trains.
     "reference": [
         "data.local_crop_size=101",
         "data.augmentation.global_crops_scale=[0.40,1.00]",
         "data.augmentation.local_crops_scale=[0.05,0.40]",
-        "data.augmentation.crop_ratio=[0.75,1.3333333333333333]",
     ],
+    # The ranges that reproduce the LEGACY corpus's seed-coverage distribution on
+    # the refined corpus -- what `legacy_view_coverage` trains. The refined crops
+    # carry a paper ring, so the seed is a median 50.5 % of a crop instead of
+    # 79.9 % and the same nominal scale is a less destructive view.
+    "legacy_coverage": [
+        "data.augmentation.global_crops_scale=[0.45,0.95]",
+        "data.augmentation.local_crops_scale=[0.20,0.55]",
+    ],
+    # The aspect range the legacy corpus needed, measured against the refined
+    # one. On a 100 %-square corpus it raises the global deterministic-fallback
+    # rate from 0.1 % to 5.0 % -- the reason the canonical policy dropped it.
+    "wide_ratio": ["data.augmentation.crop_ratio=[0.5,2.0]"],
 }
 
 #: The columns worth putting side by side when comparing two policies. Ordered

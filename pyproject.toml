@@ -13,9 +13,15 @@ dependencies = [
     "matplotlib",
     "numpy",
     "omegaconf",
+    # Stage 0 (src/segmentation): image decode, morphology, distance transform,
+    # inpainting and template matching. Headless build -- nothing here opens a
+    # window, and the GUI variant pulls Qt onto a rented GPU box for nothing.
+    "opencv-python-headless",
     "pillow",
     "psutil",
+    "scikit-image",   # peak_local_max, watershed (stage 0)
     "scikit-learn",
+    "scipy",          # ndimage: labelling, hole filling (stage 0)
     "timm",
     "torch",
     "torchvision",

@@ -726,7 +726,7 @@ def extract_features(
     """One deterministic pass over ``loader``, returning pooled and per-stage features.
 
     Per-stage features are captured with forward hooks *in the same pass*, because
-    a second pass over 9,357 images at 25.6 GFLOPs/view costs as much as the first
+    a second pass over 13,492 images at 25.6 GFLOPs/view costs as much as the first
     and produces bit-identical inputs. The hooks pool immediately, so peak memory
     is ``batch x channels`` rather than ``batch x 64 x channels``.
 
@@ -956,7 +956,7 @@ def grouped_cv_readout(
     Why this exists, and why it is the number to headline.
 
     The single held-out split stage 2 uses is a ``GroupShuffleSplit``: it takes 20 %
-    of the 81 source photographs with no stratification. On this dataset that is
+    of the 96 source photographs with no stratification. On this dataset that is
     not a detail -- most sub-varieties have crops from only ~3 photographs, so a
     20 % draw of photographs leaves **13 of the 27 sub-varieties entirely absent
     from the test side**. Accuracy on that split is a 27-way classifier scored on
@@ -967,7 +967,7 @@ def grouped_cv_readout(
     ``StratifiedGroupKFold`` over every crop fixes both without weakening the
     protocol: each fold's held-out half is still photograph-disjoint from its
     training half, every crop is held out exactly once, and every class appears.
-    Concatenating the folds gives one out-of-fold prediction per crop -- 9,357 of
+    Concatenating the folds gives one out-of-fold prediction per crop -- 13,492 of
     them, all 27 classes present, no leakage -- which is what the confusion matrix
     and the per-class table should be computed from.
 
@@ -1073,7 +1073,7 @@ def grouped_cv_readout(
         "knn_accuracy_mean": knn_mean,
         "knn_accuracy_std": knn_std,
         # Pooled out-of-fold scores. Not a mean of fold scores: this is one metric
-        # over all 9,357 predictions, which is what the confusion matrix shows.
+        # over all 13,492 predictions, which is what the confusion matrix shows.
         "out_of_fold_accuracy": float(accuracy_score(labels[covered], predictions[covered])),
         "out_of_fold_f1_macro": float(
             f1_score(labels[covered], predictions[covered], average="macro", zero_division=0)

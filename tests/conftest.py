@@ -66,25 +66,41 @@ PAPER_GLOBAL_CROPS = 2         # Table 1
 PAPER_LOCAL_CROPS = 4          # Table 1
 
 # View geometry. The submitted ranges are DINO's ImageNet defaults; the canonical
-# ones are sized for a source that is already one seed at a median 52 x 51 px.
-# Measured over all 9,357 crops (`scripts/report_view_geometry.py`, 40k draws at
-# seed 7), a local view carries a median 598 native pixels under the submitted
-# ranges and 1,419 under the canonical ones -- 0.91 % vs 2.17 % real content in a
-# 256 px view, with 8 of the 10 cross-view terms of Eq. 1 anchored on one.
+# ones are sized for a source that is a square window holding one seed at a
+# median 61 x 61 px. Measured over all 13,492 refined crops
+# (`scripts/report_view_geometry.py`, 40k draws at seed 7), a local view carries
+# a median 864 native pixels under the submitted ranges and 1,935 under the
+# canonical ones -- 1.32 % vs 2.95 % real content in a 256 px view, with 8 of the
+# 10 cross-view terms of Eq. 1 anchored on one.
 #
-# `crop_ratio` is not in the paper at all. It exists because narrowing the scale
-# range spends randomness: `get_params` retries the (area, aspect) draw ten times
-# and then returns a DETERMINISTIC centre crop, and only 3.4 % of these crops are
-# square. Measured global fallback rates: 3.5 % at (0.40, 1.00) with torchvision's
-# ratio, 22.0 % at (0.70, 1.00) with it, 10.2 % at (0.70, 1.00) once the ratio
-# widens to (0.5, 2.0).
+# `crop_ratio` is not in the paper at all, and it is the one view constant the
+# corpus re-baseline moved. It exists because `get_params` retries the
+# (area, aspect) draw ten times and then returns a DETERMINISTIC centre crop, and
+# whether that fires depends on the SOURCE's aspect ratio:
+#
+#   corpus                     square    fallback @ (0.70,1.00) x (0.75,1.33)
+#   -------------------------  -------   ------------------------------------
+#   Cropped_Samples (legacy)     3.4 %                22.0 %   -> needs (0.5, 2.0)
+#   Refined_Samples (canonical) 100.0 %                 0.3 %   -> (0.5, 2.0) gives 4.8 %
+#
+# So the wide range is correct for the legacy corpus and wrong for the refined
+# one, which is why both are named here.
 SUBMITTED_GLOBAL_CROPS_SCALE = [0.4, 1.0]
 SUBMITTED_LOCAL_CROPS_SCALE = [0.05, 0.4]
 SUBMITTED_LOCAL_CROP_SIZE = 101
 CANONICAL_GLOBAL_CROPS_SCALE = [0.70, 1.00]
 CANONICAL_LOCAL_CROPS_SCALE = [0.30, 0.70]
 CANONICAL_LOCAL_CROP_SIZE = 160
-CANONICAL_CROP_RATIO = [0.5, 2.0]
+CANONICAL_CROP_RATIO = [0.75, 4.0 / 3.0]
+LEGACY_CROP_RATIO = [0.5, 2.0]
+
+# The scale ranges that reproduce the LEGACY corpus's seed-coverage distribution
+# on the refined corpus, which carries a 12 % paper ring. Run as the
+# `legacy_view_coverage` arm; kept here so a test can assert the arm exists and
+# says which numbers it means.
+LEGACY_COVERAGE_GLOBAL_SCALE = [0.45, 0.95]
+LEGACY_COVERAGE_LOCAL_SCALE = [0.20, 0.55]
+
 PAPER_CLIP_GRAD = 3.0
 
 # Stage-1 constants come in pairs now: what Table 1 states, and what the revision
@@ -177,11 +193,48 @@ REVISED_DINO_HEAD_LAYERS = 3
 ADACOS_SCALE_27 = 4.6076
 SUBMITTED_ARCFACE_SCALE = 30.0
 
-# Dataset provenance, measured from the real tree under Cropped_Samples. These
-# decide what any accuracy number can mean, so they are constants like the rest.
-DATASET_NUM_SOURCE_PHOTOGRAPHS = 81
-DATASET_NUM_CROPS = 9357
+# Dataset provenance, measured from the real trees. These decide what any
+# accuracy number can mean, so they are constants like the rest -- and they come
+# in pairs, because the corpus was re-baselined and a test asserting a bare count
+# would silently become a claim about whichever tree the reader assumed.
+#
+# LEGACY_* is `Cropped_Samples`: 9,357 hand-curated, 96.6 % non-square crops from
+# 81 of the 99 photographs in RAW_Samples.
+#
+# DATASET_* is `Refined_Samples`, the canonical corpus: 13,492 square crops from
+# 96 photographs, produced by `python main.py extract-seeds`. The three
+# photographs it does not use are a near-empty sheet, a paper packet on a wooden
+# table and a labelled ziplock bag -- identified from their support fraction
+# (0.58 / 0.63 / 0.65 against 0.76-1.00 for a genuine tray), not from a list.
+LEGACY_NUM_SOURCE_PHOTOGRAPHS = 81
+LEGACY_NUM_CROPS = 9357
+DATASET_NUM_SOURCE_PHOTOGRAPHS = 96
+DATASET_NUM_CROPS = 13492
+DATASET_NUM_RAW_PHOTOGRAPHS = 99
+DATASET_EXCLUDED_PHOTOGRAPHS = 3
+
+# Unchanged by the re-baseline, and that is the point: Baryard, Browntop,
+# FingerMillet, PearlMillet and ProsaMillet each have exactly ONE raw
+# photograph, so no crop-extraction improvement can make them
+# photograph-separable. The fix there is a camera, not a splitter.
 DATASET_SINGLE_SOURCE_SUBVARIETIES = 5
+
+# The refined corpus's own geometry, measured from the tree. Square by
+# construction; the median crop is 61 px on a side and the seed occupies a
+# median 50.5 % of it (the crop policy's 12 % margin on each side).
+REFINED_CROP_SIDE_MEDIAN = 61
+REFINED_SQUARE_FRACTION = 1.0
+REFINED_SEED_AREA_FRACTION_MEDIAN = 0.505
+LEGACY_SEED_AREA_FRACTION_MEDIAN = 0.799
+
+# What `python main.py validate-seeds` measured on this extraction: the refined
+# detector recovers 9,024 of the 9,050 legacy crops whose exact bounding boxes
+# are recoverable from the raw photographs, and finds 1,439 seeds in the same
+# photographs that the curated set does not contain. The 307 crops that are NOT
+# byte-exact sub-images of their raw file all belong to four photographs whose
+# raw was re-oriented after cropping; they are excluded from the denominator.
+AUDIT_LEGACY_REFERENCE_CROPS = 9050
+AUDIT_LEGACY_RECALL = 0.9971
 
 # The REAL tree under `Cropped_Samples`: Amaranthus 3, Millet 8, Mustard 3,
 # Rice 13 = 27, matching Section 3.

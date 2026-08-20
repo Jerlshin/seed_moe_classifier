@@ -1,0 +1,144 @@
+# Seed extraction and audit -- the ONE configuration for building the refined
+# corpus out of RAW_Samples.
+#
+# This is a standalone root config, not a group composed into `conf/config.yaml`.
+# Extraction runs before any training, reads no checkpoint and writes no tensor,
+# so composing it into the trainers' config would put a node in every run's
+# `summary.json` that no run uses.
+#
+#   python -m src.segmentation.extract
+#   python -m src.segmentation.extract segmentation.detection.z_threshold=10
+#   python -m src.segmentation.audit
+#
+# Every threshold below was chosen against a measurement recorded in the
+# docstring of the module that consumes it. Where a number looks arbitrary, the
+# docstring says which photographs it was measured on and what the two sides of
+# the decision were.
+
+defaults:
+  - _self_
+
+seed: 42
+
+paths:
+  # RAW_Samples. NEVER written to -- the extractor opens these files read-only
+  # and there is no code path in src/segmentation that writes under this root.
+  raw_root: "${oc.env:SEED_RAW_DATA_ROOT,data/Hierarchical_SeedData/RAW_Samples}"
+
+  # Where the refined corpus is written. A NEW directory: the legacy
+  # `Cropped_Samples` tree is left exactly as it is, so every published number
+  # remains reproducible and the two corpora stay distinguishable by their
+  # `corpus_fingerprint` SHA-256.
+  output_root: "${oc.env:SEED_REFINED_DATA_ROOT,data/Hierarchical_SeedData/Refined_Samples}"
+
+  # The legacy corpus, used by the audit as a REFERENCE ANNOTATION SET. The
+  # legacy crops are byte-identical sub-images of the raw photographs, so their
+  # exact bounding boxes are recoverable by template matching -- which turns
+  # "did we miss seeds?" into a measurement instead of an opinion.
+  legacy_root: "${oc.env:SEED_DATA_ROOT,data/Hierarchical_SeedData/Cropped_Samples}"
+
+  # Reports, overlays and galleries. Never inside the dataset tree, so the
+  # corpus fingerprint covers images only.
+  report_dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/segmentation"
+
+segmentation:
+  # ---------------------------------------------------------------- detection
+  # See src/segmentation/detect.py: every default carries the measurement that
+  # chose it.
+  detection:
+    z_threshold: 8.0            # sigma above the PAPER's own noise, in either channel
+    darkness_floor: 0.07        # absolute floor on 1 - grey/illumination_field
+    chroma_floor: 4.0           # absolute floor on CIELAB distance from paper colour
+    min_area_ratio: 0.35        # below this a component is chaff, not a seed
+    split_area_ratio: 1.50      # never split anything at or below this
+    max_single_ratio: 3.00      # an unsplittable component up to this is one large seed
+    max_area_ratio: 8.00        # above this no split is attempted at all
+    # A component is only CONSIDERED for splitting when it has a waist. Every
+    # component the watershed resolves into two seeds measures 0.77-0.88
+    # solidity; every large single seed measures 0.92-0.98. Without this an
+    # elongated single seed above `split_area_ratio` can be halved along the
+    # ridge its own distance transform carries.
+    split_solidity: 0.93
+    min_fragment_ratio: 0.45    # one implausible fragment discards the whole split
+    max_fragment_ratio: 1.80
+    peak_radius_fraction: 0.40  # peak suppression, as a fraction of seed diameter
+    peak_height_fraction: 0.25  # minimum peak height, as a fraction of the max
+    support_margin_seeds: 1.50  # paper-edge erosion, in seed diameters
+    # Shape gates. The absolute floors catch a shape no seed could have; the
+    # relative ones do the actual work, as a fraction of the PHOTOGRAPH's own
+    # median. Shape is varietal: a rice grain measures 0.97 solidity and a
+    # pearl-millet seed with a hilum notch 0.73-0.88, and a global constant that
+    # keeps the rice discards 29 real pearl-millet seeds from one photograph.
+    min_solidity: 0.60
+    min_circularity: 0.15
+    solidity_relative: 0.80
+    circularity_relative: 0.50
+
+  # ------------------------------------------------------------- crop geometry
+  crop:
+    # Square window side = max(w, h) * (1 + 2*margin), centred on the tight box.
+    #
+    # 0.12 reproduces the legacy crops' measured 5-6 px padding (a median 14 %
+    # of the tight side) while guaranteeing the whole boundary is inside the
+    # frame. Measured cost of the margin: neighbour intrusion into the window
+    # rises 1.6 % -> 2.9 % between margin 0 and 0.12, and 6.5 % at 0.30.
+    margin: 0.12
+    min_side: 32
+    interpolation_free: true    # assert no crop is ever resampled
+    suppress_distractors: true  # inpaint OTHER seeds out of the window
+    distractor_dilation: 3
+
+  # ----------------------------------------------------------------- scene gate
+  # Which photographs are trays of seeds at all. Three of the 99 are not: a seed
+  # packet on a wooden table, a near-empty sheet, and a labelled ziplock bag.
+  scene:
+    min_support_fraction: 0.70  # tray photographs measure 0.76-1.00; the three others 0.58-0.65
+    min_instances: 20
+    max_reject_fraction: 0.60   # over SEED-SIZED candidates, not over every speck
+
+  # ------------------------------------------------------------------- outputs
+  output:
+    # PNG, so the crop is a bit-exact copy of the decoded source pixels. The raw
+    # photographs are already JPEG; re-encoding the crops as JPEG would add a
+    # second generation of loss to the exact fine texture the task depends on.
+    image_format: "png"
+    # `IMG_0502_bbox0137.png` -- the SAME `_bbox<n>` convention the legacy
+    # corpus uses, so `src.datasets.dataset.source_image_id` groups the refined
+    # crops by source photograph with no code change and the photograph-disjoint
+    # split protocol keeps working.
+    filename_template: "{stem}_bbox{index:04d}"
+    write_contours: true        # per-crop boundary polygon into manifest.json
+    overwrite: false            # refuse to write into a populated output root
+
+  # -------------------------------------------------------------------- figures
+  #
+  # DISK: the full set is ~600 MB for 99 photographs -- ~4 MB per overlay at
+  # `overlay_long_side: 2000`, plus the galleries. That is the price of being
+  # able to answer "did it miss a row of seeds?" by looking, which a count
+  # cannot. `enabled: false` writes the manifests and nothing else; lowering
+  # `overlay_long_side` is the cheaper trade, but below ~1500 a 30 px amaranthus
+  # seed stops being inspectable on a 3400 px original.
+  figures:
+    enabled: true
+    overlay_long_side: 2000
+    per_photograph_overlay: true    # one annotated overlay per photograph
+    rejection_gallery: true
+    accepted_gallery: true
+    gallery_per_reason: 8           # tiles per rejection reason, evenly spaced
+
+audit:
+  # Recover the legacy crops' exact bounding boxes by template matching, and
+  # score the refined detections against them. ~4 minutes for 9,357 crops.
+  match_legacy: true
+  # Coarse search factor. 2 resolves 93 % of crops exactly on the first pass and
+  # falls back to a full-resolution search for the rest; 1 is exhaustive and 4x
+  # slower for no gain.
+  coarse_scale: 2
+  # A refined detection matches a legacy box when their intersection over union
+  # is at least this. 0.30 is deliberately loose: the two use different padding
+  # rules, so a tight IoU would measure the margin rather than the detection.
+  iou_threshold: 0.30
+  # Two refined crops whose windows overlap by more than this are reported as a
+  # possible duplicate detection of one seed.
+  duplicate_iou: 0.60
+  before_after_samples: 24

@@ -117,6 +117,26 @@ experiment:
     vertical_flip_prob: 0.5
     rotation_degrees: 0.0
 
+    # Letterbox each crop to a square, with a replicated border, before the
+    # resize to `image_size`.
+    #
+    # A NO-OP on the canonical corpus and that is why it is false. Every crop
+    # under `Refined_Samples` is already square (aspect p5/p95 = 1.00/1.00), so
+    # `Resize((256, 256))` is a uniform rescale. It matters only for a control
+    # run against the legacy `Cropped_Samples` tree, which is 96.6 % non-square
+    # with aspect ratios from 0.17 to 3.48: there the resize stretches each crop
+    # by a factor set by the seed's ORIENTATION in the photograph, which turns a
+    # rigid rotation of the object into a shape change on a task whose classes
+    # differ by shape.
+    #
+    #   SEED_DATA_ROOT=.../Cropped_Samples python main.py finetune \
+    #       data.expected_num_samples=9357 \
+    #       data.augmentation.crop_ratio=[0.5,2.0] \
+    #       experiment.training.pad_to_square=true
+    #
+    # Applied to the training and the evaluation transform together.
+    pad_to_square: false
+
     # Inverse-frequency sampling over sub-varieties. The hierarchy is 13 rice +
     # 8 millet + 3 + 3, so seed-type accuracy is structurally rice-dominated.
     # Macro-F1 is reported either way; this is the option that trains for it.

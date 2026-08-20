@@ -78,18 +78,58 @@ arms:
   - name: wo_view_redesign
     description: >-
       The recipe minus the view redesign: the reference DINO crop geometry
-      ((0.40,1.00)/(0.05,0.40) at 101 px, torchvision's aspect range) with the
-      colour policy, dihedral augmentation and KoLeo space intact. This is THE
-      arm -- the difference between it and `full` is the entire value of moving
-      local views from a median 598 native pixels to 1,419. Expect `full` to
+      ((0.40,1.00)/(0.05,0.40) at 101 px) with the colour policy, dihedral
+      augmentation and KoLeo space intact. This is THE arm -- the difference
+      between it and `full` is the entire value of moving local views from a
+      median 864 native pixels to 1,920 on the refined corpus. Expect `full` to
       show a LOWER KL (the correspondence is genuinely easier to learn once the
       two views depict the same object) and, if the hypothesis holds, a higher
-      probe.
+      probe. Note that `crop_ratio` is NOT part of this arm any more: the
+      canonical policy and the reference now share torchvision's range, because
+      the refined crops are square (see conf/data/hierarchical_seeds.yaml).
     overrides:
       - data.local_crop_size=101
       - data.augmentation.global_crops_scale=[0.40,1.00]
       - data.augmentation.local_crops_scale=[0.05,0.40]
-      - data.augmentation.crop_ratio=[0.75,1.3333333333333333]
+
+  - name: legacy_view_coverage
+    description: >-
+      The scale ranges that reproduce the LEGACY corpus's view statistics on the
+      refined corpus. The refined crops carry a 12 % paper ring, so the seed
+      occupies a median 50.5 % of a crop instead of 79.9 %, and at unchanged
+      settings the same nominal scale delivers a view containing a median 100 %
+      of the seed where it used to deliver 87.5 % (global) and 76.8 % where it
+      used to deliver 56.0 % (local). Measured over 20,000 draws,
+      (0.45,0.95)/(0.20,0.55) puts the coverage distribution back where it was
+      (global p5/median 0.694/0.917 against the legacy 0.661/0.875; local
+      0.317/0.605 against 0.367/0.560) while still carrying MORE native pixels
+      than the legacy views did.
+      This is the arm that decides whether the corpus re-baseline should have
+      moved the view policy with it. If it beats `full`, the multi-crop
+      objective wanted the harder local-to-global task and the canonical ranges
+      are now too easy; if it loses, the extra object coverage is worth more than
+      the extra difficulty and `full` stays.
+    overrides:
+      - data.augmentation.global_crops_scale=[0.45,0.95]
+      - data.augmentation.local_crops_scale=[0.20,0.55]
+
+  - name: legacy_corpus
+    description: >-
+      The canonical recipe on the corpus it replaced -- 9,357 hand-curated,
+      non-square crops from 81 photographs instead of 13,492 square ones from 96.
+      The arm that prices the re-baseline itself. `crop_ratio` has to move with
+      the corpus: the legacy crops are 96.6 % non-square, where torchvision's
+      aspect range sends 22 % of global draws into `get_params`'s deterministic
+      centre-crop fallback.
+      Read it with `nuisance_above_chance` beside the probe, because the refined
+      corpus adds 15 photographs and the honest question is how much of any gain
+      is scenes rather than crops. The no-training version of the same
+      comparison, which costs minutes rather than GPU-hours, is
+      `python -m src.segmentation.benchmark`.
+    overrides:
+      - data.root_path=${oc.env:SEED_LEGACY_DATA_ROOT,data/Hierarchical_SeedData/Cropped_Samples}
+      - data.expected_num_samples=9357
+      - data.augmentation.crop_ratio=[0.5,2.0]
 
   - name: wo_colour_policy
     description: >-

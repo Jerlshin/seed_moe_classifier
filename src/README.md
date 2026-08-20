@@ -1,10 +1,11 @@
 # `src/` — implementation
 
-Five packages, split by responsibility. Nothing imports "upward": `models`
+Six packages, split by responsibility. Nothing imports "upward": `models`
 never imports `trainers`, `losses` never imports `datasets`.
 
 | Package | Responsibility | README |
 | --- | --- | --- |
+| `segmentation/` | **Stage 0**: `RAW_Samples` photographs → the one-seed-per-file corpus, plus its audit | [→](segmentation/README.md) |
 | `models/` | Network definitions — SwinV2 encoder, hierarchical head, components, baselines | [→](models/README.md) |
 | `losses/` | Every objective, for both stages | [→](losses/README.md) |
 | `datasets/` | Image-folder dataset, label hierarchy, augmentation | [→](datasets/README.md) |
@@ -14,12 +15,20 @@ never imports `trainers`, `losses` never imports `datasets`.
 ## Dependency direction
 
 ```
+segmentation  (stage 0, standalone: reads photographs, writes PNGs)
+    └─────▶ datasets    (only for source_image_id / corpus_fingerprint)
+
 trainers ──▶ models ──▶ components
     │           └─────▶ backbones
     ├──────▶ losses  ──▶ models.components   (ArcFaceHead, HierarchicalOutput)
     ├──────▶ datasets
     └──────▶ utils   ──▶ utils.training
 ```
+
+`segmentation` is deliberately off the main graph. It runs before any training,
+touches no checkpoint and no GPU, and hands downstream nothing but a directory in
+the layout `HierarchicalSeedDataset` already walks — so the corpus can be rebuilt
+or replaced without any other package knowing.
 
 `losses` depending on `models` is deliberate: `CombinedHierarchicalLoss` takes a
 `HierarchicalOutput` rather than a dozen positional tensors, which is what stops

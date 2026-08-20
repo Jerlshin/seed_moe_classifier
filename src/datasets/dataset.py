@@ -61,7 +61,7 @@ def image_sizes(paths: Sequence[str | os.PathLike[str]]) -> list[tuple[int, int]
 
     ``PIL.Image.open`` parses the header and defers the pixel decode, so this is
     ~10 us per file rather than ~1 ms. That matters because the caller is the
-    trainer's startup path and the corpus is 9,357 files: a header read is a
+    trainer's startup path and the corpus is 13,492 files: a header read is a
     second, a decode is a minute.
 
     Unreadable files are skipped rather than raising. A geometry *report* that
@@ -193,7 +193,7 @@ def raw_photograph_coverage(
     """Which source photographs exist but were never cropped.
 
     The binding constraint on this dataset is the number of *scenes*, not the
-    number of crops: 9,357 crops come from 81 photographs, and within one
+    number of crops: 13,492 crops come from 96 photographs, and within one
     photograph 89-98 % of crops have a neighbour above cosine 0.95 at 32x32 grey.
     ``RAW_Samples`` holds 99 photographs, so 18 exist and were never cropped --
     which is +22 % scenes at zero acquisition cost, concentrated on classes that
@@ -258,9 +258,9 @@ class PretrainImageFolderDataset(ImageFolder):
 
     Optionally holds every decoded image in one shared RAM buffer. That is worth
     doing here for a reason specific to this dataset: the crops under
-    ``Cropped_Samples`` have a median size of 52 x 51 px, so all 9,357 of them
-    decode to roughly **75 MB** of raw RGB. Without the cache, a 300-epoch run
-    pays 2.8 million PNG decodes for a working set that fits in a rounding error
+    ``Refined_Samples`` have a median size of 61 x 61 px, so all 13,492 of them
+    decode to roughly **299 MB** of raw RGB. Without the cache, a 300-epoch run
+    pays 4.0 million PNG decodes for a working set that fits in a rounding error
     of system memory -- and those decodes are on the dataloader workers, which
     are the processes currently failing to keep the GPU fed.
 
@@ -268,7 +268,7 @@ class PretrainImageFolderDataset(ImageFolder):
     than a list of arrays. Under ``fork`` the pages are shared copy-on-write
     across every worker, and one array means the reference counts the workers
     touch live in the parent's few metadata pages instead of being scattered
-    through 9,357 object headers.
+    through 13,492 object headers.
     """
 
     def __init__(
@@ -324,7 +324,7 @@ class PretrainImageFolderDataset(ImageFolder):
         """``(width, height)`` of every crop, in dataset order.
 
         Read from the file headers, not by decoding: ``Image.open`` is lazy, so
-        ``.size`` costs a few bytes per file and the whole 9,357-image corpus is
+        ``.size`` costs a few bytes per file and the whole 13,492-image corpus is
         a second. The view-geometry report needs the true source dimensions
         because ``RandomResizedCrop``'s ``scale`` is a *fraction* of them, and a
         fraction of an unknown quantity is not a measurement.
@@ -724,9 +724,9 @@ class HierarchicalSeedDataset(Dataset):
         Args:
             raw_root: Optional ``RAW_Samples`` tree. When supplied, the report
                 additionally names the source photographs that exist and were
-                never cropped -- 18 of 99 on the shipped corpus, i.e. +22 %
-                scenes available at zero acquisition cost. Reporting only; see
-                :func:`raw_photograph_coverage`.
+                never cropped -- **3** of 99 on the canonical corpus, all three
+                excluded on purpose because they are not trays of seeds.
+                Reporting only; see :func:`raw_photograph_coverage`.
 
         Reported at the top of every run because it decides what the headline
         accuracy can mean. ``single_group_sub_varieties`` is the number that
