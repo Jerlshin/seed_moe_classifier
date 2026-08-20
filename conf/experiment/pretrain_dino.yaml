@@ -85,7 +85,7 @@ experiment:
   stage: "pretrain"
   group: "stage1"
   training:
-    epochs: 50
+    epochs: 70
     max_batches: null
     # Dense early milestones: the earlier run's probe curve peaked at epoch 50
     # of 100 and was already within 0.8 pp of its peak at epoch 25, so the
@@ -99,7 +99,7 @@ experiment:
     # resume state. Comfortable on a server, tight on a 16 GB vast.ai root disk:
     # raise `probe.every_epochs` to 10 there rather than trimming this list, so
     # the probe and the milestones stay in step.
-    save_epochs: [5, 10, 15, 20, 25, 30, 40, 50]
+    save_epochs: [20, 25, 30, 40, 50, 60, 70]
 
     # ---------------------------------------------------- checkpoint selection
     #
@@ -118,7 +118,7 @@ experiment:
       # Three probes (15 epochs) without a gain above `min_delta` ends the run.
       # 0.002 is below the probe's fold-to-fold spread on purpose -- it is a
       # guard against stopping on noise, not a target effect size.
-      patience: 3
+      patience: 20
       min_delta: 0.002
       folds: 3                # crop-level stratified, matching the primary protocol
       regularisation: 10.0
