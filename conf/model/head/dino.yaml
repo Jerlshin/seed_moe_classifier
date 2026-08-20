@@ -60,7 +60,7 @@ use_batch_norm: "layer"
 norm_last_layer: true
 
 # ---------------------------------------------------------------------------
-# Auxiliary head on an intermediate trunk stage (STAGE1_CHANGES.md C4).
+# Auxiliary head on an intermediate trunk stage. An arm, not a default.
 #
 # null (the default) is plain DINO: one head, on the pooled trunk output.
 #

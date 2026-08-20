@@ -1,28 +1,32 @@
 # @package _global_
 #
-# Stage-1 evaluation for the v2 run, under the primary crop-level protocol.
+# STAGE 1.5 -- score the stage-1 representation itself. No training.
 #
-#     python main.py eval-pretrain-v2
+#     python main.py eval-pretrain
 #
-# Differs from `eval_pretrain_representation` in three ways and no others:
+# The DINO loss is a cross entropy against a teacher that moved during training,
+# so it is comparable to nothing -- not across runs, not across checkpoints of
+# one run, not against a threshold. This stage measures the representation with
+# instruments that fail independently: label-free geometry (RankMe, participation
+# ratio, alignment/uniformity), frozen-feature readout (linear probe + a
+# parameter-free weighted cosine k-NN), structure recovered without labels
+# (k-means, prototype argmax against the taxonomy), and the nuisance the stage was
+# supposed to remove.
 #
-# 1. It reads the v2 run's milestones, including `dino_best_encoder.pth` -- the
+# Three things about this file specifically:
+#
+# 1. It reads the run's milestones, including `dino_best_encoder.pth` -- the
 #    encoder the in-training probe selected and the one stage 2 is handed. That
 #    row is the headline; the numbered milestones are what make "did the probe
 #    pick the right one" checkable rather than assumed.
 # 2. The headline split is **crop-level stratified**, matching the primary
-#    pipeline, and `grouped_cv` is off. The photograph-disjoint estimate lives in
-#    `finetune_v2_grouped_diagnostic` and in this file's own
-#    `split.also_stratified` counterpart -- here `also_stratified` is inverted:
-#    the grouped single split is reported *beside* the headline so the delta
-#    stays visible, but it is not what any headline number is computed from.
-# 3. The trunk is SwinV2-Tiny, so `random_init` and `imagenet_init` are Tiny
-#    too. Comparing a Tiny DINO encoder against a Small ImageNet control would
-#    make the "+X pp from self-distillation" figure partly an architecture delta.
-#
-# Everything else -- the handcrafted floor, the layerwise readout, the nuisance
-# measurement, the prototype and invariance blocks -- is unchanged, because those
-# are instruments rather than protocol choices.
+#    pipeline, and `grouped_cv` is off. The photograph-disjoint estimate is
+#    reported beside it (`split.also_stratified` is inverted here: the grouped
+#    single split is the companion, not the headline) and measured end-to-end by
+#    `experiment=finetune_grouped_diagnostic`.
+# 3. `random_init` and `imagenet_init` use the same trunk as the run under test,
+#    so the "+X pp from self-distillation" figure is not partly an architecture
+#    delta.
 
 defaults:
   - override /model/head: dino
@@ -30,41 +34,39 @@ defaults:
 
 model:
   backbone:
-    name: "swinv2_tiny_window16_256"
-    feature_dim: 768
+    # The trunk comes from `conf/model/backbone/swinv2.yaml`, so the controls are
+    # the same architecture as the encoder under test. `checkpoint_path: null`
+    # because every encoder row below names its own weights.
     checkpoint_path: null
     pretrained: false
     freeze: true
     drop_path_rate: 0.0
 
-data:
-  expected_num_samples: 9357
-
 experiment:
-  name: "eval_pretrain_v2"
+  name: "eval_pretrain"
   stage: "eval"
-  group: "stage1_v2_evaluation"
+  group: "stage1_evaluation"
   evaluation:
-    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/eval_pretrain_v2"
-    pretrain_run_dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_v2_swinv2_tiny"
-    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_v2_swinv2_tiny.pth"
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/eval_pretrain"
+    pretrain_run_dir: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_dino"
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_pretrained_encoder.pth"
     encoders:
-      - label: "dino_v2_best"
+      - label: "dino_best"
         checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_best_encoder.pth"
         pretrained: false
         role: "primary"
         description: "the probe-selected encoder -- the weights stage 2 is handed"
-      - label: "dino_v2_epoch10"
+      - label: "dino_epoch10"
         checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0010.pth"
         pretrained: false
         role: "milestone"
-        description: "10 epochs of v2 self-distillation"
-      - label: "dino_v2_epoch25"
+        description: "10 epochs of in-domain self-distillation"
+      - label: "dino_epoch25"
         checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0025.pth"
         pretrained: false
         role: "milestone"
         description: "25 epochs"
-      - label: "dino_v2_epoch50"
+      - label: "dino_epoch50"
         checkpoint: "${experiment.evaluation.pretrain_run_dir}/dino_backbone_epoch_0050.pth"
         pretrained: false
         role: "milestone"
@@ -73,12 +75,12 @@ experiment:
         checkpoint: null
         pretrained: true
         role: "control_imagenet"
-        description: "SwinV2-Tiny ImageNet-1k weights -- what stage 1 started from, and the bar it must clear"
+        description: "ImageNet-1k weights -- what stage 1 started from, and the bar it must clear"
       - label: "random_init"
         checkpoint: null
         pretrained: false
         role: "control"
-        description: "untrained SwinV2-Tiny; the floor a linear readout gets from architecture alone"
+        description: "untrained trunk; the floor a linear readout gets from architecture alone"
       - label: "handcrafted_floor"
         kind: "handcrafted"
         checkpoint: null
@@ -103,10 +105,10 @@ experiment:
     probe:
       regularisation_grid: [0.01, 0.1, 1.0, 10.0, 100.0]
       max_iterations: 2000
-      cv_encoders: ["dino_v2_best", "imagenet_init"]
+      cv_encoders: ["dino_best", "imagenet_init"]
       low_shot_shots: [1, 2, 5, 10, 25]
       low_shot_repeats: 5
-      low_shot_encoders: ["dino_v2_best", "imagenet_init"]
+      low_shot_encoders: ["dino_best", "imagenet_init"]
     knn:
       k_values: [1, 5, 10, 20]
       temperature: 0.07
@@ -120,13 +122,13 @@ experiment:
     layerwise:
       enabled: true
       all_encoders: true
-      encoders: ["dino_v2_best", "imagenet_init"]
+      encoders: ["dino_best", "imagenet_init"]
     nuisance:
       enabled: true
       folds: 3
     invariance:
       enabled: true
-      encoders: ["dino_v2_best", "imagenet_init"]
+      encoders: ["dino_best", "imagenet_init"]
       max_samples: 1500
     prototypes:
       enabled: false
@@ -134,7 +136,7 @@ experiment:
     tsne:
       perplexity: 30.0
       max_samples: 3000
-      encoders: ["dino_v2_best", "imagenet_init", "random_init"]
+      encoders: ["dino_best", "imagenet_init", "random_init"]
     efficiency:
       enabled: true
       batch_sizes: [1, 8, 32]

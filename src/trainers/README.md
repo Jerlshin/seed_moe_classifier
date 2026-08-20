@@ -13,8 +13,8 @@ loss decision lives elsewhere.
 | `runner.py` | Suite orchestration for `scripts/run_{ablations,baselines}.py` | — |
 
 ```bash
-python main.py pretrain       # == python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
-python main.py eval-pretrain  # == python -m src.trainers.pretrain_eval experiment=eval_pretrain_representation
+python main.py pretrain       # == python -m src.trainers.contrastive_pretrain experiment=pretrain_dino
+python main.py eval-pretrain  # == python -m src.trainers.pretrain_eval experiment=eval_pretrain
 python main.py finetune       # == python -m src.trainers.moe_finetune experiment=finetune_hierarchical_moe
 python main.py smoke          # 2-batch dry run of both training stages
 ```
@@ -37,14 +37,13 @@ scores. `--gpus` is refused: one forward pass per encoder has no gradient to
 reduce.
 
 See [`../../architecture/08_STAGE1_REPRESENTATION_EVALUATION.md`](../../architecture/08_STAGE1_REPRESENTATION_EVALUATION.md)
-for the protocol and [`../../STAGE1_EVALUATION.md`](../../STAGE1_EVALUATION.md) for
-the results.
+for the protocol and what each instrument is for.
 
 Both honour `experiment.training.max_batches`, which caps batches per epoch.
 
 ## One trainer serves all three
 
-The full model, the six ablations and the three baselines all run through
+The full model, every ablation and every baseline all run through
 `moe_finetune.py`, differing only by Hydra overrides. That is deliberate: an
 ablation routed through a second training loop would differ from the full model
 in ways nobody intentionally chose — a different shuffle, a different metric
@@ -61,7 +60,7 @@ loop itself never branches.
 Stage 1 ends by writing `dino_pretrained_backbone.pth` — a bare
 `student_backbone` state dict — and then **publishing a copy** to
 `experiment.training.shared_backbone_path`, by default
-`outputs/checkpoints/dinov2_swinv2_pretrained.pth`. Every downstream run reads
+`outputs/checkpoints/dino_pretrained_encoder.pth`. Every downstream run reads
 that one file.
 
 That indirection is what makes the ablation table valid. The suites compare
@@ -142,7 +141,7 @@ Four details in the loop:
 ### Running it on more than one GPU
 
     torchrun --standalone --nproc_per_node=2 -m src.trainers.contrastive_pretrain \
-        experiment=pretrain_swinv2_dino
+        experiment=pretrain_dino
     python main.py pretrain --gpus 2          # the same, run id pinned
 
 `DistributedSampler` shards **images**; all six views of a sample stay on the
@@ -321,8 +320,9 @@ Three log lines that are easy to misread:
 
 ## `split_protocol: grouped_cv` in stage 2
 
-A third protocol beside `grouped` and `stratified`, and **opt-in**: there is no
-held-out test split at all. `StratifiedGroupKFold` partitions every crop into
+The photograph-disjoint counterpart of the crop-level primary, reached as
+`experiment=finetune_grouped_diagnostic` or as one override. There is no held-out
+test split at all. `StratifiedGroupKFold` partitions every crop into
 photograph-disjoint folds, each fold's finished model scores its own held-out
 half, and `merge_out_of_fold` concatenates the predictions — in dataset order — 
 into one out-of-fold set covering every crop and every class.
@@ -336,6 +336,8 @@ stage-2 headline numbers directly comparable.
 
 Two things it is **not**: it is an estimate of the *recipe* (K different models
 contributed), not any single shipped model's test score, and it is not comparable
-with a `grouped` number — which is why it is not the default. Every split now
-reports `classes_present_in_test` next to the metrics so the cap is visible either
-way.
+with the crop-level headline as "better" or "worse" — only as a measurement of the
+gap between two questions. It also has no paired test against `full_model`,
+because it does not share that split. Every protocol reports
+`classes_present_in_test`, `shared_source_groups` and `leaked_test_fraction` next
+to the metrics, so the cap and the leak are visible either way.

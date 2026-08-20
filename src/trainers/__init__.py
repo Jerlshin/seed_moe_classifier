@@ -5,7 +5,7 @@ as modules rather than imported, so this package deliberately does not import
 them at module load time -- doing so would trigger Hydra's config search on any
 ``import src.trainers``.
 
-    python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
+    python -m src.trainers.contrastive_pretrain experiment=pretrain_dino
     python -m src.trainers.moe_finetune        experiment=finetune_hierarchical_moe
 """
 

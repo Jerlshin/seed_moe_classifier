@@ -49,9 +49,9 @@ Three further blocks the revision adds:
         (gamma, beta) = MLP(g_hidden(z)),   h' = gamma * h + beta
 
     ``gamma = 1 + tanh(.)`` is bounded by construction, so the residual's
-    magnitude cannot track the coarse head's confidence -- the same hazard
-    ``PAPER_AUDIT.md`` 2.2 addressed by projecting probabilities rather than
-    logits, handled structurally. Setting ``gamma = 1`` recovers the additive
+    magnitude cannot track the coarse head's confidence -- the same hazard the
+    Eq. 9 residual addresses by projecting probabilities rather than logits,
+    handled structurally. Setting ``gamma = 1`` recovers the additive
     form exactly, so this is a strict superset and the two are ablatable against
     each other.
 

@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         default=os.environ.get(
             "SEED_PRETRAIN_BACKBONE",
-            f"{output_root}/checkpoints/dinov2_swinv2_pretrained.pth",
+            f"{output_root}/checkpoints/dino_pretrained_encoder.pth",
         ),
         help="DINO-pretrained backbone weights. Pass 'none' to skip loading.",
     )

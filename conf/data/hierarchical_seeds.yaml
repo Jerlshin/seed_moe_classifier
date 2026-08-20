@@ -1,4 +1,9 @@
-# Seed dataset and augmentation pipeline (paper Sections 3 and 4).
+# Seed dataset, splits and the multi-crop view policy (paper Sections 3 and 4).
+#
+# This is the ONLY data group. It carries the current, canonical view recipe --
+# the one sized for this corpus, not the one inherited from ImageNet. The
+# reference (submitted) geometry is still reachable, as a set of overrides, and
+# `conf/stage1_arms/view_design.yaml` runs it as the `wo_view_redesign` arm.
 #
 # Layout expected under `root_path`:
 #
@@ -22,9 +27,14 @@ raw_photographs_root: "${oc.env:SEED_RAW_DATA_ROOT,null}"
 
 # Must match the backbone's window resolution (256 for swinv2_*_window16_256).
 image_size: 256
-local_crop_size: 101
 
-batch_size: 16                   # Table 1
+# 160, not torchvision's habitual small local crop. The local view is emitted at
+# this size and upsampled to `image_size` on the GPU; raising it removes the
+# intermediate as a second low-pass and costs 2.5x the collate bandwidth of a
+# 101 px view, which is still 2.6x cheaper than emitting at 256.
+local_crop_size: 160
+
+batch_size: 16                   # stage-2 default; stage 1 raises it to 64
 pin_memory: true
 drop_last: true
 save_csv_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/metadata/seed_dataset.csv"
@@ -61,7 +71,7 @@ num_workers: "auto"
 # Ceiling on what `num_workers: "auto"` resolves to, per rank.
 #
 # Raised from 8 to 16. The 8 was chosen for a 4-vCPU Kaggle T4x2 and became a
-# limiter everywhere else: the shipped 13.34-hour stage-1 run carried
+# limiter everywhere else: the previous 13.34-hour stage-1 run carried
 # `num_workers=0` on a 48-physical-core host and spent a mean 91.6 % of its wall
 # clock blocked in the dataloader. One sample costs six independent PIL chains,
 # so the per-image CPU cost is ~59 ms and the loader -- not the GPU -- sets the
@@ -94,93 +104,127 @@ num_sub_varieties: 27
 # How many crops the corpus is supposed to contain. `null` disables the check;
 # any integer makes a disagreement FATAL at startup, before a GPU-hour is spent.
 #
-# This is not defensive coding. The shipped 100-epoch encoder was self-distilled
-# on 8,173 crops while the evaluation, stage 2 and every published number use
+# This is not defensive coding. An earlier 100-epoch encoder was self-distilled
+# on 8,173 crops while the evaluation, stage 2 and every published number used
 # 9,357, nothing on disk recorded it, and it was recoverable only by cross-
 # reading two log lines against `metrics.json`. `corpus_fingerprint` makes that
-# discoverable afterwards; this makes it impossible in the first place. Set it on
-# the experiment that must not drift, leave it null while the corpus is being
-# changed on purpose (e.g. after cropping the 18 unused photographs).
-expected_num_samples: null
+# discoverable afterwards; this makes it impossible in the first place. Set it to
+# null only while the corpus is being changed on purpose (e.g. after cropping the
+# 18 unused photographs).
+expected_num_samples: 9357
 
-# Multi-crop augmentation (paper Section 6.1).
+# ---------------------------------------------------------------------------
+# Multi-crop augmentation.
+#
+# WHY THESE RANGES, AND NOT DINO'S
+# ================================
+#
+# `RandomResizedCrop`'s `scale` is a fraction of the SOURCE area. On ImageNet the
+# source is a whole scene and a 5 % crop is still a recognisable object part.
+# Here the source is already a tight crop of ONE SEED at a median 52 x 51 px, so
+# the reference recipe is not sampling part of a scene -- it is shredding the
+# object.
+#
+# Measured over all 9,357 crops with torchvision's own `get_params`, 40,000 draws
+# at seed 7 (`scripts/report_view_geometry.py` reproduces every row):
+#
+#   view recipe                            native px p5/50/95    upsample  real content
+#   -------------------------------------  --------------------  --------  ------------
+#   global (0.40, 1.00) r=(0.75, 1.33)       648 / 1845 / 5680      6.0x        2.82 %
+#   local  (0.05, 0.40) r=(0.75, 1.33)       132 /  598 / 2585     10.5x        0.91 %  <- reference
+#   global (0.70, 1.00) r=(0.50, 2.00)       928 / 2484 / 7564      5.1x        3.79 %  <- canonical
+#   local  (0.30, 0.70) r=(0.50, 2.00)       483 / 1419 / 4730      6.8x        2.17 %  <- canonical
+#
+# A local view under the reference recipe is a median 24 x 24 px fragment of one
+# seed inflated to 65,536 output pixels, and 8 of the 10 cross-view terms in
+# Eq. 1 are anchored on such a view. The canonical policy gives the local views
+# 2.37x the content and cuts their upsample from 10.5x to 6.8x, which also
+# narrows the local-vs-global resolution gap the student can use as a shortcut.
+#
+# COLOUR IS SIGNAL HERE
+# =====================
+#
+# Mean RGB alone scores 0.3169 on the 27-way task and explains 78.5 % of the
+# between-sub-variety variance; only ~26.6 % of the within-class colour variance
+# is photograph-specific, so most of the cue transfers. The jitter is therefore
+# split by what it attacks rather than turned down uniformly:
+#
+#   * brightness / contrast  = illumination = photograph nuisance -> keep at 0.4
+#   * saturation / hue       = pigmentation = class signal        -> cut hard
+#   * grayscale, solarize    = delete / invert the cue            -> off
+#
+# What this is NOT claiming: the obvious version of the argument is refuted. Mean
+# RGB is *more* linearly decodable after in-domain self-distillation than before
+# (pooled R^2 0.864 -> 0.908), so the jitter did not destroy the cue. This is a
+# hypothesis about where capacity goes, and `conf/stage1_arms/view_design.yaml`
+# runs `wo_colour_policy` as its control.
+# ---------------------------------------------------------------------------
 augmentation:
-  # 2 global crops, scale (0.4, 1.0); 4 local crops, scale (0.05, 0.4).
-  global_crops_scale: [0.4, 1.0]
-  local_crops_scale: [0.05, 0.4]
+  # --------------------------------------------------------------- geometry
+  global_crops_scale: [0.70, 1.00]
+  local_crops_scale: [0.30, 0.70]
   local_crops_number: 4
-  horizontal_flip_prob: 0.5
 
-  # ---------------------------------------------------------------- geometry
+  # The aspect-ratio range `RandomResizedCrop` samples.
   #
-  # `scale` is a fraction of the SOURCE area, and the source here is one seed at
-  # a median 52 x 51 px. Measured over all 9,357 crops, a local view at
-  # (0.05, 0.40) is built from a median 598 native pixels -- a 24 x 24 fragment
-  # inflated to 65,536 output pixels, 0.9 % real content -- and 8 of the 10
-  # cross-view terms in Eq. 1 are anchored on one. `conf/data/seed_crops_v2.yaml`
-  # is the redesigned policy; the numbers here are the submitted recipe and are
-  # kept so every published result stays reproducible.
-  #
-  # crop_ratio: the aspect-ratio range `RandomResizedCrop` samples. Torchvision's
-  # (0.75, 1.33) cannot fit a high-area box inside a non-square source, and only
-  # 3.4 % of these crops are square (aspect p5/p95 = 0.52 / 1.98). After 10
-  # failed attempts `get_params` returns a DETERMINISTIC centre crop, so raising
-  # the scale floor buys content by spending randomness: measured fallback rates
-  # are 3.5 % at scale (0.40, 1.00), 22.0 % at (0.70, 1.00), and 10.2 % at
-  # (0.70, 1.00) with crop_ratio (0.5, 2.0). The trainer measures and logs this
-  # at startup and warns above 15 %.
-  crop_ratio: [0.75, 1.3333333333333333]
+  # This exists because narrowing the scale range silently spends randomness.
+  # `get_params` retries the (area, aspect) draw ten times and then returns a
+  # DETERMINISTIC centre crop. Only 3.4 % of these crops are square (aspect
+  # p5/p95 = 0.52 / 1.98), so a high-area box in torchvision's (0.75, 1.33)
+  # often does not fit: measured fallback rates are 3.5 % at scale (0.40, 1.00),
+  # 22.0 % at (0.70, 1.00), and 10.2 % at (0.70, 1.00) once the ratio widens to
+  # (0.5, 2.0) -- which also raises the median content further (2,484 vs 2,310
+  # native px), so the wider ratio is strictly better on both axes. The trainer
+  # measures this at startup and warns above 15 %.
+  crop_ratio: [0.5, 2.0]
 
   # Floor on the native source pixels a view may be built from. Raises the
   # effective lower scale bound per image to max(scale_lo, floor / area) and
   # never lowers it, so it can only make views less destructive; 0 disables it
   # and is byte-identical to a plain RandomResizedCrop. Exists because a fixed
   # *fraction* shreds a 21 x 22 crop and an 881 x 413 crop by the same factor.
+  #
+  # 0 in the primary run: at (0.30, 0.70) the p5 local view already carries 483
+  # native px, and adding a second mechanism to the primary arm would confound it
+  # with the scale change. The `native_pixel_floor` arm runs it at 900, which
+  # lifts the p5 to 832 (+72 %) and moves the median by 1.1 % -- i.e. it acts only
+  # on the worst views, which is the entire claim being tested.
   min_native_pixels: 0
 
-  # Seeds photographed on a tray have no canonical orientation, so the dihedral
-  # group of order 8 is label-preserving here. The 90-degree rotations go
-  # through PIL's `transpose`, which is a pixel permutation -- no interpolation,
-  # no resampling, no black corners -- unlike `T.RandomRotation`. Off by default
-  # because the submitted recipe used the horizontal flip alone; v2 turns them on
-  # to buy back view diversity after the crop ranges narrow.
-  vertical_flip_prob: 0.0
-  rotation90_prob: 0.0
+  # The full dihedral group of order 8, losslessly. Seeds photographed on a tray
+  # have no canonical orientation, so this is label-preserving *here
+  # specifically*. The 90-degree rotations go through PIL's `transpose`, which is
+  # a pixel permutation -- no interpolation, no resampling, no black corners --
+  # unlike `T.RandomRotation`. This is what buys back the augmentation diversity
+  # the narrower crop ranges give up, which is what keeps the narrowing from
+  # being a step toward pretext-task memorisation on 81 scenes.
+  horizontal_flip_prob: 0.5
+  vertical_flip_prob: 0.5
+  rotation90_prob: 0.75
 
-  # Colour jitter magnitudes are stated explicitly in the paper: brightness
-  # +/-0.4, contrast +/-0.4, saturation +/-0.2, hue +/-0.1.
-  color_jitter_brightness: 0.4
-  color_jitter_contrast: 0.4
-  color_jitter_saturation: 0.2
-  color_jitter_hue: 0.1
-
-  # The paper says the pipeline "follows the standard DINOv2 protocol", whose
-  # application probabilities are 0.8 for jitter and 0.2 for grayscale. An
-  # earlier notebook used 0.01/0.01 to preserve seed colour; drop these back if
-  # colour turns out to be the dominant cue for your sub-varieties.
+  # ------------------------------------------------------------- photometry
   color_jitter_prob: 0.8
-  grayscale_prob: 0.2
+  color_jitter_brightness: 0.4    # illumination: nuisance, keep
+  color_jitter_contrast: 0.4      # illumination: nuisance, keep
+  color_jitter_saturation: 0.1    # pigmentation: signal, halved
+  color_jitter_hue: 0.02          # pigmentation: signal. 0.1 is +-36 degrees of hue
+  grayscale_prob: 0.0             # deletes the colour cue outright
+  solarization_prob: 0.0          # inverts it, which is worse
 
-  # Global crop 1: blur p=1.0. Global crop 2: blur p=0.1 + solarization p=0.2.
-  #
-  # Note what the asymmetry costs here specifically. It is what makes the
-  # teacher's two views genuinely different, which is the signal Eq. 1 consumes
-  # -- but 1.0 / 0.1 / 0.5 also *identifies* which family a view came from, on
-  # top of the resolution artefact the local views already carry, and the
-  # student can satisfy part of the objective by detecting the family rather
-  # than the correspondence. A symmetric setting removes that cue; v2 uses one.
-  global_blur_prob_1: 1.0
-  global_blur_prob_2: 0.1
-  solarization_prob: 0.2
-  # Local crops: blur p=0.5.
+  # Symmetric across the three view families, so blur no longer identifies which
+  # family a view came from. DINO's 1.0 / 0.1 / 0.5 gave the student a second
+  # family cue on top of the resolution artefact, and a cue it can use to predict
+  # the family's marginal is a cue that substitutes for learning the
+  # local-to-global correspondence Eq. 1 exists to teach.
+  global_blur_prob_1: 0.5
+  global_blur_prob_2: 0.5
   local_blur_prob: 0.5
 
-  # Blur radius range, in pixels of the *output* view. At a median 5.8x upsample
-  # a 2.0 px blur at 256 removes ~0.35 px of native detail, so the reference
-  # range is milder here than it is on ImageNet -- which is an argument for not
-  # raising it, not for trusting it.
+  # Blur radius range, in pixels of the *output* view. These images carry
+  # essentially no content above ~52 px and are then upsampled ~5x, so a wide
+  # radius removes real structure rather than a nuisance frequency band.
   blur_radius_min: 0.1
-  blur_radius_max: 2.0
+  blur_radius_max: 1.0
 
   # SwinV2 windows require a fixed input size, so local crops are resized back
   # up to `image_size` after being cropped at `local_crop_size`.
@@ -191,30 +235,19 @@ augmentation:
   # upsample cycle the local crops necessarily undergo, so the resolution
   # artefact stops identifying a view as local.
   #
-  # The gap it closes is measured: over all 9,357 crops (median 52 x 51 px) a
-  # global view is a median 5.7x upsample and a local view 10.5x (p95: 9.9x vs
-  # 22.1x). The student can satisfy part of Eq. 1 by detecting "this is a local
-  # view" and predicting the corresponding marginal, which substitutes for the
-  # local-to-global correspondence multi-crop exists to teach. The per-view blur
-  # probabilities (1.0 / 0.1 / 0.5) add a second identifying signal.
-  #
-  # Off by default because it changes the submitted recipe, and because it
-  # low-passes the globals too on data that already has almost no high-frequency
-  # content -- the argument for it is theoretical and the argument against it is
-  # measurable. It is the C2 arm; run it isolated.
-  #
-  # This key exists so `data.augmentation.match_view_lowpass=true` works. It was
-  # documented in architecture/02 and STAGE1_EVALUATION.md while being absent
-  # from this group, so Hydra's struct mode rejected the documented override and
-  # the error looked like a typo.
+  # Off by default because it low-passes the globals too, on data that already
+  # has almost no high-frequency content -- the argument for it is theoretical
+  # and the argument against it is measurable. The canonical policy narrows the
+  # same gap by raising the local scale instead, which costs nothing. Run it as
+  # its own arm if you want the measurement.
   # -------------------------------------------------------------------------
   match_view_lowpass: false
 
   # -------------------------------------------------------------------------
-  # Provenance-derived positives (STAGE1_CHANGES.md F1). Replace this many of
-  # the `local_crops_number` local views with local crops of *other crops from
-  # the same source photograph*, which is parsed from the filename
-  # (`IMG_0502_bbox137.png`) and involves no labels.
+  # Provenance-derived positives. Replace this many of the `local_crops_number`
+  # local views with local crops of *other crops from the same source
+  # photograph*, which is parsed from the filename (`IMG_0502_bbox137.png`) and
+  # involves no labels.
   #
   # The view count is unchanged, so nothing downstream moves. What changes is
   # the invariance being taught: DINO's positives are augmented views of one
@@ -226,9 +259,9 @@ augmentation:
   # same-photograph crops share lighting, background and sensor noise, so the
   # objective can be satisfied by learning photograph identity -- exactly what
   # the photograph-disjoint protocol punishes. The evaluation's
-  # `nuisance/within_class_photo_accuracy_above_chance` is the gate (the shipped
-  # DINO encoder sits at +3.5 pp against ImageNet's +10.0 pp); an arm that
-  # pushes it back up learned the confound rather than the variety.
+  # `nuisance/within_class_photo_accuracy_above_chance` is the gate (in-domain
+  # self-distillation drove it from +10.0 pp to +3.5 pp above chance); an arm
+  # that pushes it back up learned the confound rather than the variety.
   #
   # 0 disables it, which is the default and the only setting any published
   # number was produced under.
@@ -246,8 +279,8 @@ augmentation:
   #   The tensors that get collated, pinned and pushed over PCIe are then 1 byte
   #   per channel instead of 4.
   #
-  # defer_local_upsample: emit local crops at local_crop_size (101) and let the
-  #   GPU resize them to image_size (256). A 101 px crop is 6.4x fewer pixels
+  # defer_local_upsample: emit local crops at local_crop_size (160) and let the
+  #   GPU resize them to image_size (256). A 160 px crop is 2.6x fewer pixels
   #   than the 256 px tensor it becomes, so this is the larger saving of the two
   #   -- four of the six views per sample stop being inflated before transfer.
   #   Implied by output_uint8: the CPU recipe resizes *after* normalisation, on

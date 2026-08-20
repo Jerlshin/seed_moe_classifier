@@ -63,8 +63,8 @@ center_momentum: 0.99
 # near-duplicate samples do not collapse onto each other. Particularly apt here,
 # where 27 sub-varieties of four crops are near-duplicates by construction.
 #
-# 0.0 is the control that answers "is KoLeo worth anything at all on this data?",
-# and it is a Phase-1 arm rather than a hypothetical -- see STAGE1_CHANGES.md C8.
+# 0.0 is the control that answers "is KoLeo worth anything at all on this data?"
+# once it is no longer fighting Eq. 1, and it is one override rather than a fork.
 # ---------------------------------------------------------------------------
 lambda_koleo: 0.1
 

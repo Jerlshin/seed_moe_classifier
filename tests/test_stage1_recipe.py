@@ -14,6 +14,7 @@ changed any of them fails loudly instead of quietly invalidating the cost table.
 from __future__ import annotations
 
 import logging
+import math
 
 import pytest
 import torch
@@ -42,19 +43,19 @@ from tests.conftest import (
     REVISED_BACKBONE_FEATURE_DIM,
     REVISED_BACKBONE_GFLOPS_PER_VIEW,
     REVISED_BACKBONE_PARAMS_M,
-    SHIPPED_BACKBONE,
-    SHIPPED_BACKBONE_FEATURE_DIM,
-    SHIPPED_BACKBONE_GFLOPS_PER_VIEW,
-    SHIPPED_BACKBONE_PARAMS_M,
+    SMALL_BACKBONE,
+    SMALL_BACKBONE_FEATURE_DIM,
+    SMALL_BACKBONE_GFLOPS_PER_VIEW,
+    SMALL_BACKBONE_PARAMS_M,
     REVISED_DINO_BOTTLENECK_DIM,
     REVISED_DINO_HEAD_LAYERS,
     REVISED_DINO_HIDDEN_DIM,
     REVISED_DINO_OUT_DIM,
     REVISED_DROP_PATH_RATE,
-    REVISED_EFFECTIVE_BATCH,
-    REVISED_EPOCHS,
-    REVISED_LEARNING_RATE,
-    REVISED_LR_WARMUP_EPOCHS,
+    STAGE1_EFFECTIVE_BATCH,
+    STAGE1_EPOCHS,
+    STAGE1_LEARNING_RATE,
+    STAGE1_WARMUP_EPOCHS,
 )
 
 LOGGER = logging.getLogger("tests.stage1")
@@ -63,8 +64,8 @@ LOGGER = logging.getLogger("tests.stage1")
 def training_cfg(**overrides):
     """A minimal ``experiment.training`` node, matching the shipped defaults."""
     training = {
-        "epochs": REVISED_EPOCHS,
-        "warmup_epochs": REVISED_LR_WARMUP_EPOCHS,
+        "epochs": STAGE1_EPOCHS,
+        "warmup_epochs": STAGE1_WARMUP_EPOCHS,
         "learning_rate": None,
         "lr_base": LR_BASE,
         "lr_reference_batch_size": LR_REFERENCE_BATCH,
@@ -120,36 +121,36 @@ def test_measured_gflops_per_view_matches_the_reported_budget():
 def test_shipped_small_trunk_costs_what_the_stage1_report_claims():
     """The trunk `conf/` actually selects, measured rather than quoted.
 
-    The stage-1 evaluation report and `STAGE1_EVALUATION.md` both quote 48.96 M
+    The stage-1 evaluation report quotes 48.96 M
     parameters and ~25.6 GFLOPs/view, and the published 100-epoch checkpoint is a
     Small. Pinning them here is what stops those documents from drifting into a
     claim about the Tiny trunk the configs used to select.
     """
     import timm
 
-    backbone = timm.create_model(SHIPPED_BACKBONE, pretrained=False, num_classes=0)
+    backbone = timm.create_model(SMALL_BACKBONE, pretrained=False, num_classes=0)
     parameters = sum(p.numel() for p in backbone.parameters()) / 1e6
-    assert backbone.num_features == SHIPPED_BACKBONE_FEATURE_DIM
-    assert parameters == pytest.approx(SHIPPED_BACKBONE_PARAMS_M, abs=0.05)
+    assert backbone.num_features == SMALL_BACKBONE_FEATURE_DIM
+    assert parameters == pytest.approx(SMALL_BACKBONE_PARAMS_M, abs=0.05)
 
     with torch.no_grad():
         tokens = backbone.forward_features(torch.zeros(1, 3, 256, 256))
     # Same 8x8 grid as Tiny and Base: the reason a trunk swap is invisible to
     # stage 2's grid routing, and why only the channel width had to change.
     assert tokens.shape[1] * tokens.shape[2] == PAPER_TOKEN_GRID
-    assert tokens.shape[-1] == SHIPPED_BACKBONE_FEATURE_DIM
+    assert tokens.shape[-1] == SMALL_BACKBONE_FEATURE_DIM
 
 
 @pytest.mark.slow
 def test_shipped_small_trunk_gflops_match_the_evaluation_report():
     measured = measure_gflops_per_view(
-        __import__("timm").create_model(SHIPPED_BACKBONE, pretrained=False, num_classes=0),
+        __import__("timm").create_model(SMALL_BACKBONE, pretrained=False, num_classes=0),
         256,
         torch.device("cpu"),
     )
     if measured is None:
         pytest.skip("FlopCounterMode is unavailable on this torch build")
-    assert measured == pytest.approx(SHIPPED_BACKBONE_GFLOPS_PER_VIEW, rel=0.02)
+    assert measured == pytest.approx(SMALL_BACKBONE_GFLOPS_PER_VIEW, rel=0.02)
 
 
 # ----------------------------------------------------- initialisation regime
@@ -305,14 +306,14 @@ def test_shape_report_traces_the_whole_path():
 
 def test_learning_rate_scales_linearly_with_the_effective_batch():
     cfg = training_cfg()
-    resolved, provenance = resolve_learning_rate(cfg, REVISED_EFFECTIVE_BATCH, LOGGER)
-    assert resolved == pytest.approx(REVISED_LEARNING_RATE)
+    resolved, provenance = resolve_learning_rate(cfg, STAGE1_EFFECTIVE_BATCH, LOGGER)
+    assert resolved == pytest.approx(STAGE1_LEARNING_RATE)
     assert provenance == {
-        "learning_rate": pytest.approx(REVISED_LEARNING_RATE),
+        "learning_rate": pytest.approx(STAGE1_LEARNING_RATE),
         "rule": "linear",
         "lr_base": LR_BASE,
         "lr_reference_batch_size": LR_REFERENCE_BATCH,
-        "effective_batch_size": REVISED_EFFECTIVE_BATCH,
+        "effective_batch_size": STAGE1_EFFECTIVE_BATCH,
     }
     # At the reference batch the rule is the identity, which is the sanity check
     # that the scaling is anchored where the paper's number belongs.
@@ -356,33 +357,40 @@ def lr_curve(cfg, peak: float = 1.0) -> list[float]:
 
 
 def test_warmup_ramps_linearly_and_peaks_exactly_at_the_warmup_boundary():
-    """Ten epochs of ramp, the target rate at epoch 11, then cosine. One scheduler.
+    """A linear ramp, the target rate on the first post-warmup epoch, then cosine.
 
     ``LinearLR`` interpolates the *factor* from ``start_factor`` to 1 over
     ``total_iters`` steps, so epoch ``i`` (0-based) sits at
     ``start + (1 - start) * i / warmup`` of the target and the peak lands on the
-    first post-warmup epoch. That is the intended reading of "10 epochs of
-    warmup": ten epochs are spent warming up, and the eleventh is the first at
+    first post-warmup epoch. That is the intended reading of "N epochs of
+    warmup": N epochs are spent warming up, and the (N+1)-th is the first at
     full rate.
     """
     cfg = training_cfg()
-    curve = lr_curve(cfg, peak=REVISED_LEARNING_RATE)
-    warmup = REVISED_LR_WARMUP_EPOCHS
+    curve = lr_curve(cfg, peak=STAGE1_LEARNING_RATE)
+    warmup = STAGE1_WARMUP_EPOCHS
     start_factor = 1.0 / warmup
 
-    assert curve[0] == pytest.approx(REVISED_LEARNING_RATE * start_factor)
+    assert curve[0] == pytest.approx(STAGE1_LEARNING_RATE * start_factor)
     for epoch in range(warmup):
         factor = start_factor + (1.0 - start_factor) * epoch / warmup
-        assert curve[epoch] == pytest.approx(REVISED_LEARNING_RATE * factor, rel=1e-6)
+        assert curve[epoch] == pytest.approx(STAGE1_LEARNING_RATE * factor, rel=1e-6)
     # Strictly increasing through the warmup, then exactly the target.
     ramp = curve[:warmup]
     assert all(later > earlier for earlier, later in zip(ramp, ramp[1:]))
-    assert curve[warmup] == pytest.approx(REVISED_LEARNING_RATE)
-    assert max(curve) == pytest.approx(REVISED_LEARNING_RATE)
-    # Monotone decay afterwards, reaching eta_min at the end of the run.
+    assert curve[warmup] == pytest.approx(STAGE1_LEARNING_RATE)
+    assert max(curve) == pytest.approx(STAGE1_LEARNING_RATE)
+    # Monotone decay afterwards, landing on eta_min one step after the last
+    # epoch. The tolerance is the cosine's own resolution, not a magic constant:
+    # the last epoch sits at step N-1 of an N-step cosine, i.e. at
+    # `peak * (1 - cos(pi/N)) / 2`, which is ~1.2e-3 of the peak at N = 45 and
+    # would be ~4x smaller at N = 90. Hard-coding a fraction of the peak makes
+    # the test a function of the epoch budget rather than of the schedule.
     tail = curve[warmup:]
     assert all(later <= earlier for earlier, later in zip(tail, tail[1:]))
-    assert tail[-1] == pytest.approx(0.0, abs=REVISED_LEARNING_RATE * 1e-3)
+    cosine_steps = len(tail)
+    floor = STAGE1_LEARNING_RATE * (1.0 - math.cos(math.pi / cosine_steps)) / 2.0
+    assert tail[-1] == pytest.approx(floor, rel=1e-6)
 
 
 def test_the_cosine_spans_the_post_warmup_run_not_the_whole_run():
@@ -390,7 +398,7 @@ def test_the_cosine_spans_the_post_warmup_run_not_the_whole_run():
     cfg = training_cfg()
     scheduler = build_scheduler(optim.SGD([nn.Parameter(torch.zeros(1))], lr=1.0), cfg)
     cosine = scheduler._schedulers[1]
-    assert cosine.T_max == REVISED_EPOCHS - REVISED_LR_WARMUP_EPOCHS
+    assert cosine.T_max == STAGE1_EPOCHS - STAGE1_WARMUP_EPOCHS
 
 
 def test_one_scheduler_object_owns_both_phases():
@@ -416,13 +424,13 @@ def test_the_schedule_round_trips_through_state_dict_mid_warmup():
     def fresh():
         module = nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4))
         optimizer = optim.AdamW(
-            build_param_groups(module, weight_decay=0.04), lr=REVISED_LEARNING_RATE
+            build_param_groups(module, weight_decay=0.04), lr=STAGE1_LEARNING_RATE
         )
         return optimizer, build_scheduler(optimizer, cfg)
 
     reference_optimizer, reference_scheduler = fresh()
     reference = []
-    for _ in range(REVISED_EPOCHS):
+    for _ in range(STAGE1_EPOCHS):
         reference.append(reference_optimizer.param_groups[0]["lr"])
         reference_scheduler.step()
 
@@ -438,7 +446,7 @@ def test_the_schedule_round_trips_through_state_dict_mid_warmup():
     restored_scheduler.load_state_dict(scheduler_state)
 
     resumed = []
-    for _ in range(5, REVISED_EPOCHS):
+    for _ in range(5, STAGE1_EPOCHS):
         resumed.append(restored_optimizer.param_groups[0]["lr"])
         restored_scheduler.step()
     assert resumed == pytest.approx(reference[5:])
@@ -454,11 +462,11 @@ def test_the_schedule_round_trips_through_state_dict_mid_warmup():
 def test_warmup_is_clamped_so_a_one_epoch_smoke_run_still_trains():
     """The smoke run composes the same config; an unclamped warmup would own it."""
     assert resolve_warmup_epochs(training_cfg(epochs=1)) == 0
-    assert resolve_warmup_epochs(training_cfg(epochs=5)) == 4
-    assert resolve_warmup_epochs(training_cfg(epochs=100)) == REVISED_LR_WARMUP_EPOCHS
+    assert resolve_warmup_epochs(training_cfg(epochs=3)) == 2
+    assert resolve_warmup_epochs(training_cfg(epochs=100)) == STAGE1_WARMUP_EPOCHS
 
-    curve = lr_curve(training_cfg(epochs=1), peak=REVISED_LEARNING_RATE)
-    assert curve[0] == pytest.approx(REVISED_LEARNING_RATE)
+    curve = lr_curve(training_cfg(epochs=1), peak=STAGE1_LEARNING_RATE)
+    assert curve[0] == pytest.approx(STAGE1_LEARNING_RATE)
 
 
 # -------------------------------------------------------- parameter groups
@@ -559,11 +567,11 @@ def test_build_optimizer_preserves_the_group_split():
         training_cfg(),
         torch.device("cpu"),
         LOGGER,
-        learning_rate=REVISED_LEARNING_RATE,
+        learning_rate=STAGE1_LEARNING_RATE,
     )
     assert isinstance(optimizer, optim.AdamW)
     assert len(optimizer.param_groups) == 2
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(REVISED_LEARNING_RATE)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(STAGE1_LEARNING_RATE)
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.04)
     assert optimizer.param_groups[1]["weight_decay"] == 0.0
 
@@ -584,19 +592,23 @@ def test_budget_separates_measured_parameters_from_estimated_flops():
         gflops_per_view=REVISED_BACKBONE_GFLOPS_PER_VIEW,
         views_per_image=6,
         global_views_per_image=2,
-        epochs=REVISED_EPOCHS,
-        effective_batch_size=REVISED_EFFECTIVE_BATCH,
+        epochs=STAGE1_EPOCHS,
+        effective_batch_size=STAGE1_EFFECTIVE_BATCH,
         steps_per_epoch=292,
         prototypes=REVISED_DINO_OUT_DIM,
     )
 
-    # 32 images x (6 student + 2 teacher) views.
-    assert budget.views_per_iteration == 32 * 8
+    # B images x (6 student + 2 teacher) views.
+    assert budget.views_per_iteration == STAGE1_EFFECTIVE_BATCH * 8
 
     # Student forward+backward, teacher forward only.
-    expected = REVISED_BACKBONE_GFLOPS_PER_VIEW * 32 * (6 * (1 + BACKWARD_MULTIPLIER) + 2)
+    expected = (
+        REVISED_BACKBONE_GFLOPS_PER_VIEW
+        * STAGE1_EFFECTIVE_BATCH
+        * (6 * (1 + BACKWARD_MULTIPLIER) + 2)
+    )
     assert budget.estimated_gflops_per_iteration == pytest.approx(expected)
-    assert budget.estimated_total_flops == pytest.approx(expected * 1e9 * 292 * REVISED_EPOCHS)
+    assert budget.estimated_total_flops == pytest.approx(expected * 1e9 * 292 * STAGE1_EPOCHS)
 
     table = budget.format_table()
     assert "[measured, fwd @ 256 px]" in table

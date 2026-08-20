@@ -208,10 +208,13 @@ def split_dataset(
     sensor noise, overlapping bounding boxes -- appear in both train and test,
     and the measured accuracy is substantially a memorisation score.
 
-    ``protocol="stratified"`` reproduces the submitted crop-level splitting. It
-    is retained deliberately: running the full model under both and reporting the
-    delta turns a fatal methodological objection into a measured result. See
-    ``scripts/run_ablations.py``'s ``leakage_ungrouped`` variant.
+    ``protocol="stratified"`` is crop-level splitting, and it is the PRIMARY
+    protocol here by instruction. The leak is not hidden by it: every split
+    reports ``shared_source_groups`` and ``leaked_test_fraction``, and running the
+    full model under both protocols and reporting the delta turns a fatal
+    methodological objection into a measured result. See
+    ``scripts/run_ablations.py``'s ``leakage_grouped`` variant and
+    ``conf/experiment/finetune_grouped_diagnostic.yaml``.
 
     ``protocol="grouped_cv"`` takes **no held-out test split at all**. Instead
     ``StratifiedGroupKFold`` partitions every crop into ``num_folds``

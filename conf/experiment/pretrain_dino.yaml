@@ -1,42 +1,45 @@
 # @package _global_
 #
-# The v2 stage-1 recipe: SwinV2-Tiny, the redesigned view geometry, colour
-# preserved, and an epoch budget decided by a representation probe instead of by
-# a loss curve.
+# STAGE 1 -- DINO self-distillation on the seed corpus. THE stage-1 recipe.
 #
-#     python main.py pretrain-v2
-#     python main.py pretrain-v2 --gpus 2
+#     python main.py pretrain
+#     python main.py pretrain --gpus 2
 #
-# WHAT THIS CHANGES, AND ON WHAT EVIDENCE
-# =======================================
+# SwinV2-Tiny, a view geometry sized for 52 x 51 px crops, colour preserved, and
+# an epoch budget decided by a representation probe instead of by a loss curve.
 #
-# The reference point is the shipped 100-epoch run: 13.34 h on an H100 for
-# **+0.31 pp** of 27-way accuracy over the ImageNet-1k weights it started from
-# (0.6284 vs 0.6253, `outputs/eval_pretrain/tables/encoder_comparison.csv`).
-# Every change below targets one of the reasons that number is so small.
+# WHY EACH CHOICE, AND ON WHAT EVIDENCE
+# =====================================
 #
-# 1. TRUNK: SwinV2-Small -> SwinV2-Tiny.
-#    Frozen-feature screen (`STAGE1_CHANGES.md` Appendix 2): Tiny scores 0.6021
-#    pooled / 0.6243 at `layers.2`, Small 0.6053 / 0.6174 -- i.e. Tiny is
-#    -0.32 pp pooled and **+0.69 pp** at the better readout stage, for **half the
-#    FLOPs** (13.32 vs 25.56 GFLOPs/view) and 27.6 M vs 49.0 M parameters. D6 is
-#    explicit that capacity is not the binding constraint here; scene diversity
-#    is. Small is dominated on both axes, so this is the cheap half of a
-#    two-sided decision, not a compromise.
+# The reference point is an earlier 100-epoch run of the ImageNet-inherited
+# recipe: 13.34 h on an H100 for **+0.31 pp** of 27-way accuracy over the
+# ImageNet-1k weights it started from (0.6284 vs 0.6253). Every choice below
+# targets one of the reasons that number was so small.
 #
-# 2. VIEWS: see `conf/data/seed_crops_v2.yaml`, which carries the measurements.
-#    Local views go from a median 598 native pixels to 1,419 (2.37x), and their
-#    upsample from 10.5x to 6.9x. This is the primary hypothesis of the run.
+# 1. TRUNK: SwinV2-Tiny, set in `conf/model/backbone/swinv2.yaml` and shared with
+#    stage 2 so the two cannot disagree. Frozen-feature screen
+#    (`python main.py screen-backbones`): Tiny scores 0.6021 pooled / 0.6243 at
+#    `layers.2`, Small 0.6053 / 0.6174 -- i.e. Tiny is -0.32 pp pooled and
+#    **+0.69 pp** at the better readout stage, for **half the FLOPs** (13.32 vs
+#    25.56 GFLOPs/view) and 27.6 M vs 49.0 M parameters. Capacity is not the
+#    binding constraint on 81 scenes; scene diversity is. Small is dominated on
+#    both axes, so this is the cheap half of a two-sided decision.
 #
-# 3. KOLEO: per-view (already the default after the audit's A1) and on the
-#    **backbone** feature rather than the head's discarded 256-D bottleneck.
-#    DINOv2 applies KoLeo to `x_norm_clstoken`, i.e. the trunk output, and the
-#    trunk output is the only thing stage 2 ever sees. Regularising a space that
-#    is thrown away at the end of stage 1 is the weaker of the two options.
+# 2. VIEWS: see `conf/data/hierarchical_seeds.yaml`, which carries the
+#    measurements. Local views carry a median 1,419 native pixels against the
+#    598 the ImageNet-inherited ranges produce (2.37x), and their upsample falls
+#    from 10.5x to 6.8x. This is the primary hypothesis of the run.
+#
+# 3. KOLEO: per-view (across views it is an anti-alignment term -- see
+#    `src/losses/dino.py`) and on the **backbone** feature rather than the head's
+#    discarded 256-D bottleneck. DINOv2 applies KoLeo to `x_norm_clstoken`, i.e.
+#    the trunk output, and the trunk output is the only thing stage 2 ever sees.
+#    Regularising a space that is thrown away at the end of stage 1 is the weaker
+#    of the two options.
 #
 # 4. BUDGET: 50 epochs configured, probed every 5, stopped when the probe
 #    plateaus, and the encoder that **ships is the one that probed best** rather
-#    than the last one. On the shipped run epoch 50 probed 0.6358 and epoch 100
+#    than the last one. On the earlier run epoch 50 probed 0.6358 and epoch 100
 #    probed 0.6284 -- so publishing the final weights shipped a worse encoder and
 #    the second half of the budget was a net loss. `experiment.training.publish`
 #    is the switch; `final` is the pre-probe behaviour.
@@ -59,20 +62,18 @@
 # the hypothesis this experiment is testing.
 
 defaults:
-  - override /data: seed_crops_v2
   - override /model/head: dino
   - override /model/loss: dino
 
 model:
   backbone:
-    # Half the FLOPs of Small and better at `layers.2`. See (1) above.
-    name: "swinv2_tiny_window16_256"
-    feature_dim: 768
+    # The trunk itself comes from `conf/model/backbone/swinv2.yaml`, which both
+    # stages share. Only the stage-1-specific switches are set here.
     pretrained: true      # ImageNet-1k (timm `ms_in1k`), verified at startup
     freeze: false         # the trunk is fine-tuned; this is the whole stage
     drop_path_rate: 0.1
   loss:
-    koleo_scope: "per_view"   # the A1 fix; `all_views` is the control
+    koleo_scope: "per_view"   # `all_views` is the pre-fix control
     koleo_space: "backbone"   # the space stage 2 reads, and DINOv2's own choice
     lambda_koleo: 0.1
 
@@ -80,13 +81,13 @@ data:
   batch_size: 64
 
 experiment:
-  name: "pretrain_v2_swinv2_tiny"
+  name: "pretrain_dino"
   stage: "pretrain"
-  group: "stage1_v2"
+  group: "stage1"
   training:
     epochs: 50
     max_batches: null
-    # Dense early milestones: the shipped run's probe curve peaked at epoch 50
+    # Dense early milestones: the earlier run's probe curve peaked at epoch 50
     # of 100 and was already within 0.8 pp of its peak at epoch 25, so the
     # interesting region is the first half and the budget question is decided
     # there. Three milestones (25/50/100) were too coarse to see the peak at all.
@@ -104,7 +105,7 @@ experiment:
     #
     # The loop cannot rank its own checkpoints from the loss: the loss is a cross
     # entropy against a teacher that moved, 94.8 % of it was irreducible target
-    # entropy on the shipped run, and its minimum was at epoch 90 while the best
+    # entropy on the earlier run, and its minimum was at epoch 90 while the best
     # encoder was at epoch 50. This measures the representation directly.
     probe:
       enabled: true
@@ -190,8 +191,8 @@ experiment:
     save_full_checkpoints: false
     save_teacher_in_checkpoints: false
     measure_gpu_busy: false
-    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_v2_swinv2_tiny"
-    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_v2_swinv2_tiny.pth"
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_dino"
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_pretrained_encoder.pth"
     optimizer:
       name: "AdamW"
     scheduler:

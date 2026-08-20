@@ -1,12 +1,13 @@
 # @package _global_
 #
-# Stage 2: hierarchical MoE finetuning (paper Section 5).
+# STAGE 2 -- hierarchical MoE finetuning (paper Section 5). THE stage-2 recipe.
 #
-#   python main.py finetune
+#   SEED_PRETRAIN_BACKBONE=$SEED_OUTPUT_DIR/checkpoints/dino_pretrained_encoder.pth \
+#       python main.py finetune
 #
 # Uses the root defaults for `model/head` (hierarchical_moe) and `model/loss`
-# (arcface_kl); this file only owns the training loop. Every ablation and
-# baseline experiment inherits from it, so anything changed here changes them
+# (arcface_kl); this file only owns the training loop. Every ablation, control
+# and baseline experiment inherits from it, so anything changed here changes them
 # all -- which is the point: the variants must differ only in the one thing
 # being ablated.
 
@@ -24,23 +25,50 @@ experiment:
     max_batches: null
 
     # -----------------------------------------------------------------------
-    # Split protocol. "grouped" keeps every crop of one source photograph on one
-    # side of the boundary; "stratified" is the submitted crop-level split.
+    # SPLIT PROTOCOL, AND WHAT THE HEADLINE NUMBER MEANS.
     #
-    # This is not a stylistic choice here. The 9,357 crops under
-    # Cropped_Samples come from 81 source photographs -- a mean of 115 crops per
-    # source -- so crop-level splitting puts near-duplicate views of the same
-    # physical seeds (same lighting, same background, overlapping bounding boxes)
-    # on both sides, and the reported accuracy is substantially a memorisation
-    # score. The trainer logs how many source photographs straddle the boundary
-    # under either protocol.
+    # "stratified" holds out 20 % of the CROPS, stratified on sub-variety, then
+    # splits the remainder into a stratified train/validation pair. The model is
+    # selected on validation and reported on the held-out test split.
+    # `num_folds: 1` keeps one named partition, so "the model" is one model with
+    # one test score.
     #
-    # Known limit the protocol cannot fix: 5 of 27 sub-varieties have crops from
+    # This is the primary protocol by instruction, and its cost is measured
+    # rather than assumed. The 9,357 crops come from 81 SOURCE PHOTOGRAPHS -- a
+    # mean of 115 crops per photograph, cut from the same tray under the same
+    # lighting, frequently with overlapping bounding boxes -- so crop-level
+    # splitting puts near-duplicate views of the same physical seeds on both
+    # sides of the boundary. Under an identical frozen encoder and probe:
+    #
+    #     27-way probe   photograph-disjoint 0.6500 -> crop-level 0.8365  (+18.65 pp)
+    #     27-way k-NN    photograph-disjoint 0.5099 -> crop-level 0.6891  (+17.92 pp)
+    #     retrieval P@1  0.4745 excluding same-photograph neighbours, 0.6636 including
+    #
+    # and 89-98 % of the crops in a photograph have a neighbour above cosine 0.95
+    # at 32 x 32 grey. So this number answers "how well does this classify a new
+    # crop from a KNOWN acquisition session" and not "...from a new session".
+    #
+    # Nothing here hides that. `leakage_report` runs for both protocols and
+    # `shared_source_groups`, `leaked_test_fraction` and `classes_present_in_test`
+    # land in `summary.json` for every run, and
+    # `experiment=finetune_grouped_diagnostic` is this same configuration under
+    # photograph-disjoint `grouped_cv`, so the delta is measured on THIS encoder.
+    #
+    # The other two values:
+    #   "grouped"     -- one GroupShuffleSplit over the 81 photographs. Note it
+    #                    is unstratified, so the test side holds only 14 of the
+    #                    27 classes and a 27-way macro-F1 on it is mechanically
+    #                    capped near 14/27.
+    #   "grouped_cv"  -- StratifiedGroupKFold over every crop, out-of-fold
+    #                    predictions concatenated; covers all 27 classes. This is
+    #                    the photograph-disjoint estimate worth quoting, and it
+    #                    estimates the RECIPE (K models contributed), not any one
+    #                    shipped model.
+    #
+    # Known limit no protocol fixes: 5 of 27 sub-varieties have crops from
     # exactly ONE photograph, so no grouped split can place them on both sides.
-    # `leakage_ungrouped` in run_ablations.py measures the delta between the two
-    # protocols, which is a result worth reporting rather than a fix to hide.
     # -----------------------------------------------------------------------
-    split_protocol: "grouped"
+    split_protocol: "stratified"
 
     # Section 6.2 reports "consistent performance across all folds"; set
     # num_folds > 1 to switch to StratifiedGroupKFold. Fold test metrics are
@@ -79,10 +107,14 @@ experiment:
     # Set random_resized_crop_scale: null and horizontal_flip_prob: 0.0 to
     # reproduce the submitted configuration (the `wo_stage2_augmentation`
     # ablation does exactly that).
+    #
+    # The vertical flip is here for the same reason stage 1 uses the full
+    # dihedral group: seeds on a tray have no canonical orientation, so it is
+    # label-preserving and it destroys nothing.
     # -----------------------------------------------------------------------
     horizontal_flip_prob: 0.5
     random_resized_crop_scale: [0.8, 1.0]
-    vertical_flip_prob: 0.0
+    vertical_flip_prob: 0.5
     rotation_degrees: 0.0
 
     # Inverse-frequency sampling over sub-varieties. The hierarchy is 13 rice +

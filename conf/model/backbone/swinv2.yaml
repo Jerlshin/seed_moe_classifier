@@ -11,7 +11,7 @@
 # emits 768 channels; DinoV2SwinV2Encoder projects that down to the 384-D z of
 # Eq. 4, so `encoder(images).shape[-1] == 384` regardless of which variant is
 # chosen here. `swinv2_base_window16_256` (1024) is the capacity control -- use
-# `experiment=pretrain_swinv2_base_dino`, which sets both fields together.
+# `experiment=pretrain_dino_base`, which sets both fields together.
 #
 # Every window16_256 variant emits the SAME 8x8 final-stage token grid at 256 px,
 # which is what makes the Tiny/Base swap invisible to stage 2's grid routing.
@@ -19,24 +19,37 @@
 #
 # `data.image_size` must equal the window resolution in the model name (256).
 
-# Backbone, RESIZED for the revision. SwinV2-Base is 86.89 M parameters and
-# 43.94 GFLOPs/view against 9,357 crops from 81 photographs; Tiny is 27.58 M and
-# 13.32 GFLOPs/view (both measured, not quoted) for the same 8x8 grid. Stage 1
-# runs 6 views per image, so the 3.3x compute cut is what makes 100 epochs of
-# in-domain self-distillation affordable at a physical batch the collapse guards
-# can actually estimate from.
-
-# name: "swinv2_tiny_window16_256"
-name: "swinv2_small_window16_256"
+# THE trunk, for both stages. One name here, so a stage-2 run cannot compose a
+# different depth from the encoder stage 1 published -- which is silent under
+# `checkpoint_strict: false` and trains the head against a half-random trunk.
+#
+# Chosen on a frozen-feature screen (`python main.py screen-backbones`), all
+# ImageNet-supervised, no self-distillation:
+#
+#   trunk    params    GFLOPs/view   pooled 27-way   layers.2 27-way
+#   Tiny     27.58 M      13.32          0.6021          0.6243
+#   Small    48.96 M      25.56          0.6053          0.6174
+#   Base     86.89 M      43.94          (capacity control -- see below)
+#
+# Tiny is -0.32 pp pooled and +0.69 pp at the better readout stage for HALF the
+# FLOPs, so Small is dominated on both axes. Capacity is not the binding
+# constraint on this corpus; scene diversity is (81 photographs). Stage 1 runs 6
+# views per image, so the compute cut is what makes an in-domain self-distillation
+# budget affordable at a physical batch the collapse guards can estimate from.
+#
+# Small and Base remain one override away:
+#   model.backbone.name=swinv2_small_window16_256
+#   experiment=pretrain_dino_base          # capacity control, sets feature_dim too
+name: "swinv2_tiny_window16_256"
 feature_dim: 768
 
 # ImageNet-1k initialisation.
 #
 # FALSE here is the STAGE-2 default and means "the weights come from the stage-1
 # checkpoint below", which is the whole point of the two-stage recipe. Stage 1
-# sets it true (conf/experiment/pretrain_swinv2_dino.yaml) so self-distillation
-# starts from ImageNet rather than from noise, and the two ImageNet controls set
-# it true as well:
+# sets it true (conf/experiment/pretrain_dino.yaml) so self-distillation starts
+# from ImageNet rather than from noise, and the two ImageNet controls set it true
+# as well:
 #
 #   experiment=control_imagenet_frozen      ImageNet -> frozen -> stage 2
 #   experiment=baseline_swinv2_supervised   ImageNet -> unfrozen -> stage 2
@@ -107,7 +120,7 @@ projection_dropout: 0.0
 #
 # Set to null for a run that must NOT read the self-supervised encoder -- the
 # two ImageNet controls do exactly that.
-checkpoint_path: "${oc.env:SEED_PRETRAIN_BACKBONE,${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_pretrained.pth}"
+checkpoint_path: "${oc.env:SEED_PRETRAIN_BACKBONE,${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_pretrained_encoder.pth}"
 checkpoint_strict: false
 
 # The paper fine-tunes the encoder in stage 2 (Section 4, final paragraph). This

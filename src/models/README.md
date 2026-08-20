@@ -111,7 +111,7 @@ use this directly only when the unprojected feature is what you want (e.g.
   two-stage recipe. `train()` is overridden so a frozen backbone can never be
   put back into train mode by an enclosing `model.train()` call.
 * `freeze=False` fine-tunes the encoder jointly with the head, which is what
-  Section 4 describes. See `PAPER_AUDIT.md` §7.1.
+  Section 4's final paragraph describes.
 * `load_checkpoint` returns the missing/unexpected key report. `strict=False` is
   the default, so without this a mismatched checkpoint would load quietly and
   surface only as unexplained metrics; the trainer logs the report.
@@ -193,7 +193,7 @@ Three implementation facts:
 Extraction uses timm's `forward_intermediates(..., stop_early=True)`, so reading
 `layers.2` genuinely skips the blocks after it rather than running the whole trunk
 with a hook on it. A build without that method falls back to a forward hook, and
-`tests/test_stage1_changes.py` pins that the two produce bit-identical tensors.
+`tests/test_stage1_correctness.py` pins that the two produce bit-identical tensors.
 
 ## The auxiliary stage head
 

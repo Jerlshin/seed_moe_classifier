@@ -96,7 +96,8 @@ The gate is a probability simplex, so its total L1 norm is identically 1 and
 penalising *that* would do nothing; what "restricts the selection to only the
 top-K most relevant experts" describes is driving the discarded mass to zero.
 `moe_sparsity_mode: "topk"` restores the earlier behaviour of penalising the
-selected weights themselves — see `PAPER_AUDIT.md` §3.1.
+selected weights themselves, which is available as an ablation and is not the
+default.
 
 The two terms deliberately oppose each other: one wants each *sample* routed
 decisively, the other wants the *batch* spread evenly. That tension is what

@@ -59,20 +59,27 @@ Two collapse guards, both on that final prototype layer:
 
 ## Choosing a SwinV2 variant
 
-`conf/model/backbone/swinv2.yaml` holds `name` and `feature_dim`; everything else
-— the DINO head width, the encoder's projection to `z` — interpolates from
-`feature_dim`, so switching variants is a two-line config change:
+`conf/model/backbone/swinv2.yaml` holds `name` and `feature_dim`, **for both
+stages** — that is what makes it impossible for stage 2 to compose a different
+depth from the encoder stage 1 published (silent under
+`checkpoint_strict: false`: a Tiny encoder in a Small trunk matches 219 of 423
+tensors and the rest stay random). Everything else — the DINO head width, the
+encoder's projection to `z` — interpolates from `feature_dim`, so switching
+variants is a two-line config change:
 
 | `name` | `feature_dim` | Params | GFLOPs/view @256 |
 | --- | --- | --- | --- |
 | `swinv2_tiny_window16_256` (**default**) | 768 | 27.58 M | 13.32 |
-| `swinv2_small_window16_256` | 768 | 49.7 M | 25.9 |
+| `swinv2_small_window16_256` | 768 | 48.96 M | 25.56 |
 | `swinv2_base_window16_256` | 1024 | 86.89 M | 43.94 |
 
-Tiny and Base figures are measured, and `tests/test_stage1_recipe.py`
-re-measures them. All three emit the same `8x8` final-stage token grid at
+Every figure is measured, and `tests/test_stage1_recipe.py` re-measures Tiny and
+Small. Tiny is the default because the frozen screen
+(`python main.py screen-backbones`) put it -0.32 pp pooled and **+0.69 pp at
+`layers.2`** against Small for half the FLOPs — dominated on both axes. All three
+emit the same `8x8` final-stage token grid at
 256 px — only the channel width differs — which is what makes the swap invisible
-to stage 2's grid routing. `experiment=pretrain_swinv2_base_dino` runs the
+to stage 2's grid routing. `experiment=pretrain_dino_base` runs the
 identical stage-1 recipe on Base as a capacity control, and sets both `name` and
 `feature_dim` together (`DINO.__init__` cross-checks them against the trunk's
 actual `num_features` and refuses a mismatch).

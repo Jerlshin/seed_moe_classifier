@@ -9,7 +9,7 @@
 | `diagnose_sdpa_parity.py` | Per-module SwinV2→SDPA parity report (errors at fp32/TF32/fp64, gradients, shapes, guard verdicts) |
 | `run_stage1_ablations.py` | A **stage-1** arm suite from a YAML manifest: train each arm, evaluate it, collect one table |
 | `report_raw_photographs.py` | Which source photographs exist and were never cropped (reports only; never touches the data) |
-| `run_ablations.py` | The six component-wise ablation variants, optionally one per GPU |
+| `run_ablations.py` | The component-wise ablation variants, five seeds each, optionally one per GPU |
 | `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |
 | `extract_features.py` | Dump frozen-backbone embeddings to an `.npz` |
@@ -123,7 +123,7 @@ variant with its Hydra config snapshot, logs, checkpoints, figures,
 `summary.json` and `test_predictions.npz`.
 
 **Pretraining is never repeated.** Every variant reads the single published
-encoder at `outputs/checkpoints/dinov2_swinv2_pretrained.pth`. If each variant
+encoder at `outputs/checkpoints/dino_pretrained_encoder.pth`. If each variant
 had its own self-supervised initialisation, the table would partly measure that
 instead of the architectural change under test — and the resulting numbers would
 look entirely normal. `--allow-missing-checkpoint` waives the requirement for
@@ -132,12 +132,12 @@ smoke runs and prints a warning; results from such a run are not comparable.
 ## `run_stage1_ablations.py`
 
 ```bash
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase0.yaml
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --dry-run
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml     --experiment pretrain_swinv2_tiny_dino
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase3.yaml --seeds 42 43 44
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --collect-only
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/screens.yaml
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --dry-run
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml     --experiment pretrain_swinv2_tiny_dino
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --seeds 42 43 44
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --collect-only
 ```
 
 **Why `run_ablations.py` could not be reused.** That script runs stage-2 head
@@ -147,33 +147,29 @@ needs a second process to evaluate it, and both write to paths the other arms
 would otherwise overwrite. Without per-arm `experiment.training.save_path`,
 `shared_backbone_path` and `experiment.evaluation.save_path`, four arms silently
 overwrite each other's `outputs/eval_pretrain/` and each other's
-`outputs/checkpoints/dinov2_swinv2_pretrained.pth`, and the resulting table
+`outputs/checkpoints/dino_pretrained_encoder.pth`, and the resulting table
 compares one encoder against itself.
 
 **The arms are data, not code.** A manifest under `conf/stage1_arms/` names a base
 Hydra experiment, overrides applied to every arm, and one entry per arm. Adding an
 arm is adding an entry.
 
-| Manifest | Phase | What it runs |
-| --- | --- | --- |
-| `phase0.yaml` | 0 | No training. The readout screen and the initialisation screen |
-| `phase1.yaml` | 1 | The frozen reference plus five 50-epoch arms (baseline, KoLeo per view, `lambda_koleo=0`, crop scales, EMA centering) |
-| `phase2.yaml` | 2 | Template: the Phase-1 winner, plus `match_view_lowpass`, the auxiliary stage head, and a 100-epoch re-run |
-| `phase3.yaml` | 3 | The winner and the baseline at three seeds each, plus the frozen reference |
-| `view_design.yaml` | v2 | The v2 recipe decomposed into single factors: the view redesign, the colour policy, the dihedral augmentation, KoLeo's space, plus the native-pixel floor, EMA centering and the stage-3 readout it deliberately left fixed |
+| Manifest | What it runs |
+| --- | --- |
+| `screens.yaml` | **No training at all.** The readout screen, the initialisation screen, and the frozen reference. Run it first: it decides the trunk and the readout stage, and neither is recoverable by more self-distillation |
+| `view_design.yaml` | The primary recipe decomposed into single factors — `full`, `wo_view_redesign`, `wo_colour_policy`, `wo_dihedral`, `koleo_bottleneck` — plus the knobs it deliberately left fixed (`native_pixel_floor`, `ema_centering`, `stage3_readout`) and the `frozen` reference |
 
 Three arm shapes: `train: true` (train then evaluate), `train: false` with
 `evaluate_frozen: true` (the reference — the chosen trunk, frozen, no in-domain
-training), and `train: false` with an explicit `eval_experiment` (a Phase-0
-screen).
+training), and `train: false` with an explicit `eval_experiment` (a screen).
 
 **A suite on a different trunk must name its own evaluation.** The manifest's
 `evaluation:` and `frozen_evaluation:` keys select which evaluation experiment
 scores every arm, because the evaluation config carries the *trunk* and the
 *protocol*: scoring a SwinV2-Tiny arm against an evaluation whose `imagenet_init`
 control is SwinV2-Small turns "what did self-distillation add" into an
-architecture delta. `view_design.yaml` sets them to `eval_pretrain_v2` /
-`eval_frozen_v2`; a per-arm `eval_experiment` still wins over both.
+architecture delta. `view_design.yaml` sets them to `eval_pretrain` /
+`eval_frozen_reference`; a per-arm `eval_experiment` still wins over both.
 
 **Only `data.*` overrides carry into the evaluation.** They describe the corpus
 and the augmentation, both of which the alignment measurement must reproduce;
@@ -195,10 +191,14 @@ won the probe by re-learning the photograph confound the protocol punishes).
 
 ```bash
 python scripts/report_view_geometry.py
-python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
-python scripts/report_view_geometry.py --data seed_crops_v2 --csv outputs/reports/geometry.csv \
+python scripts/report_view_geometry.py --policy canonical reference
+python scripts/report_view_geometry.py --csv outputs/reports/geometry.csv \
     data.augmentation.min_native_pixels=900
 ```
+
+`--policy` names an override set on the one `data` group rather than a second
+config file: `canonical` is whatever `conf/data/hierarchical_seeds.yaml` currently
+says, `reference` is DINO's ImageNet geometry as a *measurement* baseline.
 
 **What each DINO view is actually built from, before spending a GPU-hour on it.**
 `RandomResizedCrop`'s `scale` is a fraction of the *source* area, so a config

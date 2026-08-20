@@ -159,11 +159,12 @@ def test_grouped_splitting_keeps_source_photographs_on_one_side(dataset):
 
 
 def test_split_report_quantifies_leakage_under_the_ungrouped_protocol(dataset):
-    """The stratified protocol is retained, but it must carry its own indictment.
+    """The crop-level protocol is the primary one, and it carries its own indictment.
 
     Reporting the leak is what turns it from a hidden flaw into a measured
-    result: ``leakage_ungrouped`` in the ablation suite runs exactly this and the
-    delta against ``full_model`` is the number the paper should quote.
+    result: ``leakage_grouped`` in the ablation suite runs the photograph-disjoint
+    counterpart and the delta against ``full_model`` is the number the paper
+    should quote.
     """
     _, _, report = split_dataset(
         dataset, test_size=0.3, num_folds=1, seed=42, protocol="stratified"

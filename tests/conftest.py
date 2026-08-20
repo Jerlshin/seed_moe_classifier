@@ -46,7 +46,7 @@ REVISED_TOP_K = 2
 # `swinv2_*_window12_192` emits 6x6 = 36 at 192 px. Stage 2's routing-slot count
 # moves with it, which matters for the load-balancing statistic's estimability at
 # small batch. All three figures are MEASURED, not derived --
-# `tests/test_stage1_changes.py` re-measures them.
+# `tests/test_stage1_correctness.py` re-measures them.
 PAPER_TOKEN_GRID = 64            # swinv2_*_window16_256 @ 256 px, layers.3
 TOKEN_GRID_192 = 36              # swinv2_*_window12_192 @ 192 px, layers.3
 
@@ -64,6 +64,27 @@ STAGE3_FEATURE_DIM_BASE = 512
 
 PAPER_GLOBAL_CROPS = 2         # Table 1
 PAPER_LOCAL_CROPS = 4          # Table 1
+
+# View geometry. The submitted ranges are DINO's ImageNet defaults; the canonical
+# ones are sized for a source that is already one seed at a median 52 x 51 px.
+# Measured over all 9,357 crops (`scripts/report_view_geometry.py`, 40k draws at
+# seed 7), a local view carries a median 598 native pixels under the submitted
+# ranges and 1,419 under the canonical ones -- 0.91 % vs 2.17 % real content in a
+# 256 px view, with 8 of the 10 cross-view terms of Eq. 1 anchored on one.
+#
+# `crop_ratio` is not in the paper at all. It exists because narrowing the scale
+# range spends randomness: `get_params` retries the (area, aspect) draw ten times
+# and then returns a DETERMINISTIC centre crop, and only 3.4 % of these crops are
+# square. Measured global fallback rates: 3.5 % at (0.40, 1.00) with torchvision's
+# ratio, 22.0 % at (0.70, 1.00) with it, 10.2 % at (0.70, 1.00) once the ratio
+# widens to (0.5, 2.0).
+SUBMITTED_GLOBAL_CROPS_SCALE = [0.4, 1.0]
+SUBMITTED_LOCAL_CROPS_SCALE = [0.05, 0.4]
+SUBMITTED_LOCAL_CROP_SIZE = 101
+CANONICAL_GLOBAL_CROPS_SCALE = [0.70, 1.00]
+CANONICAL_LOCAL_CROPS_SCALE = [0.30, 0.70]
+CANONICAL_LOCAL_CROP_SIZE = 160
+CANONICAL_CROP_RATIO = [0.5, 2.0]
 PAPER_CLIP_GRAD = 3.0
 
 # Stage-1 constants come in pairs now: what Table 1 states, and what the revision
@@ -91,10 +112,12 @@ REVISED_DINO_OUT_DIM = 2048
 SUBMITTED_CENTER_MOMENTUM = 0.9
 REVISED_CENTER_MOMENTUM = 0.99
 
-# Stage-1 backbone and recipe, second revision. The submitted trunk was
-# SwinV2-Base at random initialisation for 300 epochs; the revision starts from
-# ImageNet-1k on SwinV2-Tiny for 100. All four numbers below were MEASURED from
-# timm rather than quoted, and `test_models.py` re-measures them.
+# Stage-1 backbone and recipe. The submitted trunk was SwinV2-Base at random
+# initialisation for 300 epochs; this pipeline starts from ImageNet-1k on
+# SwinV2-Tiny. `REVISED_BACKBONE` is THE trunk -- what
+# `conf/model/backbone/swinv2.yaml` selects, for both stages. All four numbers
+# below were MEASURED from timm rather than quoted, and `test_models.py`
+# re-measures them.
 SUBMITTED_BACKBONE = "swinv2_base_window16_256"
 REVISED_BACKBONE = "swinv2_tiny_window16_256"
 SUBMITTED_BACKBONE_FEATURE_DIM = 1024
@@ -102,33 +125,47 @@ REVISED_BACKBONE_FEATURE_DIM = 768
 REVISED_BACKBONE_PARAMS_M = 27.58      # +-0.01, swinv2_tiny_window16_256
 REVISED_BACKBONE_GFLOPS_PER_VIEW = 13.32   # forward, 1 view at 256 px
 
-# The trunk `conf/model/backbone/swinv2.yaml` actually selects, and the one the
-# published 100-epoch checkpoint was trained with: SwinV2-**Small**, a third
-# constant rather than an edit to REVISED_BACKBONE, because the Tiny numbers above
-# are still what several tests measure and a test asserting a bare name must be
-# able to say which trunk it means.
+# SwinV2-Small: the trunk the pipeline previously defaulted to, and the loser of
+# the frozen screen (-0.69 pp at `layers.2` for 1.9x the FLOPs). Kept as its own
+# constant, and re-measured, because the trunk decision is only checkable if both
+# sides of it are pinned -- a test asserting a bare name must be able to say which
+# trunk it means.
 #
 # Both figures are MEASURED: the params from timm, the GFLOPs from
-# FlopCounterMode, and the stage-1 run's own budget report printed 25.57
+# FlopCounterMode, and a Small stage-1 run's own budget report printed 25.57
 # GFLOPs/view for backbone + head against the 25.56 measured here for the
 # backbone alone.
-SHIPPED_BACKBONE = "swinv2_small_window16_256"
-SHIPPED_BACKBONE_FEATURE_DIM = 768
-SHIPPED_BACKBONE_PARAMS_M = 48.96
-SHIPPED_BACKBONE_GFLOPS_PER_VIEW = 25.56
+SMALL_BACKBONE = "swinv2_small_window16_256"
+SMALL_BACKBONE_FEATURE_DIM = 768
+SMALL_BACKBONE_PARAMS_M = 48.96
+SMALL_BACKBONE_GFLOPS_PER_VIEW = 25.56
 SUBMITTED_EPOCHS = 300
-REVISED_EPOCHS = 100
-REVISED_LR_WARMUP_EPOCHS = 10
 REVISED_DROP_PATH_RATE = 0.1
 
+# The stage-1 recipe `conf/experiment/pretrain_dino.yaml` ships, as constants, so
+# a test asserting one of these numbers is asserting the canonical run rather
+# than a number the reader assumed.
+#
+# 50 epochs, not 100: the budget is decided by the in-training representation
+# probe, and on a 100-epoch run of the earlier recipe the probe peaked at epoch
+# 50 (0.6358) and fell to 0.6284 by epoch 100. The probe forces every epoch it
+# scores into `save_epochs`, so the milestone list is what it can select from.
+STAGE1_EPOCHS = 50
+STAGE1_WARMUP_EPOCHS = 5
+STAGE1_SAVE_EPOCHS = [5, 10, 15, 20, 25, 30, 40, 50]
+
 # Learning rate. Section 6.1's 0.0005 is DINO's rate at ITS reference batch of
-# 256; the revision derives the run's rate from the effective batch by the
-# linear scaling rule, which at 32 gives 6.25e-05.
+# 256; this pipeline derives the run's rate from the effective batch by the
+# linear scaling rule, which at 64 gives 1.25e-04.
+#
+# Physical batch 64 at accumulation 1: Sinkhorn and KoLeo are per-MICRO-batch
+# statistics, so the physical batch is what they estimate from, and trading it
+# for accumulation changes the objective at a constant effective batch.
 LR_BASE = 0.0005
 LR_REFERENCE_BATCH = 256
-REVISED_PHYSICAL_BATCH = 32
-REVISED_EFFECTIVE_BATCH = 32
-REVISED_LEARNING_RATE = LR_BASE * REVISED_EFFECTIVE_BATCH / LR_REFERENCE_BATCH
+STAGE1_PHYSICAL_BATCH = 64
+STAGE1_EFFECTIVE_BATCH = 64
+STAGE1_LEARNING_RATE = LR_BASE * STAGE1_EFFECTIVE_BATCH / LR_REFERENCE_BATCH
 
 # DINO projection head, resized with the trunk: 768 -> 1024 -> 1024 -> 256 -> 2048.
 REVISED_DINO_HIDDEN_DIM = 1024

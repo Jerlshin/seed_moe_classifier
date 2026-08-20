@@ -17,7 +17,7 @@
 # GPUS means two different things, deliberately, because the two stages want
 # different kinds of parallelism:
 #
-#   * for `pretrain` / `finetune` / `ablation` it is a COUNT, and the stage runs
+#   * for `pretrain` / `finetune` / `finetune-grouped` / `ablation` it is a COUNT, and the stage runs
 #     as one DDP job across that many ranks;
 #   * for `ablations` / `baselines` it is a DEVICE LIST, and the suite runs one
 #     variant per device concurrently. That is the better use of a second GPU
@@ -31,7 +31,7 @@ set -euo pipefail
 
 STAGE="${1:-}"
 if [[ -z "${STAGE}" ]]; then
-  echo "Usage: [GPUS=n] scripts/train_distributed.sh pretrain|finetune|ablation|ablations|baselines|verify|report [overrides...]"
+  echo "Usage: [GPUS=n] scripts/train_distributed.sh pretrain|finetune|finetune-grouped|ablation|ablations|baselines|eval-pretrain|eval-frozen|verify|report [overrides...]"
   exit 2
 fi
 shift || true
@@ -43,12 +43,12 @@ mkdir -p "${SEED_OUTPUT_DIR}"
 # The single encoder every downstream run reuses. Published by the pretrain
 # stage; exported here so the finetune, ablation and baseline stages all resolve
 # to the same file without any manual path plumbing.
-export SEED_PRETRAIN_BACKBONE="${SEED_PRETRAIN_BACKBONE:-${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth}"
+export SEED_PRETRAIN_BACKBONE="${SEED_PRETRAIN_BACKBONE:-${SEED_OUTPUT_DIR}/checkpoints/dino_pretrained_encoder.pth}"
 
 GPUS="${GPUS:-1}"
 
 case "${STAGE}" in
-  pretrain|finetune|ablation)
+  pretrain|finetune|finetune-grouped|ablation)
     # scripts/launch.py pins one $SEED_RUN_ID so every rank composes the same
     # Hydra output directory, and runs the module directly (no process group)
     # when GPUS is 1.
@@ -67,6 +67,10 @@ case "${STAGE}" in
     else
       python scripts/run_baselines.py --gpus "${GPUS}" -- "$@"
     fi
+    ;;
+  eval-pretrain|eval-frozen)
+    # One forward pass per encoder, no gradient to reduce: always single process.
+    python main.py "${STAGE}" "$@"
     ;;
   verify)
     python scripts/verify_runtime.py "$@"

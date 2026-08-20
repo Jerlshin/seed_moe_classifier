@@ -1,17 +1,17 @@
-"""Tests for the v2 stage-1 pipeline.
+"""Tests for the stage-1 pipeline: views, protocol, artifacts.
 
 Grouped by the claim each one defends, because several of these pin a *measured
 property of this dataset* rather than a property of the code, and a failure means
 something different in each case:
 
-* **View geometry** -- the redesign's whole justification is that a local view
-  carries a median ~600 native pixels under the submitted recipe and ~1,400 under
-  v2. If those numbers move, the argument moves with them.
+* **View geometry** -- the crop policy's whole justification is that a local view
+  carries a median ~600 native pixels under DINO's reference ranges and ~1,400
+  under the canonical ones. If those numbers move, the argument moves with them.
 * **Losslessness** -- ``RandomRotation90`` and the native-pixel floor are only
   admissible because they add no interpolation and never make a view *more*
   destructive. Both are checked directly rather than assumed.
-* **Protocol** -- the v2 pipeline is crop-level stratified by instruction, and
-  the configs must say so unambiguously in both stages.
+* **Protocol** -- the pipeline is crop-level stratified by instruction, and the
+  configs must say so unambiguously in both stages.
 * **Machine-readability** -- every artifact an automated analysis reads (CSV
   schema, ``describe()``, ``summary.json`` keys) is pinned, because the whole
   point of writing them is that something else parses them later.
@@ -110,8 +110,8 @@ def test_widening_the_aspect_range_cuts_the_deterministic_fallback():
     3.4 % of these crops are square -- so raising the scale floor silently trades
     augmentation randomness for content. Widening the ratio recovers it.
 
-    This is the one place the implementation departs from ``STAGE1_CHANGES.md``
-    C1, which proposes the narrower scales and leaves the aspect range alone.
+    This is the knob a naive narrowing of the scale range would leave alone, and
+    the reason ``crop_ratio`` is a config key rather than a torchvision default.
     """
     sizes = _synthetic_source_sizes()
     narrow = measure_view_geometry(
@@ -169,7 +169,7 @@ def test_floor_never_exceeds_the_upper_scale_bound(width, height, expected_low):
 
 
 def test_zero_floor_is_exactly_a_plain_random_resized_crop():
-    """``min_native_pixels: 0`` must be the pre-v2 behaviour, not an approximation.
+    """``min_native_pixels: 0`` must be a plain ``RandomResizedCrop``, not an approximation.
 
     This is what makes the floor a single-factor arm: if the disabled path
     differed at all, ``V2-FLOOR`` would be measuring two things.
@@ -524,24 +524,24 @@ def test_publish_best_encoder_is_atomic_and_leaves_no_temporary():
 
 
 def test_v2_pipeline_is_crop_level_end_to_end(conf_dir):
-    """The v2 pipeline splits at crop level in both stages, by instruction.
+    """The pipeline splits at crop level in both stages, by instruction.
 
     Photograph-disjoint splitting is available and is reported as a diagnostic;
     it must not be what any primary number is computed from.
     """
     from tests.test_configs import build
 
-    stage2 = build(conf_dir, "experiment=finetune_v2_crop_level")
+    stage2 = build(conf_dir, "experiment=finetune_hierarchical_moe")
     assert stage2.experiment.training.split_protocol == "stratified"
     assert stage2.experiment.training.test_size == 0.2
     assert stage2.experiment.validation.enabled is True
 
-    stage1_eval = build(conf_dir, "experiment=eval_pretrain_v2")
+    stage1_eval = build(conf_dir, "experiment=eval_pretrain")
     assert stage1_eval.experiment.evaluation.split.protocol == "stratified"
     assert stage1_eval.experiment.evaluation.grouped_cv.enabled is False
 
     # The photograph-disjoint counterpart exists, and is explicitly not primary.
-    diagnostic = build(conf_dir, "experiment=finetune_v2_grouped_diagnostic")
+    diagnostic = build(conf_dir, "experiment=finetune_grouped_diagnostic")
     assert diagnostic.experiment.training.split_protocol == "grouped_cv"
     assert diagnostic.experiment.group.endswith("diagnostic")
 
@@ -549,7 +549,7 @@ def test_v2_pipeline_is_crop_level_end_to_end(conf_dir):
 def test_v2_pretraining_declares_the_corpus_and_selects_on_the_probe(conf_dir):
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=pretrain_v2_swinv2_tiny")
+    cfg = build(conf_dir, "experiment=pretrain_dino")
     # The failure this guards against already happened: 8,173 crops trained, and
     # 9,357 used everywhere downstream.
     assert cfg.data.expected_num_samples == 9357
@@ -573,7 +573,7 @@ def test_v2_pretraining_declares_the_corpus_and_selects_on_the_probe(conf_dir):
 def test_v2_data_policy_preserves_colour_and_the_object(conf_dir):
     from tests.test_configs import build
 
-    augmentation = build(conf_dir, "experiment=pretrain_v2_swinv2_tiny").data.augmentation
+    augmentation = build(conf_dir, "experiment=pretrain_dino").data.augmentation
 
     # Geometry: views must depict the same object.
     assert list(augmentation.local_crops_scale) == [0.30, 0.70]
@@ -606,7 +606,7 @@ def test_v2_koleo_is_per_view_and_on_the_shipped_space(conf_dir):
     """
     from tests.test_configs import build
 
-    loss = build(conf_dir, "experiment=pretrain_v2_swinv2_tiny").model.loss
+    loss = build(conf_dir, "experiment=pretrain_dino").model.loss
     assert loss.koleo_scope == "per_view"
     assert loss.koleo_space == "backbone"
     assert loss.lambda_koleo > 0
@@ -619,24 +619,25 @@ def test_view_design_arms_are_single_factor_against_the_full_recipe():
     manifest = yaml.safe_load(
         Path("conf/stage1_arms/view_design.yaml").read_text(encoding="utf-8")
     )
-    assert manifest["experiment"] == "pretrain_v2_swinv2_tiny"
-    # The evaluation carries the trunk: scoring a Tiny arm against a Small
-    # `imagenet_init` control would make the delta an architecture delta.
-    assert manifest["evaluation"] == "eval_pretrain_v2"
-    assert manifest["frozen_evaluation"] == "eval_frozen_v2"
+    assert manifest["experiment"] == "pretrain_dino"
+    # The evaluation carries the trunk: scoring an arm against an
+    # `imagenet_init` control of a different architecture would make the delta an
+    # architecture delta.
+    assert manifest["evaluation"] == "eval_pretrain"
+    assert manifest["frozen_evaluation"] == "eval_frozen_reference"
 
     arms = {arm["name"]: arm for arm in manifest["arms"]}
-    assert arms["V2-FULL"]["overrides"] == [], "the reference arm must change nothing"
-    assert arms["V2-FROZEN"]["train"] is False
+    assert arms["full"]["overrides"] == [], "the reference arm must change nothing"
+    assert arms["frozen"]["train"] is False
 
     # Each ablation touches exactly one config subtree.
     subtrees = {
-        "V2-noVIEW": {"data.local_crop_size", "data.augmentation.global_crops_scale",
-                      "data.augmentation.local_crops_scale", "data.augmentation.crop_ratio"},
-        "V2-noDIHEDRAL": {"data.augmentation.vertical_flip_prob",
-                          "data.augmentation.rotation90_prob"},
-        "V2-KOLEO-BOTTLENECK": {"model.loss.koleo_space"},
-        "V2-FLOOR": {"data.augmentation.min_native_pixels"},
+        "wo_view_redesign": {"data.local_crop_size", "data.augmentation.global_crops_scale",
+                             "data.augmentation.local_crops_scale", "data.augmentation.crop_ratio"},
+        "wo_dihedral": {"data.augmentation.vertical_flip_prob",
+                        "data.augmentation.rotation90_prob"},
+        "koleo_bottleneck": {"model.loss.koleo_space"},
+        "native_pixel_floor": {"data.augmentation.min_native_pixels"},
     }
     for name, expected in subtrees.items():
         keys = {item.split("=", 1)[0] for item in arms[name]["overrides"]}
@@ -653,8 +654,7 @@ def test_split_delta_is_keyed_by_protocol_not_by_which_was_the_headline():
     near-duplicate leakage is measured on the encoder being reported. It used to
     file the headline under `"grouped"` and the alternative under
     `"stratified"` unconditionally -- correct only while `grouped` was the
-    primary. Under the v2 configs the primary is `stratified`, so those two
-    labels swapped: `tables/split_protocol_delta.csv` reported the crop-level
+    primary. The canonical primary is `stratified`, so those two labels swapped: `tables/split_protocol_delta.csv` reported the crop-level
     accuracy in the `grouped` column, the grouped accuracy in the `stratified`
     column, and a negative `delta_stratified_minus_grouped`.
 

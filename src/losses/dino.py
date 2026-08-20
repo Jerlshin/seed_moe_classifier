@@ -211,7 +211,7 @@ def grouped_koleo(
 ) -> torch.Tensor:
     """KoLeo over ``num_groups`` view-major blocks, applied per block or across all.
 
-    **This is the A1 fix from ``STAGE1_CHANGES.md`` and it is not cosmetic.**
+    **The per-block default is a correctness fix, not a cosmetic one.**
     ``features`` arrives view-major, so rows ``[0:B]`` are global view 0 of every
     image and rows ``[B:2B]`` are global view 1 of *the same* images in the same
     order. Handing that whole block to :func:`koleo_regularizer` masks only the

@@ -1,7 +1,7 @@
 """Stage-1 evaluation: what did DINO self-distillation actually learn?
 
     python main.py eval-pretrain
-    python -m src.trainers.pretrain_eval experiment=eval_pretrain_representation
+    python -m src.trainers.pretrain_eval experiment=eval_pretrain
 
 Stage 1 produces an encoder, not a classifier. There is no accuracy to report and
 no held-out loss that means anything -- DINO's loss is defined against a teacher
@@ -291,8 +291,8 @@ def compare_checkpoints(left: str | Path, right: str | Path) -> tuple[str, str]:
 
     A digest comparison alone is not enough, and getting this wrong produces a
     false alarm that is worse than no check. Measured on this repository's own
-    artifacts: ``dino_backbone_epoch_0100.pth`` and the published
-    ``dinov2_swinv2_pretrained.pth`` have **different SHA-256s and all 423 tensors
+    artifacts: a ``dino_backbone_epoch_*.pth`` milestone and the published
+    ``dino_pretrained_encoder.pth`` have **different SHA-256s and all 423 tensors
     bit-identical** -- the milestone goes through ``atomic_save`` and the handoff
     through ``torch.save`` plus a copy, and torch's zip container does not
     serialise byte-identically across those paths. So the digest is the fast path
@@ -687,9 +687,9 @@ def build_backbone(
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
     extractor = BackboneFeatureExtractor(
-        # A row may name its own trunk, which is what makes the Phase-0
-        # initialisation screen (Appendix 2 of STAGE1_CHANGES.md) a config entry
-        # rather than a separate script. Absent, every row is the run's trunk.
+        # A row may name its own trunk, which is what makes the initialisation
+        # screen (`experiment=screen_backbones`) a config entry rather than a
+        # separate script. Absent, every row is the run's trunk.
         model_name=str(spec.backbone or cfg.model.backbone.name),
         checkpoint_path=spec.checkpoint,
         pretrained=bool(spec.pretrained),
@@ -2277,8 +2277,8 @@ def main(cfg: DictConfig) -> None:
                 elapsed = 0.0
             elif spec.kind == "handcrafted":
                 # Not an encoder: ten image statistics, scored by the identical
-                # probe, folds and seed. See E1 of STAGE1_CHANGES.md -- this row
-                # is the floor a reviewer asks about before any of the others.
+                # probe, folds and seed. This row is the floor a reviewer asks
+                # about before any of the others.
                 logger.info("Computing handcrafted floor features | %s", spec.label)
                 pooled = handcrafted_image_features(
                     [path for path, _, _ in dataset.samples]
@@ -2362,8 +2362,8 @@ def main(cfg: DictConfig) -> None:
                 del extractor
 
         # Is the primary encoder the same bytes stage 2 will load? Checked rather
-        # than assumed: `dino_backbone_epoch_0100.pth` and the published
-        # `dinov2_swinv2_pretrained.pth` are written by different code paths at
+        # than assumed: a `dino_backbone_epoch_*.pth` milestone and the published
+        # `dino_pretrained_encoder.pth` are written by different code paths at
         # different points in the run, and a report about the wrong one of the two
         # would be indistinguishable from a report about the right one.
         handoff = OmegaConf.select(
@@ -2916,7 +2916,7 @@ def main(cfg: DictConfig) -> None:
             )
             # Key by the protocol each number was actually produced under, not
             # by which one happened to be the headline. `alt_report["protocol"]`
-            # is the *other* protocol, so under the v2 configs -- where the
+            # is the *other* protocol, so under the canonical configs -- where the
             # headline is `stratified` -- the headline is the crop-level number
             # and the alternative is the grouped one. Hardcoding
             # `{"grouped": headline, "stratified": alt}` labelled them backwards

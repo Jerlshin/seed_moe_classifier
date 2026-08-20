@@ -128,7 +128,7 @@ key and one constructor argument.
   `SEED_OUTPUT_DIR` alone is enough to compose the two stages:
 
   ```yaml
-  checkpoint_path: "${oc.env:SEED_PRETRAIN_BACKBONE,${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dinov2_swinv2_pretrained.pth}"
+  checkpoint_path: "${oc.env:SEED_PRETRAIN_BACKBONE,${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_pretrained_encoder.pth}"
   ```
 
 `model.head.feature_dim` is now a literal 384 rather than an interpolation of the
@@ -139,40 +139,58 @@ The trainer cross-checks the discovered class counts against `data.*` and refuse
 to start on a mismatch, which would otherwise surface only as unexplained
 metrics.
 
-## `data` is a group with two members
+## `data` is a group with one member
 
-`hierarchical_seeds` (the default, and the submitted recipe) and `seed_crops_v2`,
-which inherits from it and overrides the augmentation policy. Selecting it is
-`data=seed_crops_v2`, or an experiment that overrides the group —
-`pretrain_v2_swinv2_tiny` does.
+`hierarchical_seeds` — the corpus, the loader settings and the view policy, in
+one file whose header carries the measurement behind every value. There is no
+second data group: a view policy that differs from the canonical one is a set of
+overrides, and `conf/stage1_arms/view_design.yaml` runs the ones worth measuring
+as controlled single-factor arms (`wo_view_redesign`, `wo_colour_policy`,
+`wo_dihedral`, `native_pixel_floor`).
 
-The split exists so the v2 view redesign is a **separate file** rather than an
-edit: every published number was produced under `hierarchical_seeds`, and
-changing its defaults would silently re-baseline them. Nothing in
-`hierarchical_seeds.yaml` changed its values; it gained keys (`crop_ratio`,
-`min_native_pixels`, `vertical_flip_prob`, `rotation90_prob`, `blur_radius_*`,
-`expected_num_samples`) whose defaults reproduce the previous behaviour exactly.
+`scripts/report_view_geometry.py --policy canonical reference` measures the
+canonical policy against DINO's ImageNet geometry without training anything, so
+the comparison stays available without a second file for the two to drift apart
+in.
 
-`data.expected_num_samples` is worth calling out: an integer makes a
-corpus-size mismatch **fatal at startup**, `null` disables the check. The failure
-it guards against already happened — the shipped encoder was self-distilled on
-8,173 crops while everything downstream used 9,357. `corpus_fingerprint` makes
-that discoverable afterwards; this makes it impossible.
+Keys that are not in the paper and exist because this corpus is not ImageNet:
+`crop_ratio` (a narrower scale range without a wider aspect range spends
+randomness — 22.0 % deterministic centre crops instead of 10.2 %),
+`min_native_pixels` (a per-image floor on source pixels, 0 by default),
+`vertical_flip_prob` / `rotation90_prob` (the dihedral group is label-preserving
+on a tray), `blur_radius_*`, `match_view_lowpass`, `same_photo_local_views`.
 
-## The v2 experiment files
+`data.expected_num_samples` is worth calling out: an integer makes a corpus-size
+mismatch **fatal at startup**, `null` disables the check. The failure it guards
+against already happened — an encoder was self-distilled on 8,173 crops while
+everything downstream used 9,357. `corpus_fingerprint` makes that discoverable
+afterwards; this makes it impossible.
+
+## The experiment files
+
+There is one experiment per stage. Everything else is a named control or a
+single-override ablation, and each file's header says which.
 
 | File | What it is |
 | --- | --- |
-| `pretrain_v2_swinv2_tiny.yaml` | The v2 stage-1 recipe. Every value carries the measurement that chose it |
-| `eval_pretrain_v2.yaml` | Its evaluation, crop-level headline, Tiny controls |
-| `eval_frozen_v2.yaml` | Frozen SwinV2-Tiny, no in-domain training — the bar stage 1 must clear |
-| `finetune_v2_crop_level.yaml` | Stage 2 under crop-level stratified train/val/test |
-| `finetune_v2_grouped_diagnostic.yaml` | The same, photograph-disjoint. A **diagnostic**, not the primary path |
+| `pretrain_dino.yaml` | **Stage 1.** Every value carries the measurement that chose it |
+| `eval_pretrain.yaml` | **Stage 1.5.** Scores the representation: the probe-selected encoder, its milestones, and the floors |
+| `eval_frozen_reference.yaml` | The bar: the frozen trunk, no in-domain training. Run it *before* stage 1 |
+| `screen_backbones.yaml` | Frozen-feature screen across candidate trunks. No training |
+| `finetune_hierarchical_moe.yaml` | **Stage 2.** Crop-level stratified train/val/test. Every ablation, control and baseline inherits from it |
+| `finetune_grouped_diagnostic.yaml` | The same under photograph-disjoint `grouped_cv`. A **diagnostic**, not the primary path |
+| `pretrain_dino_base.yaml` | Capacity control: the same recipe on SwinV2-Base at the same IN-1k corpus |
+| `pretrain_dino_base_in22k.yaml` | Corpus control: SwinV2-Base pretrained on IN-22k. A *different* question from the line above |
+| `control_imagenet_frozen.yaml` | The stage-1 control: ImageNet, frozen, straight to stage 2 |
+| `ablation_flat_classifier.yaml` | The hierarchy removed entirely |
+| `baseline_*.yaml` | Linear probe, supervised SwinV2, ResNet-50, Swin-T, hierarchical CCE |
 
-The evaluation configs carry the *trunk* as well as the protocol, which is why
-there is a `_v2` copy of each rather than an override: an evaluation whose
-`imagenet_init` control is SwinV2-Small cannot score a SwinV2-Tiny arm without
-turning "what did self-distillation add" into an architecture delta.
+The evaluation configs inherit the *trunk* from `model/backbone` rather than
+naming their own, which is what keeps `imagenet_init` and `random_init` the same
+architecture as the encoder under test — otherwise "what did self-distillation
+add" would be partly an architecture delta. The two Base controls override `name`
+and `feature_dim` **together** and publish to their own
+`shared_backbone_path`.
 
 ## The stage-1 arm manifests are not a Hydra group
 
@@ -182,13 +200,13 @@ Hydra experiment, a list of overrides applied to every arm, and one entry per
 arm; the runner turns each entry into a `contrastive_pretrain` command and a
 `pretrain_eval` command with per-arm paths pinned.
 
-They live under `conf/` because they *are* configuration — the point of
-`STAGE1_CHANGES.md` requirement is that the arms are data rather than a Python
-list, so adding an arm is adding an entry — but they are not a config group and
-`experiment=phase1` is not a thing. Phases 0-3 of the audit's sequence ship as
-`phase0.yaml` … `phase3.yaml`, and each carries in its comments the rules about
-what may and may not be combined (four genuine confounds; see the manifest).
-`view_design.yaml` is the v2 suite.
+They live under `conf/` because they *are* configuration — the whole point is
+that the arms are data rather than a Python list, so adding an arm is adding an
+entry — but they are not a config group and `experiment=view_design` is not a
+thing. Two manifests ship: `screens.yaml` (no training at all — the trunk and
+readout-stage decisions) and `view_design.yaml` (the primary recipe decomposed
+into single factors). Each carries in its comments the rules about what may and
+may not be combined.
 
 A manifest may also name `evaluation:` and `frozen_evaluation:`, which select the
 evaluation experiment every arm is scored with — required whenever the suite's
@@ -197,29 +215,31 @@ trunk differs from the default one.
 ## Paper-critical values
 
 Every value below is asserted by `tests/test_configs.py`, each assertion citing
-its source. A failure there means the configs have drifted from the paper.
+its source. A failure there means the configs have drifted from what the test
+says they are — which is either a regression or a decision that has not been
+written down yet.
 
 | Setting | Value | Source |
 | --- | --- | --- |
-| `data.batch_size` | 16 | Table 1 |
-| `experiment.training.epochs` (pretrain) | 300 | Table 1 |
+| `data.batch_size` | 16 stage 2; **64** stage 1 | Table 1 says 16; the physical batch is what Sinkhorn/KoLeo estimate from |
+| `experiment.training.epochs` (pretrain) | **50**, probe-selected | Table 1 says 300 |
 | `experiment.training.clip_grad` | 3.0 | Table 1 |
 | `experiment.training.momentum_teacher` | 0.996 | Table 1 |
 | `experiment.training.lr_base` (pretrain) | 0.0005, at a reference batch of 256 | Section 6.1 |
-| `model.loss.warmup_teacher_temp` → `teacher_temp` | 0.02 → 0.04 | Table 1 |
-| `model.loss.warmup_teacher_temp_epochs` | 5 | Table 1 |
-| `model.loss.center_momentum` | 0.9 | Eq. 3 |
-| `model.head.out_dim` (DINO) | 65,536 (revised to 2,048) | Table 1 |
+| `model.loss.warmup_teacher_temp` → `teacher_temp` | **0.04 → 0.07 over 30 epochs** | Table 1 says 0.02 → 0.04 over 5 |
+| `model.loss.center_momentum` | **0.99** | Eq. 3 says 0.9 |
+| `model.head.out_dim` (DINO) | **2,048** | Table 1 says 65,536; `K/B_teacher` is the quantity that matters |
 | `data.augmentation` crops | 2 global + 4 local | Table 1 |
-| crop scales | (0.4, 1.0) / (0.05, 0.4) | Table 1 |
+| crop scales | **(0.70, 1.00) / (0.30, 0.70)**, aspect (0.5, 2.0) | Table 1 says (0.4, 1.0) / (0.05, 0.4) — sized for a 52 x 51 px source |
 | `model.head.embed_dim` | 384 | Eq. 4 |
 | `model.head.num_experts` | 6 | Section 5.2 |
 | `model.head.top_k` | **2** | revision (paper: 4) |
+| `model.head.arcface_scale` | **`auto`** -> AdaCos 4.61 | revision (paper: 30) |
 | `data.num_seed_types` / `num_sub_varieties` | 4 / 27 | Section 3 |
 
-`top_k` is one of several deliberate departures; `REVISION_NOTES.md` 0 tabulates
-them all with their reversing override. `model.head.top_k=4` reproduces the
-submitted configuration; see [`../REVISION_NOTES.md`](../REVISION_NOTES.md).
+`top_k` is one of several deliberate departures; README.md's "Reproducing the
+submitted configuration" tabulates them all with their reversing override.
+`model.head.top_k=4` restores the submitted routing width.
 
 ## Execution settings vs. objective settings
 
@@ -231,13 +251,13 @@ so one file runs on an A100, on Kaggle's T4x2, on Windows and on CPU:
 | --- | --- | --- |
 | `amp` | bf16 on Ampere+, **fp16 + `GradScaler` on a T4**, off on CPU/MPS | An explicit `bf16` on `sm_75` is downgraded, not refused. Safe only because Sinkhorn, the prototype log-softmax and KoLeo are pinned to fp32. |
 | `compile.enabled` | on where inductor can emit a kernel (CUDA, `sm >= 7.0`, Triton) | The reason for staying eager is logged and written to the event stream. |
-| `data.num_workers` | affinity-aware cores per rank, capped at 8 | Per-process, so it must be divided by the local rank count. |
+| `data.num_workers` | affinity-aware cores per rank, capped at `num_workers_auto_cap` (16) | Per-process, so it must be divided by the local rank count. |
 
 The multi-GPU and resume keys:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `effective_batch_size` | 64 | **The authority.** `gradient_accumulation_steps` is derived from it and the world size, and a combination that does not divide exactly is refused. 1 GPU at `16 x 4` and 2 at `16 x 2` are the same run. |
+| `effective_batch_size` | 64 | **The authority.** `gradient_accumulation_steps` is derived from it and the world size, and a combination that does not divide exactly is refused. 1 GPU at `64 x 1` and 2 at `32 x 1` are the same 64 images per step — but note that splitting *halves* what Sinkhorn and KoLeo estimate from, since both are per-micro-batch. |
 | `ddp.gradient_as_bucket_view` | true | Gradients alias DDP's buckets: one gradient's worth of memory back. |
 | `ddp.static_graph` | false | True in practice, but a wrong promise surfaces as a hang, not an error. |
 | `ddp.find_unused_parameters` | false (stage 1), true (stage 2) | Stage 2 needs it: under sparse dispatch an unrouted expert genuinely has no gradient. |

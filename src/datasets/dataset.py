@@ -801,8 +801,8 @@ def get_pretrain_dataloader(
             :class:`PretrainImageFolderDataset`. Silently ignored when workers
             would not share it (see below).
         same_photo_local_views: Replace this many local views with crops of
-            *other crops from the same source photograph* -- the F1 arm of
-            ``STAGE1_CHANGES.md``. ``0`` (the default) is plain DINO multi-crop
+            *other crops from the same source photograph* -- provenance-derived
+            positives. ``0`` (the default) is plain DINO multi-crop
             and is what every published number was produced under. Only the
             ``image_folder`` format carries the provenance needed for it.
         seed: Seeds the per-sample partner draw, so the pairing is a

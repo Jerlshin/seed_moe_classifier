@@ -1,10 +1,15 @@
 # Server run guide
 
-Verified locally before this pipeline was cleared for a server run: 344/344
-tests pass, `scripts/dry_run.py` completes cleanly, and a real 2-batch,
-1-epoch pass through both `main.py pretrain` and `main.py finetune` on the
-actual 9,357-image dataset produced `summary.json`, `test_predictions.npz` and
-a checkpoint with no NaN/Inf anywhere and no unhandled exceptions.
+Operating the pipeline on a rented or preemptible GPU box: sizing, the command
+sequence, what to watch in the first minutes of each stage, and what each failure
+mode looks like. [`README.md`](README.md) is the reasoning behind the configured
+values; this is how to run them somewhere that bills by the hour.
+
+Verified locally before each server run: the full test suite passes,
+`scripts/dry_run.py` completes cleanly, and a real 2-batch, 1-epoch pass through
+both `main.py pretrain` and `main.py finetune` on the actual 9,357-image dataset
+produces `summary.json`, `test_predictions.npz` and a checkpoint with no NaN/Inf
+anywhere and no unhandled exceptions.
 
 ---
 
@@ -35,7 +40,7 @@ Confirm the install:
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-python -m pytest tests/ -q          # expect all passing in ~8-15s on CPU
+python -m pytest tests/ -q          # 640 tests, no network, ~50s on CPU
 python scripts/dry_run.py           # synthetic pipeline, no dataset needed
 ```
 
@@ -117,7 +122,7 @@ any driver or torch upgrade.
 ```bash
 export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
 export SEED_OUTPUT_DIR=/workspace/outputs
-export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth"
+export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dino_pretrained_encoder.pth"
 mkdir -p "${SEED_OUTPUT_DIR}"
 ```
 
@@ -125,11 +130,11 @@ mkdir -p "${SEED_OUTPUT_DIR}"
 defaults (`/workspace/...`) if you don't export them yourself, and dispatches
 single- or multi-GPU depending on `GPUS`.
 
-### 3.2a The v2 pipeline, end to end
+### 3.2a The whole pipeline, end to end
 
-The current stage-1 recipe. [`STAGE1_V2.md`](STAGE1_V2.md) carries the reasoning
-and the measurements; this is the command sequence. The v1 commands in the rest
-of this section are unchanged and still reproduce every published number.
+The command sequence. Sections 3.3 onwards expand each step with what to watch
+and what the failure modes look like; [`README.md`](README.md) carries the
+reasoning and the measurement behind each configured value.
 
 ```bash
 export SEED_DATA_ROOT=/workspace/data/Hierarchical_SeedData/Cropped_Samples
@@ -137,9 +142,9 @@ export SEED_OUTPUT_DIR=/workspace/outputs
 mkdir -p "${SEED_OUTPUT_DIR}"
 
 # --- pre-flight, no GPU needed, ~3 minutes total ---------------------------
-python -m pytest tests/ -q                          # 644 tests
-python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
-python main.py pretrain-v2 \
+python -m pytest tests/ -q                          # 640 tests
+python main.py validate-data                        # corpus + view geometry + uncropped scenes
+python main.py pretrain \
     data.batch_size=4 data.num_workers=0 experiment.training.effective_batch_size=4 \
     experiment.training.epochs=2 experiment.training.max_batches=3 \
     'experiment.training.save_epochs=[1,2]' \
@@ -147,23 +152,23 @@ python main.py pretrain-v2 \
     model.backbone.pretrained=false device=cpu      # end-to-end on the real corpus
 
 # --- the reference the run must beat (no training) -------------------------
-python -m src.trainers.pretrain_eval experiment=eval_frozen_v2
+python main.py eval-frozen
 
 # --- stage 1 ---------------------------------------------------------------
-python main.py pretrain-v2 --gpus 2                 # ~50 epochs, probe may stop earlier
+python main.py pretrain --gpus 2                 # ~50 epochs, probe may stop earlier
 #   on a preemptible instance, the same line resumes:
-python main.py pretrain-v2 --gpus 2 experiment.training.resume=auto \
+python main.py pretrain --gpus 2 experiment.training.resume=auto \
     experiment.training.max_runtime_minutes=520
 
 # --- score the milestones, confirm the probe chose correctly ---------------
-python main.py eval-pretrain-v2
+python main.py eval-pretrain
 
 # --- stage 2, crop-level train / validation / test -------------------------
-export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dino_v2_swinv2_tiny.pth"
-python main.py finetune-v2 --gpus 2
+export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dino_pretrained_encoder.pth"
+python main.py finetune --gpus 2
 
 # --- the photograph-disjoint diagnostic, for the leakage delta -------------
-python -m src.trainers.moe_finetune experiment=finetune_v2_grouped_diagnostic
+python main.py finetune-grouped
 
 # --- the arms, if the budget allows ---------------------------------------
 python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
@@ -174,15 +179,15 @@ python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
 1. `Corpus size verified: 9357 images` — if this raises instead, the dataset root
    is wrong and the run stops before spending anything. That is the intent.
 2. `View geometry | local ... native px p5/p50/p95 = 493/1462/4704` — what the
-   augmentation is actually building. A local median near 600 means the v2 data
-   group did not take effect.
+   augmentation is actually building. A local median near 600 means an override
+   put DINO's reference crop ranges back.
 3. `deterministic-centre-crop fallback` under 15 % on the global views. Above it
    the trainer warns and names the fix (`crop_ratio`).
 4. `Representation probe ON | 9357 of 9357 images ... Probing at epochs: ...`
 5. `epoch/loop_blocked_fraction` under ~0.3 by the end of epoch 1. Above that the
    loader is the bottleneck; raise `data.num_workers`.
 
-**Where the artifacts land.** `${SEED_OUTPUT_DIR}/pretrain_v2_swinv2_tiny/` holds
+**Where the artifacts land.** `${SEED_OUTPUT_DIR}/pretrain_dino/` holds
 the milestones, `dino_best_encoder.pth` (the probe-selected weights, and what
 gets published) and `summary.json`. The Hydra run directory holds
 `events.jsonl`, `csv/` (seven wide CSVs including `probe_history.csv`,
@@ -203,10 +208,10 @@ substantial headroom on a 24 GB card;
 ```bash
 python main.py pretrain data.num_workers=16
 # equivalent to:
-python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
+python -m src.trainers.contrastive_pretrain experiment=pretrain_dino
 ```
 
-> **Set `data.num_workers` on a server.** The published 13.34-hour run carried
+> **Set `data.num_workers` on a server.** A measured 13.34-hour run carried
 > `data.num_workers=0` on a 48-physical-core host and spent a mean **91.6 %** of
 > its wall clock blocked in the dataloader. One sample costs six independent PIL
 > chains, so the loader — not the GPU — set the throughput. `auto` now caps at
@@ -217,27 +222,34 @@ python -m src.trainers.contrastive_pretrain experiment=pretrain_swinv2_dino
 > bottleneck is elsewhere and every cost estimate below has to be redone.
 
 Produces and publishes the **one** encoder checkpoint every downstream run
-reads: `${SEED_OUTPUT_DIR}/checkpoints/dinov2_swinv2_pretrained.pth`. Do not
+reads: `${SEED_OUTPUT_DIR}/checkpoints/dino_pretrained_encoder.pth`. Do not
 run this per-variant — every ablation and baseline that consumes it must start
 from byte-identical weights, or the comparison table partly measures
 self-supervised initialisation noise instead of the architecture change under
 test.
 
-**100 epochs** from ImageNet-1k weights on SwinV2-Tiny (27.58 M, 13.32
-GFLOPs/view — both measured), at a physical batch of 32 with accumulation 1.
-Budget for a multi-hour run on a single modern GPU; the trainer prints a
-compute/parameter budget at startup and again at the end, with measured and
-estimated quantities labelled apart.
+**50 epochs configured**, from ImageNet-1k weights on SwinV2-Tiny (27.58 M,
+13.32 GFLOPs/view — both measured), at a physical batch of 64 with accumulation 1
+— and the in-training representation probe may stop it earlier and will pick
+which epoch is published. Budget for a multi-hour run on a single modern GPU; the
+trainer prints a compute/parameter budget at startup and again at the end, with
+measured and estimated quantities labelled apart.
 
-Encoders are additionally kept at epochs **25, 50 and 100**
-(`dino_backbone_epoch_0025.pth` and friends, never pruned), so the question
-"did 100 epochs earn their cost over 25?" can be answered by pointing stage 2 at
-each in turn:
+Encoders are additionally kept at every epoch in
+`experiment.training.save_epochs` (`[5, 10, 15, 20, 25, 30, 40, 50]`, plus every
+probed epoch, never pruned), so "did epoch 50 earn its cost over epoch 25?" can be
+answered by pointing stage 2 at each in turn:
 
 ```bash
-SEED_PRETRAIN_BACKBONE=$SEED_OUTPUT_DIR/pretrain_swinv2_dino/dino_backbone_epoch_0025.pth \
+SEED_PRETRAIN_BACKBONE=$SEED_OUTPUT_DIR/pretrain_dino/dino_backbone_epoch_0025.pth \
     python main.py finetune
 ```
+
+That milestone set is ~11 epochs at ~231 MB each (**≈2.5 GB**) plus ~1 GB of
+rolling resume state. On a 16 GB root disk raise
+`experiment.training.probe.every_epochs` rather than trimming `save_epochs`, so
+the probe and the milestones stay in step — the probe cannot select an epoch
+whose weights were pruned.
 
 **Measure the batch before committing.** Physical batch is what Sinkhorn and
 KoLeo estimate from — accumulation averages gradients and buys those statistics
@@ -266,7 +278,9 @@ Step 1200 | epoch=10 batch=45 loss=5.67 | CE=5.67 = KL 0.29 + H 5.38 | ... loop_
   published run 80 % of the total loss drop was `H` falling and the final loss was
   94.8 % irreducible target entropy. **Read `KL`.** An arm that changes the
   centering moves `H` directly, so its raw loss is not comparable to another
-  arm's.
+  arm's. The probe curve in `csv/probe_history.csv` is what ranks the
+  checkpoints; on that same 100-epoch run the loss minimum was at epoch 90 while
+  the representation peaked at epoch 50.
 - `loop_blocked` is the share of wall clock the *loop* spent inside the
   dataloader. Nothing synchronises inside the step, so the queued GPU work drains
   during that window — it upper-bounds idleness rather than measuring it. For the
@@ -277,10 +291,12 @@ Step 1200 | epoch=10 batch=45 loss=5.67 | CE=5.67 = KL 0.29 + H 5.38 | ... loop_
 checkpoints: the resolved augmentation, the view geometry, the effective batch,
 the LR provenance, every objective-side flag, the final `KL`, and a **corpus
 fingerprint** — a SHA-256 over the sorted dataset-relative path list plus the
-sample, class and source-group counts. That last one exists because the published
+sample, class and source-group counts. That last one exists because an earlier
 encoder turned out to have been self-distilled on **8,173** crops while everything
 downstream used 9,357, with nothing on disk recording it. `eval-pretrain` reads
-the fingerprint back and prints a prominent mismatch line when the corpora differ.
+the fingerprint back and prints a prominent mismatch line when the corpora differ,
+and `data.expected_num_samples: 9357` makes the whole class of error fatal at
+startup instead.
 
 **On two GPUs**, and on any platform that ends the session before the run does:
 
@@ -298,18 +314,18 @@ all six views of a sample stay on the rank that owns it, because the loss pairs 
 student view against the teacher's output for that same image.
 
 The **effective batch does not change**. `data.batch_size` is per-rank, and
-`experiment.training.effective_batch_size` (32) derives the accumulation count
-from it and the world size — 1 GPU at `32 x 1` and 2 at `16 x 1` are the same 32
+`experiment.training.effective_batch_size` (64) derives the accumulation count
+from it and the world size — 1 GPU at `64 x 1` and 2 at `32 x 1` are the same 64
 images per optimizer step. A mismatch that does not divide exactly is refused
 rather than rounded.
 
-Note the trade that splitting makes, though: `16 x 2` keeps the *gradient*
-identical to `32 x 1` and halves what Sinkhorn and KoLeo estimate from, since
+Note the trade that splitting makes, though: `32 x 2` keeps the *gradient*
+identical to `64 x 1` and halves what Sinkhorn and KoLeo estimate from, since
 both are computed per micro-batch. If the second card has the memory, the
-statistically better use of it is `data.batch_size=32` on both ranks with
-`effective_batch_size=64` — a different, larger run — or
+statistically better use of it is `data.batch_size=64` on both ranks with
+`effective_batch_size=128` — a different, larger run — or
 `model.loss.distributed_sinkhorn=true`, which normalises over the concatenated
-global batch and restores the 32-image estimate exactly (a different objective
+global batch and restores the 64-image estimate exactly (a different objective
 from the single-GPU one, hence opt-in).
 
 `resume=auto` continues from the newest valid checkpoint and starts fresh when
@@ -350,15 +366,15 @@ reliable than being signalled, since not every platform signals first — and
 interval, which on a session-limited platform can exceed the whole session.
 
 Measure the batch geometry before committing. On 16 GB Turing cards the
-configured batch of 32 is the thing to check first:
+configured batch of 64 is the thing to check first:
 
 ```bash
-python scripts/bench_pretrain_step.py --find-batch-size 8,16,24,32
-python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 16
+python scripts/bench_pretrain_step.py --find-batch-size 16,24,32,48,64
+python scripts/bench_pretrain_step.py --scaling 1,2 --batch-size 32
 ```
 
-If 32 does not fit, lower both together (`data.batch_size=16
-experiment.training.effective_batch_size=16`) rather than raising accumulation.
+If 64 does not fit, lower both together (`data.batch_size=32
+experiment.training.effective_batch_size=32`) rather than raising accumulation.
 
 ### 3.3b Evaluate the stage-1 encoder before spending stage-2 compute
 
@@ -372,14 +388,14 @@ python main.py eval-pretrain
 
 Runs on a single device (there is no gradient to reduce, so `--gpus` is refused)
 and needs no network access **except** for the `imagenet_init` control, which asks
-timm for `swinv2_small_window16_256.ms_in1k`. On a box that will be offline later,
+timm for `swinv2_tiny_window16_256.ms_in1k`. On a box that will be offline later,
 warm the cache once while it has network:
 
 ```bash
-python -c "import timm; timm.create_model('swinv2_small_window16_256', pretrained=True)"
+python -c "import timm; timm.create_model('swinv2_tiny_window16_256', pretrained=True)"
 ```
 
-Those are the same weights stage 1 started from, so the download is ~200 MB once
+Those are the same weights stage 1 started from, so the download is ~110 MB once
 per machine. Without them the `imagenet_init` row — the control that measures the
 entire contribution of in-domain self-distillation — cannot be produced, and
 `experiment.evaluation.encoders` has to be overridden with a list that omits it.
@@ -389,19 +405,20 @@ CPU analysis, so ~25 minutes for the default five encoders. Features are cached
 under `outputs/eval_pretrain/features/`, so a re-run that only changes an analysis
 or a figure takes seconds.
 
-Read `outputs/eval_pretrain/tables/encoder_comparison.csv` first. The two rows that
-decide whether stage 1 earned its cost are `dino_epoch100` against
-`imagenet_init`; the two that decide whether the *epochs* earned theirs are
-`dino_epoch25`/`dino_epoch50` against `dino_epoch100`. Interpretation and the
-recommendations that follow: [`STAGE1_EVALUATION.md`](STAGE1_EVALUATION.md).
+Read `outputs/eval_pretrain/tables/encoder_comparison.csv` first. The two rows
+that decide whether stage 1 earned its cost are `dino_best` against
+`imagenet_init`; the rows that decide whether the *epochs* earned theirs are the
+numbered `dino_epoch*` milestones against `dino_best`. If `dino_best` is not the
+top milestone, the probe and the final report disagree and that is worth
+investigating before stage 2.
 
-Three columns added after the stage-1 audit, and what they are for:
+Three columns that are easy to skip and should not be:
 
 | Column | Read it as |
 | --- | --- |
-| `nuisance_photo_above_chance` | how much **photograph nuisance** survives, class held constant. The shipped run cut it from +10.0 pp (ImageNet) to +3.5 pp — the one axis stage 1 demonstrably moved. Read **jointly** with the readout: an encoder that discards everything scores chance |
-| `oof_probe_sub_accuracy_at_stage3` | the same headline probe at `layers.2` rather than the pooled output stage 2 consumes. `layers.2` scored +3.25 pp in the audit, and the ordering held for the plain ImageNet weights too |
-| the `handcrafted_floor` row | ten image statistics under the identical protocol. They reach 0.5360, which is 15.6 pp **above** an untrained 48.96 M trunk. A deep encoder that does not clear this comfortably is not doing much |
+| `nuisance_photo_above_chance` | how much **photograph nuisance** survives, class held constant. A measured in-domain run cut it from +10.0 pp (ImageNet) to +3.5 pp — the one axis stage 1 demonstrably moved. Read **jointly** with the readout: an encoder that discards everything scores chance |
+| `oof_probe_sub_accuracy_at_stage3` | the same headline probe at `layers.2` rather than the pooled output stage 2 consumes. `layers.2` scored +3.25 pp photograph-disjoint and +3.95 pp on the frozen Tiny trunk, and the ordering held for the plain ImageNet weights too |
+| the `handcrafted_floor` row | ten image statistics under the identical protocol. They reach 0.5360 photograph-disjoint, which is 15.6 pp **above** an untrained 48.96 M trunk. A deep encoder that does not clear this comfortably is not doing much |
 
 ### 3.3c Two screens that need no training at all
 
@@ -411,7 +428,8 @@ neither writes a checkpoint or touches the published handoff.
 ```bash
 # Which INITIALISATION transfers best? The evaluation's own decomposition is
 # random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO: the initialisation is
-# worth 79x what the 13.34-hour run bought, and was never treated as a variable.
+# worth 79x what a 13.34-hour in-domain run bought, and was never treated as a
+# variable.
 python main.py screen-backbones
 
 # The reference every stage-1 arm must beat: the chosen trunk, frozen, no
@@ -430,15 +448,16 @@ corpus. **Do not adopt Base before that row has run.**
 ### 3.3d Stage-1 arm suites
 
 ```bash
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --dry-run
-python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml     --experiment pretrain_swinv2_tiny_dino
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --dry-run
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/screens.yaml
+python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
 ```
 
 Each arm trains, then evaluates, into its own directory under
 `${SEED_OUTPUT_DIR}/stage1_arms/<arm>/`, with `experiment.training.save_path`,
 `shared_backbone_path` and `experiment.evaluation.save_path` **all** pinned per
 arm. That is the whole reason the script exists: left at their defaults, every arm
-publishes over `outputs/checkpoints/dinov2_swinv2_pretrained.pth` and the last one
+publishes over `outputs/checkpoints/dino_pretrained_encoder.pth` and the last one
 to finish silently becomes the encoder every stage-2 run reads.
 
 Do **not** shard arms across GPUs. A stage-1 arm saturates one device, so two
@@ -447,7 +466,8 @@ concurrent arms halve each other's throughput; use both devices *within* an arm
 
 The suite writes `stage1_arms/stage1_arm_results.csv` and prints the same table.
 Judge on `oof_probe_sub_accuracy_testable_classes` with the fold SD — a single arm
-cannot resolve a difference below ~2 pp, which is why Phase 3 exists.
+cannot resolve a difference below ~2 pp, which is why `--seeds 42 43 44` is what
+turns a ranking into a claim.
 
 ### 3.4 Stage 2 — single finetune run (smoke-test the head before the full suite)
 
@@ -560,20 +580,23 @@ background expecting them to race safely.
 
 | Hyperparameter | Value | Where |
 | --- | --- | --- |
-| `data.batch_size` | 16 | `conf/data/hierarchical_seeds.yaml` |
-| `data.image_size` | 256 | must match backbone window resolution |
-| Stage 1 `learning_rate` | 0.0005 | `conf/experiment/pretrain_swinv2_dino.yaml` |
-| Stage 1 `epochs` | 300 | — |
+| `data.batch_size` | 16 (stage 2); stage 1 raises it to **64** | `conf/data/hierarchical_seeds.yaml` |
+| `data.image_size` / `local_crop_size` | 256 / 160 | image size must match the backbone window resolution |
+| `data.expected_num_samples` | 9357 | a mismatch is **fatal at startup** |
+| `model.backbone.name` | `swinv2_tiny_window16_256` | `conf/model/backbone/swinv2.yaml` — **both stages read it** |
+| Stage 1 `learning_rate` | `null` -> derived `0.0005 x B_eff/256` = **1.25e-04** | `conf/experiment/pretrain_dino.yaml` |
+| Stage 1 `epochs` / `warmup_epochs` | 50 configured / 5 | the probe may stop it earlier |
+| Stage 1 `publish` | `best` — the probe picks the epoch | `final` is the pre-probe behaviour |
 | Stage 1 `clip_grad` | 3.0 | — |
-| Stage 1 `gradient_accumulation_steps` | 4 (effective batch 64) | — |
+| Stage 1 `gradient_accumulation_steps` | 1 (effective batch 64) | never trade physical batch for accumulation |
 | Stage 1 teacher momentum | 0.996 -> 1.0 (cosine) | — |
-| Stage 1 weight decay | 0.04 -> 0.4 (cosine) | — |
+| Stage 1 weight decay | 0.04 -> 0.4 (cosine), matrices only | — |
 | Stage 2 `learning_rate` | 0.0001 | `conf/experiment/finetune_hierarchical_moe.yaml` |
 | Stage 2 `epochs` | 100 | — |
 | Stage 2 `weight_decay` | 0.0001 | — |
 | Stage 2 `clip_grad` | 3.0 | — |
-| `split_protocol` | `grouped` (default) / `stratified` (submitted) | — |
-| `test_size` | 0.2 | — |
+| `split_protocol` | **`stratified`** (crop level, primary) / `grouped` / `grouped_cv` | the diagnostic is `experiment=finetune_grouped_diagnostic` |
+| `test_size` | 0.2 (0.0 under `grouped_cv`) | — |
 | `num_folds` | 1 (set >1 for `StratifiedGroupKFold`) | — |
 | `margin_warmup_fraction` | 0.15 | ArcFace margin ramps 0 -> m |
 | `router_noise_fraction` | 0.3 | gate noise anneals to 0 |
@@ -631,10 +654,10 @@ background expecting them to race safely.
 | LR sweep (optional) | `{1e-5, 3e-5, 1e-4}` for `resnet50`/`swin_tiny` | `--lr-sweep` flag |
 
 To reproduce the **submitted manuscript's** configuration point-for-point
-instead of the revision, chain the override table in `REVISION_NOTES.md` §0
-(e.g. `model.head.top_k=4 model.head.token_mode=pooled
-model.loss.moe_load_mode=entropy model.head.arcface_scale=30.0
-model.loss.cosine_mode=residual experiment.training.split_protocol=stratified`).
+instead of this revision, chain the override table in README.md's "Reproducing
+the submitted configuration" (e.g. `model.head.top_k=4
+model.head.token_mode=pooled model.loss.moe_load_mode=entropy
+model.head.arcface_scale=30.0 model.loss.cosine_mode=residual`).
 
 ---
 
@@ -648,11 +671,16 @@ uniformly without retraining anything:
 ```
 ${SEED_OUTPUT_DIR}/
   checkpoints/
-    dinov2_swinv2_pretrained.pth      # the ONE shared Stage-1 encoder
-  pretrain_swinv2_dino/
+    dino_pretrained_encoder.pth      # the ONE shared Stage-1 encoder
+  pretrain_dino/
+    dino_best_encoder.pth             # the probe-selected encoder (publish: best)
     dino_pretrained_final.pth
     dino_pretrained_backbone.pth
-    dino_checkpoint_epoch_XXXX.pth    # rolling, keep_last_n_checkpoints=1
+    dino_backbone_epoch_XXXX.pth      # milestones, never pruned
+    dino_resume_stepXXXX.pth          # rolling, keep_last_n_checkpoints=2
+    summary.json                      # recipe, corpus fingerprint, selection, budget
+  eval_frozen_reference/              # `main.py eval-frozen`, the no-training bar
+  eval_pretrain/                      # `main.py eval-pretrain`
   finetune_hierarchical_moe/          # `main.py finetune` (single run)
     summary.json
     test_predictions.npz
@@ -670,6 +698,7 @@ ${SEED_OUTPUT_DIR}/
   baselines/
     {model}/seed{42..46}/              # same contract as above
     suite_manifest.json
+  finetune_grouped_diagnostic/        # `main.py finetune-grouped`, the leakage delta
   reports/
     summary_metrics.csv               # Model/Variant, Accuracy, Precision, Recall,
                                        # Macro F1, Micro F1, KL Alignment Rate (%),

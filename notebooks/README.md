@@ -28,8 +28,9 @@ variable (see the module docstring in `run_baselines.py`). `tasks.md` and the
 stub notebook are kept here as the original design record, not as an open TODO.
 
 Note that `tasks.md` names **Amaranthus** as the third seed type, matching the
-paper; the dataset on disk has **Seasame**. See `PAPER_AUDIT.md` §7.2 — worth
-resolving before these results are written up.
+paper; the dataset on disk has **Seasame**. Worth resolving before these results
+are written up: the label set the code discovers comes from the directory tree,
+so the paper and the artifacts currently disagree on one seed type's name.
 
 ## Architecture ablations belong in `conf/`, not here
 

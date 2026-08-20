@@ -19,18 +19,18 @@ from tests.conftest import (
     FIRST_REVISION_DINO_OUT_DIM,
     LR_BASE,
     LR_REFERENCE_BATCH,
+    REVISED_BACKBONE,
     REVISED_BACKBONE_FEATURE_DIM,
-    SHIPPED_BACKBONE,
-    SHIPPED_BACKBONE_FEATURE_DIM,
     REVISED_DINO_BOTTLENECK_DIM,
     REVISED_DINO_HEAD_LAYERS,
     REVISED_DINO_HIDDEN_DIM,
     REVISED_DROP_PATH_RATE,
-    REVISED_EFFECTIVE_BATCH,
-    REVISED_EPOCHS,
-    REVISED_LEARNING_RATE,
-    REVISED_LR_WARMUP_EPOCHS,
-    REVISED_PHYSICAL_BATCH,
+    STAGE1_EFFECTIVE_BATCH,
+    STAGE1_EPOCHS,
+    STAGE1_LEARNING_RATE,
+    STAGE1_PHYSICAL_BATCH,
+    STAGE1_SAVE_EPOCHS,
+    STAGE1_WARMUP_EPOCHS,
     SUBMITTED_BACKBONE_FEATURE_DIM,
     SUBMITTED_EPOCHS,
     REVISED_CENTER_MOMENTUM,
@@ -44,6 +44,10 @@ from tests.conftest import (
     PAPER_CLIP_GRAD,
     SUBMITTED_DINO_OUT_DIM,
     PAPER_EMBED_DIM,
+    CANONICAL_CROP_RATIO,
+    CANONICAL_GLOBAL_CROPS_SCALE,
+    CANONICAL_LOCAL_CROPS_SCALE,
+    CANONICAL_LOCAL_CROP_SIZE,
     PAPER_LOCAL_CROPS,
     PAPER_NUM_EXPERTS,
     PAPER_NUM_SEED_TYPES,
@@ -79,7 +83,7 @@ def build(conf_dir: str, *overrides: str):
 
 @pytest.fixture
 def pretrain_cfg(conf_dir):
-    return build(conf_dir, "experiment=pretrain_swinv2_dino")
+    return build(conf_dir, "experiment=pretrain_dino")
 
 
 @pytest.fixture
@@ -94,36 +98,26 @@ def finetune_cfg(conf_dir):
 #: nothing composes until someone launches a suite against it, which is the
 #: worst moment to discover a dangling interpolation.
 ALL_EXPERIMENTS = [
-    "pretrain_swinv2_dino",
-    "pretrain_swinv2_base_dino",
-    # Stage-1 trunk options. `screen_backbones` decides between them on measured
-    # transfer rather than on capacity; until it has run, neither is adopted.
-    "pretrain_swinv2_tiny_dino",
-    "pretrain_swinv2_base_in22k_dino",
-    "eval_pretrain_representation",
-    # Phase-0 screening and the frozen-trunk reference. Neither trains anything;
-    # both must still compose, because the failure mode of a dangling
-    # interpolation is discovering it when a suite launches.
-    "screen_backbones",
+    # The canonical path, in the order a run walks it.
     "eval_frozen_reference",
-    "control_imagenet_frozen",
+    "pretrain_dino",
+    "eval_pretrain",
     "finetune_hierarchical_moe",
+    # Stage-1 trunk controls. `screen_backbones` decides between them on measured
+    # transfer rather than on capacity; until it has run, neither is adopted.
+    "pretrain_dino_base",
+    "pretrain_dino_base_in22k",
+    "screen_backbones",
+    # Off the primary path, and all of them must still compose -- the failure
+    # mode of a dangling interpolation is discovering it when a suite launches.
+    "finetune_grouped_diagnostic",
+    "control_imagenet_frozen",
     "ablation_flat_classifier",
     "baseline_resnet50",
     "baseline_swin_tiny",
     "baseline_hierarchical_cce",
     "baseline_linear_probe",
     "baseline_swinv2_supervised",
-    # The v2 pipeline: SwinV2-Tiny, the redesigned view geometry, and crop-level
-    # stratified splitting downstream. `eval_frozen_v2` is the reference the
-    # stage-1 arms must clear and `finetune_v2_grouped_diagnostic` is the
-    # photograph-disjoint counterpart kept for the leakage delta -- neither is on
-    # the primary path, and both must still compose.
-    "pretrain_v2_swinv2_tiny",
-    "eval_pretrain_v2",
-    "eval_frozen_v2",
-    "finetune_v2_crop_level",
-    "finetune_v2_grouped_diagnostic",
 ]
 
 
@@ -190,20 +184,21 @@ def test_dino_pretraining_keeps_the_table_1_values_it_should(pretrain_cfg):
 
 
 def test_stage_one_starts_from_imagenet_and_trains_the_trunk(pretrain_cfg):
-    """ImageNet -> SwinV2-Small -> DINO fine-tuning, not ImageNet feature extraction.
+    """ImageNet -> SwinV2-Tiny -> DINO fine-tuning, not ImageNet feature extraction.
 
     ``freeze=false`` is the assertion that matters. Stage 1 with a frozen trunk
     fits the projection head to fixed features and publishes an unadapted
     encoder, and nothing in the loss curve would say so -- which is why
     ``build_dino`` refuses it outright rather than trusting this config.
 
-    The trunk is ``SHIPPED_BACKBONE`` (Small), not ``REVISED_BACKBONE`` (Tiny):
-    the config moved to Small and the published 100-epoch checkpoint is a Small.
-    Asserting the Tiny name here would make the *test* the thing that is wrong.
+    The trunk comes from the shared ``model/backbone`` group rather than from
+    this experiment, which is what makes it impossible for stage 2 to compose a
+    different depth from the encoder stage 1 published -- silent under
+    ``checkpoint_strict: false``, and fatal to every number downstream.
     """
     backbone = pretrain_cfg.model.backbone
-    assert backbone.name == SHIPPED_BACKBONE
-    assert backbone.feature_dim == SHIPPED_BACKBONE_FEATURE_DIM
+    assert backbone.name == REVISED_BACKBONE
+    assert backbone.feature_dim == REVISED_BACKBONE_FEATURE_DIM
     assert backbone.pretrained is True
     assert backbone.freeze is False
     assert backbone.drop_path_rate == pytest.approx(REVISED_DROP_PATH_RATE)
@@ -219,7 +214,7 @@ def test_stage_two_backbone_defaults_keep_the_checkpoint_path(finetune_cfg):
     backbone = finetune_cfg.model.backbone
     assert backbone.pretrained is False
     assert backbone.freeze is True
-    assert "dinov2_swinv2_pretrained.pth" in str(backbone.checkpoint_path)
+    assert "dino_pretrained_encoder.pth" in str(backbone.checkpoint_path)
 
 
 def test_frozen_imagenet_control_is_the_lower_arm_of_the_stage_one_comparison(conf_dir):
@@ -243,8 +238,8 @@ def test_frozen_imagenet_control_is_the_lower_arm_of_the_stage_one_comparison(co
 
 def test_base_capacity_control_changes_only_the_trunk(conf_dir):
     """SwinV2-Base at the identical recipe, publishing to its own path."""
-    cfg = build(conf_dir, "experiment=pretrain_swinv2_base_dino")
-    reference = build(conf_dir, "experiment=pretrain_swinv2_dino")
+    cfg = build(conf_dir, "experiment=pretrain_dino_base")
+    reference = build(conf_dir, "experiment=pretrain_dino")
     OmegaConf.resolve(cfg)
     OmegaConf.resolve(reference)
 
@@ -265,26 +260,37 @@ def test_base_capacity_control_changes_only_the_trunk(conf_dir):
 
 
 def test_stage_one_duration_and_milestones(pretrain_cfg):
-    """100 epochs, with 25/50/100 kept permanently so the length can be ablated."""
+    """50 epochs, densely milestoned, with the budget decided by the probe.
+
+    Milestones are named artifacts with no rolling prefix, so `keep_last_n` never
+    prunes them -- which is the only reason "did epoch 50 earn its cost over 25"
+    is answerable after the run. The probe additionally forces every epoch it
+    scores into this list, because a best epoch whose weights were pruned is not
+    selectable.
+    """
     training = pretrain_cfg.experiment.training
-    assert training.epochs == REVISED_EPOCHS
+    assert training.epochs == STAGE1_EPOCHS
     assert training.epochs < SUBMITTED_EPOCHS
-    assert list(training.save_epochs) == [25, 50, 100]
+    assert list(training.save_epochs) == STAGE1_SAVE_EPOCHS
     assert max(training.save_epochs) == training.epochs
     # The rolling series must not fight the milestones for `keep_last_n`.
     assert training.save_interval == 0
+    # The probe, not the loss, ranks the checkpoints -- and `publish: best` is
+    # what makes that decision reach stage 2 instead of only the log.
+    assert training.probe.enabled is True
+    assert training.publish == "best"
 
 
 def test_physical_batch_is_preferred_to_accumulation(pretrain_cfg):
     """Sinkhorn and KoLeo are per-micro-batch, so accumulation cannot stand in.
 
-    The submitted 16x4 and this 32x1 have the same effective batch and are not
-    the same run: the former gives four 16-sample assignments where the latter
-    gives one 32-sample assignment.
+    The submitted 16x4 and this 64x1 do not even share an effective batch, but
+    the point stands at a fixed one: 16x4 gives four 16-sample assignments where
+    64x1 gives one 64-sample assignment.
     """
     training = pretrain_cfg.experiment.training
-    assert pretrain_cfg.data.batch_size == REVISED_PHYSICAL_BATCH
-    assert training.effective_batch_size == REVISED_EFFECTIVE_BATCH
+    assert pretrain_cfg.data.batch_size == STAGE1_PHYSICAL_BATCH
+    assert training.effective_batch_size == STAGE1_EFFECTIVE_BATCH
     assert training.gradient_accumulation_steps == 1
     # Single GPU: effective batch / (micro x world) must be exactly 1.
     assert training.effective_batch_size == pretrain_cfg.data.batch_size
@@ -293,7 +299,7 @@ def test_physical_batch_is_preferred_to_accumulation(pretrain_cfg):
 def test_learning_rate_is_derived_from_the_effective_batch(pretrain_cfg):
     """Section 6.1's 0.0005 is DINO's rate at batch 256, not at this batch.
 
-    Quoting it verbatim next to batch 32 is an 8x overstatement of the step
+    Quoting it verbatim next to batch 64 is a 4x overstatement of the step
     size, and a literal rate is also immune to every knob that moves the batch.
     The config therefore leaves `learning_rate` null and the trainer derives it.
     """
@@ -307,23 +313,23 @@ def test_learning_rate_is_derived_from_the_effective_batch(pretrain_cfg):
     assert training.lr_scaling == "linear"
 
     resolved, provenance = resolve_learning_rate(
-        pretrain_cfg, REVISED_EFFECTIVE_BATCH, logging.getLogger("test")
+        pretrain_cfg, STAGE1_EFFECTIVE_BATCH, logging.getLogger("test")
     )
-    assert resolved == pytest.approx(REVISED_LEARNING_RATE)
-    assert resolved == pytest.approx(6.25e-05)
+    assert resolved == pytest.approx(STAGE1_LEARNING_RATE)
+    assert resolved == pytest.approx(1.25e-04)
     assert provenance["rule"] == "linear"
 
     # Doubling the batch doubles the rate; that is the whole point.
     doubled, _ = resolve_learning_rate(
-        pretrain_cfg, 2 * REVISED_EFFECTIVE_BATCH, logging.getLogger("test")
+        pretrain_cfg, 2 * STAGE1_EFFECTIVE_BATCH, logging.getLogger("test")
     )
     assert doubled == pytest.approx(2 * resolved)
 
 
 def test_learning_rate_warmup_is_configured(pretrain_cfg):
-    """10 epochs of linear warmup; the submitted configuration had none."""
+    """5 epochs of linear warmup -- 10 % of the budget; the paper had none."""
     training = pretrain_cfg.experiment.training
-    assert training.warmup_epochs == REVISED_LR_WARMUP_EPOCHS
+    assert training.warmup_epochs == STAGE1_WARMUP_EPOCHS
     assert training.warmup_epochs < training.epochs
     assert training.scheduler.name == "cosine"
     # null t_max means `epochs - warmup_epochs`, so the cosine finishes with the
@@ -420,29 +426,69 @@ def test_dino_head_normalisation_decouples_teacher_from_student(pretrain_cfg):
     assert pretrain_cfg.model.head.use_batch_norm in {"layer", "none"}
 
 
-def test_multi_crop_configuration_matches_table_1(pretrain_cfg):
+def test_multi_crop_view_counts_match_table_1_and_the_scales_do_not(pretrain_cfg):
+    """2 global + 4 local views, at crop ranges sized for a 52 x 51 px source.
+
+    The view *counts* are the paper's and are not negotiable -- the loss's
+    cross-view pairing is written against them. The *scales* deliberately are
+    not: `scale` is a fraction of the SOURCE area, and on ImageNet the source is
+    a scene while here it is already one seed, so DINO's (0.05, 0.40) builds a
+    local view from a median 598 native pixels (0.91 % real content) rather than
+    from a recognisable object part.
+
+    `conf/stage1_arms/view_design.yaml`'s `wo_view_redesign` arm is the control
+    that measures what the change bought, and it restores exactly the three
+    values asserted here as submitted.
+    """
     augmentation = pretrain_cfg.data.augmentation
     assert augmentation.local_crops_number == PAPER_LOCAL_CROPS
-    assert list(augmentation.global_crops_scale) == [0.4, 1.0]
-    assert list(augmentation.local_crops_scale) == [0.05, 0.4]
+    assert list(augmentation.global_crops_scale) == CANONICAL_GLOBAL_CROPS_SCALE
+    assert list(augmentation.local_crops_scale) == CANONICAL_LOCAL_CROPS_SCALE
+    assert pretrain_cfg.data.local_crop_size == CANONICAL_LOCAL_CROP_SIZE
+    # Not a paper knob at all: without it, raising the scale floor pushes 22 % of
+    # global draws into torchvision's deterministic centre crop.
+    assert list(augmentation.crop_ratio) == CANONICAL_CROP_RATIO
 
 
-def test_augmentation_probabilities_match_section_6_1(pretrain_cfg):
-    """Blur p=1.0 / p=0.1 / p=0.5 and solarization p=0.2."""
+def test_blur_is_symmetric_across_the_three_view_families(pretrain_cfg):
+    """Section 6.1's 1.0 / 0.1 / 0.5 asymmetry is a second view-family cue.
+
+    The asymmetry is what makes the teacher's two globals genuinely different,
+    which is signal -- but it also *identifies* which family a view came from, on
+    top of the resolution artefact the local views already carry, and the student
+    can satisfy part of Eq. 1 by detecting the family and predicting its marginal
+    instead of learning the correspondence. Symmetric probabilities remove that.
+
+    Solarization is off for a different reason: it inverts a colour cue that is
+    class signal here (mean RGB alone scores 0.3169 on the 27-way task).
+    """
     augmentation = pretrain_cfg.data.augmentation
-    assert augmentation.global_blur_prob_1 == pytest.approx(1.0)
-    assert augmentation.global_blur_prob_2 == pytest.approx(0.1)
+    assert augmentation.global_blur_prob_1 == pytest.approx(0.5)
+    assert augmentation.global_blur_prob_2 == pytest.approx(0.5)
     assert augmentation.local_blur_prob == pytest.approx(0.5)
-    assert augmentation.solarization_prob == pytest.approx(0.2)
+    assert augmentation.solarization_prob == pytest.approx(0.0)
 
 
-def test_color_jitter_magnitudes_match_section_6_1(pretrain_cfg):
-    """"brightness +/-0.4, contrast +/-0.4, saturation +/-0.2, hue +/-0.1"."""
+def test_color_jitter_is_split_by_what_it_attacks(pretrain_cfg):
+    """Illumination is nuisance and stays; pigmentation is signal and is cut.
+
+    Section 6.1 specifies brightness +/-0.4, contrast +/-0.4, saturation +/-0.2,
+    hue +/-0.1. Brightness and contrast are illumination, which is genuine
+    photograph-specific nuisance, so they are unchanged. Saturation and hue are
+    pigmentation, which is class signal on this dataset -- +/-0.1 hue is +/-36
+    degrees of the hue circle -- so they are cut, and grayscale (which deletes
+    the cue outright) goes to zero.
+
+    `wo_colour_policy` in `conf/stage1_arms/view_design.yaml` restores all four
+    and is the control; judge it on the per-class F1 of the confusable pairs, not
+    on a mean over 27 classes.
+    """
     augmentation = pretrain_cfg.data.augmentation
     assert augmentation.color_jitter_brightness == pytest.approx(0.4)
     assert augmentation.color_jitter_contrast == pytest.approx(0.4)
-    assert augmentation.color_jitter_saturation == pytest.approx(0.2)
-    assert augmentation.color_jitter_hue == pytest.approx(0.1)
+    assert augmentation.color_jitter_saturation == pytest.approx(0.1)
+    assert augmentation.color_jitter_hue == pytest.approx(0.02)
+    assert augmentation.grayscale_prob == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------- paper: Section 5
@@ -522,7 +568,7 @@ def test_all_variants_share_one_pretrained_encoder(conf_dir):
                            "baseline_hierarchical_cce")
     }
     assert len(paths) == 1
-    assert "dinov2_swinv2_pretrained.pth" in str(paths.pop())
+    assert "dino_pretrained_encoder.pth" in str(paths.pop())
 
 
 def test_head_uses_the_paper_variants_by_default(finetune_cfg):
@@ -581,9 +627,31 @@ def test_hierarchy_kl_is_decoupled_from_the_arcface_scale(finetune_cfg):
     assert loss.detach_kl_seed_target is True
 
 
-def test_split_protocol_defaults_to_group_aware(finetune_cfg):
-    """9,357 crops from 81 photographs: crop-level splitting is not a neutral choice."""
-    assert finetune_cfg.experiment.training.split_protocol == "grouped"
+def test_the_primary_split_is_crop_level_and_the_diagnostic_is_not(conf_dir, finetune_cfg):
+    """Crop-level is the primary protocol, and its cost is measured, not hidden.
+
+    9,357 crops come from 81 photographs, so crop-level splitting puts
+    near-duplicate views of the same physical seeds on both sides: measured on an
+    identical frozen encoder and probe, the crop-level 27-way accuracy sits
+    +18.65 pp above the photograph-disjoint one. That is a real effect and the
+    reason `finetune_grouped_diagnostic` exists -- the same configuration under
+    `grouped_cv`, so the delta is a property of THIS encoder rather than a figure
+    quoted from another one.
+
+    `grouped_cv` rather than `grouped` for the diagnostic: `grouped`'s
+    `GroupShuffleSplit` is unstratified over 81 photographs, so its test side
+    holds 14 of 27 classes and a 27-way macro-F1 on it is capped near 14/27.
+    """
+    assert finetune_cfg.experiment.training.split_protocol == "stratified"
+
+    diagnostic = build(conf_dir, "experiment=finetune_grouped_diagnostic")
+    assert diagnostic.experiment.training.split_protocol == "grouped_cv"
+    assert diagnostic.experiment.training.num_folds > 1
+    # Different save paths, or the diagnostic overwrites the headline run.
+    assert (
+        diagnostic.experiment.training.save_path
+        != finetune_cfg.experiment.training.save_path
+    )
 
 
 def test_stage_two_augmentation_is_not_empty(finetune_cfg):

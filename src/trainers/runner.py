@@ -41,7 +41,7 @@ from typing import Callable, Sequence
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 #: Where the pretrain stage publishes the encoder every downstream run reuses.
-DEFAULT_PRETRAINED_CHECKPOINT = "checkpoints/dinov2_swinv2_pretrained.pth"
+DEFAULT_PRETRAINED_CHECKPOINT = "checkpoints/dino_pretrained_encoder.pth"
 
 
 def output_root() -> Path:

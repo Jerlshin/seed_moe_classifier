@@ -68,7 +68,15 @@ def parse_args() -> argparse.Namespace:
         default=[
             str(root / "ablations"),
             str(root / "baselines"),
+            str(root / "controls"),
             str(root / "finetune_hierarchical_moe"),
+            # The photograph-disjoint diagnostic. It appears in the table with
+            # its own `group`, and it is the one row McNemar is NOT run against
+            # `full_model` for -- it does not share the primary test split, and
+            # it estimates the recipe (K models contributed out-of-fold
+            # predictions) rather than a single trained model. The pairing check
+            # (`no variant shares its sample count`) refuses it on its own.
+            str(root / "finetune_grouped_diagnostic"),
         ],
         help="Directories to scan for summary.json files.",
     )

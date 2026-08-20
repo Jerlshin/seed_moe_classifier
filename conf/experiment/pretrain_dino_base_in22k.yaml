@@ -1,0 +1,45 @@
+# @package _global_
+#
+# Stage-1 CORPUS CONTROL: the canonical recipe on the ImageNet-22k SwinV2-Base
+# trunk.
+#
+#   python -m src.trainers.contrastive_pretrain experiment=pretrain_dino_base_in22k
+#
+# This is a CORPUS change, not a capacity change, and the distinction is the
+# whole point. `pretrain_dino_base` is the capacity control: same IN-1k corpus,
+# more parameters. This file changes the *pretraining corpus* of the
+# initialisation to ImageNet-22k, which the frozen screen measured as worth
+# +2.24 pp on the photograph-disjoint readout over an in-domain self-distilled
+# encoder -- with zero in-domain training, against that run's +0.58 pp.
+#
+# ** Do not adopt this trunk before running `python main.py screen-backbones`. **
+# That screen includes `swinv2_base_window16_256.ms_in1k`, the control that
+# separates the two explanations. If IN-1k Base also scores ~0.63 the effect was
+# capacity, and Tiny is then the efficient choice; only if it scores ~0.61 is the
+# effect the corpus, and only then is this file the right trunk.
+#
+# The open question this trunk exists to answer: a frozen IN-22k trunk already
+# reaches the level a full in-domain DINO run reached, so does self-distillation
+# add anything ON TOP of a strong prior, on 81 scenes? Run it against the
+# `frozen` arm of `conf/stage1_arms/view_design.yaml` -- the same trunk, frozen,
+# no training -- as the first comparison.
+#
+# Cost is ~1.8x Small per view, i.e. ~3.3x this pipeline's Tiny trunk.
+
+defaults:
+  - pretrain_dino
+
+experiment:
+  name: "pretrain_dino_base_in22k"
+
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/pretrain_dino_base_in22k"
+    shared_backbone_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/checkpoints/dino_pretrained_encoder_base_in22k.pth"
+
+model:
+  backbone:
+    # IN-22k -> IN-1k. Same window16_256 geometry, so the 8x8 final-stage token
+    # grid stage 2's routing consumes is unchanged; only the width moves, and the
+    # Eq. 4 projection absorbs that.
+    name: "swinv2_base_window12to16_192to256.ms_in22k_ft_in1k"
+    feature_dim: 1024

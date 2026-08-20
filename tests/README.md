@@ -1,7 +1,7 @@
 # `tests/` — pytest suite
 
 ```bash
-python -m pytest tests/ -q             # all 518, ~95s
+python -m pytest tests/ -q             # all 640, ~50s
 python -m pytest tests/ -k arcface     # one topic
 python -m pytest tests/test_models.py  # one file
 ```
@@ -28,6 +28,9 @@ No network access, no weight downloads, no dependency on the real dataset.
 | `test_distributed.py` | DDP gradient equality, distributed Sinkhorn, shared EMA centre, wrapper prefixes |
 | `test_checkpointing.py` | Exact resume, atomic writes, RNG round-trip, latest-valid discovery |
 | `test_precision.py` | AMP dtype selection, fp32 pinning, capability probing, reproducibility |
+| `test_stage1_recipe.py` | Stage-1 initialisation, schedules, weight-decay groups, budget, handoff — with the trunk's params/FLOPs re-measured rather than quoted |
+| `test_stage1_correctness.py` | Stage-1 behaviours that were wrong or unmeasurable before they were fixed: KoLeo scope, loss decomposition, corpus provenance, split reporting, arm hygiene |
+| `test_stage1_pipeline.py` | View geometry, losslessness of the dihedral group and the native-pixel floor, the crop-level protocol in both stages, and the machine-readable artifacts |
 
 ## Paper constants are the fixtures
 
@@ -175,11 +178,10 @@ something the paper states, quote the sentence in the docstring — that is what
 makes a future failure diagnosable as drift rather than as flakiness. If it
 asserts something the *revision* changed, say so and name the constant.
 
-## `test_stage1_changes.py`
+## `test_stage1_correctness.py`
 
-Every test in this module pins a behaviour the stage-1 audit
-(`STAGE1_CHANGES.md`) found either **wrong** or **unmeasurable**, and the
-distinction matters when one fails:
+Every test in this module pins a stage-1 behaviour that was either **wrong** or
+**unmeasurable** before it was fixed, and the distinction matters when one fails:
 
 - A **KoLeo** or **loss-decomposition** failure is a regression of a *correctness*
   fix. The pre-audit behaviour is still reachable behind a flag, so a failure here
@@ -224,10 +226,11 @@ depended on the old ordering now derive their expectations from
 `SUBVARIETY_COUNTS` rather than restating them as literals, so the two cannot
 agree with each other and disagree with production again.
 
-## `test_stage1_v2.py`
+## `test_stage1_pipeline.py`
 
-The v2 stage-1 pipeline ([`STAGE1_V2.md`](../STAGE1_V2.md)). Grouped by the claim
-each test defends, because a failure means something different in each group:
+The stage-1 pipeline as a whole: view geometry, losslessness, protocol and the
+machine-readable artifacts. Grouped by the claim each test defends, because a
+failure means something different in each group:
 
 | Group | What it pins | What a failure means |
 | --- | --- | --- |
@@ -235,8 +238,8 @@ each test defends, because a failure means something different in each group:
 | **Losslessness** | `RandomRotation90` preserves the pixel multiset exactly; `min_native_pixels: 0` is a plain `RandomResizedCrop` bit for bit | An augmentation that was admissible because it destroys nothing now destroys something — and the floor arm stopped being single-factor |
 | **CSV artifacts** | The metric file stays rectangular when the schema grows mid-run; a genuine NaN survives and an absent value is empty; prefixes route to separate files with the right index column | The machine-readable trace stopped being loadable, which is the entire reason it is written |
 | **Probe and selection** | The readout reports both heads and the gap; RankMe detects dimensional collapse; the selector picks epoch 50 out of 25/50/75/100 replayed with the shipped run's real numbers, honours `min_delta`, never selects a NaN, and publishes atomically | The mechanism that chooses which encoder ships |
-| **Protocol** | Both v2 stages split at crop level; the corpus size is declared and the check is fatal; the colour policy preserves pigmentation and jitters illumination; KoLeo is per-view and on the shipped space | The pipeline stopped doing what it says |
-| **Arm hygiene** | Every ablation arm moves exactly one config subtree, `V2-FULL` overrides nothing, and every arm states a hypothesis | An arm's number stopped being attributable to one factor |
+| **Protocol** | Both stages split at crop level; the corpus size is declared and the check is fatal; the colour policy preserves pigmentation and jitters illumination; KoLeo is per-view and on the published space | The pipeline stopped doing what it says |
+| **Arm hygiene** | Every ablation arm moves exactly one config subtree, `full` overrides nothing, and every arm states a hypothesis | An arm's number stopped being attributable to one factor |
 
 Two of these deserve the emphasis:
 
@@ -246,8 +249,7 @@ selector picks epoch 50. That run went to 100 and published epoch 100, so this
 test is the regression guard on a mistake that actually cost half a training
 budget.
 
-`test_widening_the_aspect_range_cuts_the_deterministic_fallback` pins the one
-place the implementation **departs from** `STAGE1_CHANGES.md`. C1 proposes the
-narrower crop scales and does not mention the aspect range; measured, that costs
-a 22.0 % deterministic-centre-crop rate on the global views because 96.6 % of
-these crops are non-square. The test is why `crop_ratio` exists.
+`test_widening_the_aspect_range_cuts_the_deterministic_fallback` pins why
+`crop_ratio` is a config key. Narrowing the crop scales without widening the
+aspect range costs a 22.0 % deterministic-centre-crop rate on the global views,
+because 96.6 % of these crops are non-square.

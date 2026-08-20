@@ -1,7 +1,7 @@
-"""Tests for the STAGE1_CHANGES.md implementation.
+"""Stage-1 correctness and provenance.
 
-Every test here pins a behaviour the stage-1 audit found either **wrong** or
-**unmeasurable**, and the distinction matters when one fails:
+Every test here pins a behaviour that was either **wrong** or **unmeasurable**
+before it was fixed, and the distinction matters when one fails:
 
 * A KoLeo or loss-decomposition failure is a regression of a *correctness* fix.
   The old behaviour is still reachable behind a flag, so a test failing here
@@ -10,8 +10,8 @@ Every test here pins a behaviour the stage-1 audit found either **wrong** or
   the model changes, but a number becomes uninterpretable -- which is how the
   shipped encoder came to be trained on 8,173 of 9,357 crops with no record.
 
-The file is deliberately organised by the audit's own section letters, so a
-failure names the item it belongs to.
+The file is organised by topic, and each section header names the invariant its
+tests defend, so a failure names the item it belongs to.
 """
 
 from __future__ import annotations
@@ -155,12 +155,18 @@ def test_the_default_scope_is_the_fixed_one():
     assert loss.koleo_reduction == "mean"
 
 
-def test_the_shipped_config_selects_per_view_koleo(conf_dir):
+def test_the_canonical_config_selects_per_view_koleo_on_the_published_space(conf_dir):
+    """Per view, and on the trunk feature -- the only space stage 2 ever sees.
+
+    `all_views` is the anti-alignment failure and stays reachable as a control;
+    `bottleneck` regularises the head's 256-D space, which is discarded at the
+    end of stage 1, and is the `koleo_bottleneck` arm.
+    """
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=pretrain_swinv2_dino")
+    cfg = build(conf_dir, "experiment=pretrain_dino")
     assert cfg.model.loss.koleo_scope == "per_view"
-    assert cfg.model.loss.koleo_space == "bottleneck"
+    assert cfg.model.loss.koleo_space == "backbone"
     assert cfg.model.loss.lambda_koleo > 0
 
 
@@ -494,12 +500,12 @@ def test_pickle_batches_refuses_provenance_positives(tmp_path):
 def test_match_view_lowpass_is_a_real_config_key(conf_dir):
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=pretrain_swinv2_dino")
+    cfg = build(conf_dir, "experiment=pretrain_dino")
     assert cfg.data.augmentation.match_view_lowpass is False
     # The documented override must compose without a `+`.
     overridden = build(
         conf_dir,
-        "experiment=pretrain_swinv2_dino",
+        "experiment=pretrain_dino",
         "data.augmentation.match_view_lowpass=true",
     )
     assert overridden.data.augmentation.match_view_lowpass is True
@@ -508,12 +514,12 @@ def test_match_view_lowpass_is_a_real_config_key(conf_dir):
 def test_same_photo_local_views_is_a_real_config_key(conf_dir):
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=pretrain_swinv2_dino")
+    cfg = build(conf_dir, "experiment=pretrain_dino")
     assert cfg.data.augmentation.same_photo_local_views == 0
     assert (
         build(
             conf_dir,
-            "experiment=pretrain_swinv2_dino",
+            "experiment=pretrain_dino",
             "data.augmentation.same_photo_local_views=2",
         ).data.augmentation.same_photo_local_views
         == 2
@@ -529,7 +535,7 @@ def test_the_augmentation_node_still_builds_the_transform(conf_dir):
 
     cfg = build(
         conf_dir,
-        "experiment=pretrain_swinv2_dino",
+        "experiment=pretrain_dino",
         "data.augmentation.same_photo_local_views=3",
     )
     transform = get_dino_transforms(
@@ -615,7 +621,7 @@ def test_feature_stage_defaults_to_final_everywhere(conf_dir):
     """Every published number was produced under `final`; the default must not move."""
     from tests.test_configs import build
 
-    for experiment in ("finetune_hierarchical_moe", "pretrain_swinv2_dino"):
+    for experiment in ("finetune_hierarchical_moe", "pretrain_dino"):
         cfg = build(conf_dir, f"experiment={experiment}")
         assert cfg.model.backbone.feature_stage == "final"
 
@@ -751,12 +757,24 @@ def test_every_split_reports_how_many_classes_the_test_side_holds(grouped_datase
     assert 0 <= report["classes_present_in_test"] <= report["num_classes"]
 
 
-def test_the_default_protocol_is_unchanged(conf_dir):
-    """`grouped_cv` is opt-in: every published stage-2 number used `grouped`."""
+def test_the_photograph_disjoint_protocols_stay_reachable(conf_dir):
+    """The primary split is crop-level, and both grouped protocols remain one override away.
+
+    `split_dataset` is the only thing that decides this, so a protocol that
+    stopped composing would be discovered by a suite launch rather than here.
+    """
     from tests.test_configs import build
 
     cfg = build(conf_dir, "experiment=finetune_hierarchical_moe")
-    assert cfg.experiment.training.split_protocol == "grouped"
+    assert cfg.experiment.training.split_protocol == "stratified"
+
+    for protocol in ("grouped", "grouped_cv"):
+        overridden = build(
+            conf_dir,
+            "experiment=finetune_hierarchical_moe",
+            f"experiment.training.split_protocol={protocol}",
+        )
+        assert overridden.experiment.training.split_protocol == protocol
 
 
 def test_merge_out_of_fold_restores_dataset_order(grouped_dataset):
@@ -881,7 +899,7 @@ def test_handcrafted_features_are_ten_numbers_that_encode_size_and_colour(tmp_pa
 def test_the_floor_row_is_configured_and_needs_no_backbone(conf_dir):
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=eval_pretrain_representation")
+    cfg = build(conf_dir, "experiment=eval_pretrain")
     entry = next(
         item for item in cfg.experiment.evaluation.encoders if item["label"] == "handcrafted_floor"
     )
@@ -911,7 +929,7 @@ def test_the_auto_worker_cap_is_configurable_and_defaults_to_sixteen():
 def test_the_config_carries_the_raised_cap(conf_dir):
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=pretrain_swinv2_dino")
+    cfg = build(conf_dir, "experiment=pretrain_dino")
     assert cfg.data.num_workers_auto_cap == 16
     assert cfg.data.num_workers == "auto"
 
@@ -1008,7 +1026,7 @@ def test_arm_manifests_parse_and_pin_per_arm_paths(tmp_path):
         for arm in suite.arms:
             assert arm.description, f"{manifest}: {arm.name} has no description"
 
-    suite = runner.load_suite("conf/stage1_arms/phase1.yaml")
+    suite = runner.load_suite("conf/stage1_arms/view_design.yaml")
     directories = set()
     publications = set()
     for arm in suite.arms:
@@ -1029,7 +1047,7 @@ def test_the_evaluation_command_never_forwards_training_overrides(tmp_path):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import run_stage1_ablations as runner
 
-    suite = runner.load_suite("conf/stage1_arms/phase1.yaml")
+    suite = runner.load_suite("conf/stage1_arms/view_design.yaml")
     for arm in suite.arms:
         command = runner.eval_command(arm, suite, arm.directory(tmp_path), [])
         assert not any(item.startswith("experiment.training.") for item in command)
@@ -1040,19 +1058,19 @@ def test_data_overrides_carry_into_the_evaluation(tmp_path):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import run_stage1_ablations as runner
 
-    suite = runner.load_suite("conf/stage1_arms/phase1.yaml")
-    arm = next(item for item in suite.arms if item.name == "P1-C")
+    suite = runner.load_suite("conf/stage1_arms/view_design.yaml")
+    arm = next(item for item in suite.arms if item.name == "wo_view_redesign")
     command = runner.eval_command(arm, suite, arm.directory(tmp_path), [])
-    assert "data.local_crop_size=160" in command
-    assert "data.augmentation.local_crops_scale=[0.30,0.70]" in command
+    assert "data.local_crop_size=101" in command
+    assert "data.augmentation.local_crops_scale=[0.05,0.40]" in command
 
 
 def test_the_frozen_reference_arm_evaluates_an_untrained_trunk(tmp_path):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import run_stage1_ablations as runner
 
-    suite = runner.load_suite("conf/stage1_arms/phase1.yaml")
-    frozen = next(arm for arm in suite.arms if arm.name == "P1-F")
+    suite = runner.load_suite("conf/stage1_arms/view_design.yaml")
+    frozen = next(arm for arm in suite.arms if arm.name == "frozen")
     assert frozen.train is False
     command = runner.eval_command(frozen, suite, frozen.directory(tmp_path), [])
     assert "experiment=eval_frozen_reference" in command
@@ -1063,7 +1081,7 @@ def test_a_frozen_arm_is_not_repeated_across_seeds():
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import run_stage1_ablations as runner
 
-    suite = runner.load_suite("conf/stage1_arms/phase1.yaml")
+    suite = runner.load_suite("conf/stage1_arms/view_design.yaml")
     frozen = next(arm for arm in suite.arms if not arm.train)
     trained = next(arm for arm in suite.arms if arm.train)
     assert frozen.with_seed(7).seed is None
@@ -1346,14 +1364,14 @@ def test_the_readout_stage_list_is_configurable_and_defaults_to_including_pooled
     """`pooled` must stay first: `oof_probe_sub_accuracy` keeps meaning that number."""
     from tests.test_configs import build
 
-    cfg = build(conf_dir, "experiment=eval_pretrain_representation")
+    cfg = build(conf_dir, "experiment=eval_pretrain")
     stages = list(cfg.experiment.evaluation.readout.stages)
     assert stages[0] == "pooled"
     assert "stage3" in stages
 
     reduced = build(
         conf_dir,
-        "experiment=eval_pretrain_representation",
+        "experiment=eval_pretrain",
         "experiment.evaluation.readout.stages=[pooled]",
     )
     assert list(reduced.experiment.evaluation.readout.stages) == ["pooled"]
@@ -1463,7 +1481,7 @@ def test_the_token_grid_is_a_per_trunk_constant():
     """`PAPER_TOKEN_GRID = 64` is a fact about `window16_256`, not about SwinV2.
 
     The distinction became load-bearing once the initialisation screen made a
-    192 px trunk a first-class option (`STAGE1_CHANGES.md` B5): its 6x6 = 36 final
+    192 px trunk a first-class option (`experiment=screen_backbones`): its 6x6 = 36 final
     grid changes stage 2's routing-slot count, and grid routing is what makes the
     load-balancing statistic estimable at small batch in the first place.
     """

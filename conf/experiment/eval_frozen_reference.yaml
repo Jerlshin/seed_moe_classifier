@@ -1,75 +1,78 @@
 # @package _global_
 #
-# The frozen-trunk reference. NO TRAINING, and that is the point.
+# THE BAR. The frozen trunk with no in-domain training at all, scored under the
+# primary crop-level protocol.
 #
-#   python -m src.trainers.pretrain_eval experiment=eval_frozen_reference
-#   python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --only P1-F
+#     python main.py eval-frozen
 #
-# This is `P1-F` of the STAGE1_CHANGES.md sequence, and it is the first number to
-# look at in any stage-1 comparison. The audit's decomposition of the shipped
-# encoder is `random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO`: the
-# initialisation is worth 79x what 13.34 GPU-hours of self-distillation bought.
-# A frozen IN-22k trunk, with zero in-domain training, already beats the shipped
-# DINO encoder by +2.24 pp on the readout stage 2 uses.
+# Run this BEFORE stage 1. It is the number every stage-1 run and every stage-1
+# arm has to beat, and it is not a formality: the stage-1 evaluation's own
+# decomposition of an earlier run was `random 0.3804 -> +0.2449 ImageNet-1k ->
+# +0.0031 DINO`, i.e. the initialisation supplied 79x what a 13.34-hour
+# self-distillation supplied. If a run does not clear this row by more than the
+# fold SD, the honest claim is that the objective is not the binding constraint
+# on 81 scenes -- and that is a publishable result, not a failure to hide.
 #
-# So the question is no longer "can stage 1 be improved" but:
+# Measured on this trunk and this protocol (all 9,357 crops, 7,485 fit / 1,872
+# test, frozen):
 #
-#     Does self-distillation add anything on top of a strong prior, on 81 scenes?
+#   encoder                        27-way probe  macro F1   k-NN   RankMe
+#   imagenet_init (Tiny, IN-1k)       0.8243      0.8234   0.7137   324.4
+#   random_init                       0.5748      0.5683   0.4952    27.4
+#   handcrafted_floor (10 scalars)    0.4054      0.3367   0.4920     1.4
 #
-# If no arm beats this row by more than a fold SD (+-0.10 on the 27-way probe),
-# stage 1 as an OBJECTIVE is not earning its compute, and the honest paper claim
-# changes from "in-domain SSL adapts the encoder" to "in-domain SSL removes
-# photograph nuisance (see the nuisance table) without improving the readout".
+# Two readings that matter downstream. `layers.2` beats the output stage on this
+# trunk too (0.8024 / 0.8280 / **0.8638** / 0.7607 across layers.0..3, against
+# 0.8243 pooled) -- +3.95 pp from the readout stage alone, with no training,
+# which is what the `stage3_readout` arm exists to chase. And the crop-level
+# headline sits +18.95 pp above the photograph-disjoint estimate on the identical
+# encoder (0.8243 vs 0.6347), so the protocol's cost is measured rather than
+# assumed.
 #
-# Point it at whichever trunk Phase 0 chose:
-#
-#     python -m src.trainers.pretrain_eval experiment=eval_frozen_reference \
-#         model.backbone.name=swinv2_base_window12to16_192to256.ms_in22k_ft_in1k \
-#         model.backbone.feature_dim=1024
+# Identical to `eval_pretrain` except that no trained encoder is listed, so the
+# comparison is between two instances of one measurement.
 
 defaults:
-  - eval_pretrain_representation
+  - eval_pretrain
 
 experiment:
   name: "eval_frozen_reference"
   group: "stage1_reference"
-
   evaluation:
     save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/eval_frozen_reference"
-
-    # There is no stage-1 run behind this row, so everything that reads one is off.
+    shared_backbone_path: null
     teacher:
       enabled: false
     prototypes:
       enabled: false
     dynamics:
       enabled: false
-    shared_backbone_path: null
-
     encoders:
       - label: "imagenet_init"
         checkpoint: null
         pretrained: true
         role: "primary"
-        description: "the frozen trunk with NO in-domain training -- the reference stage 1 must beat"
-
+        description: "the frozen ImageNet-1k trunk, NO in-domain training -- the bar stage 1 must clear"
       - label: "random_init"
         checkpoint: null
         pretrained: false
         role: "control"
         description: "untrained trunk; the architecture-only floor"
-
       - label: "handcrafted_floor"
         kind: "handcrafted"
         checkpoint: null
         pretrained: false
         role: "control"
-        description: "10 image statistics -- the floor a deep encoder must beat (0.5360 in the audit)"
-
+        description: "10 image statistics (log area, log AR, mean/std RGB, mean/std grey) -- the floor a deep encoder must beat"
     probe:
       cv_encoders: ["imagenet_init"]
       low_shot_encoders: ["imagenet_init"]
+    layerwise:
+      enabled: true
+      all_encoders: true
+      encoders: ["imagenet_init"]
     invariance:
+      enabled: true
       encoders: ["imagenet_init"]
     tsne:
       encoders: ["imagenet_init", "random_init"]

@@ -27,7 +27,7 @@ from src.trainers.runner import (
 
 @pytest.fixture
 def checkpoint(tmp_path) -> Path:
-    path = tmp_path / "checkpoints" / "dinov2_swinv2_pretrained.pth"
+    path = tmp_path / "checkpoints" / "dino_pretrained_encoder.pth"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"not a real checkpoint")
     return path
@@ -71,11 +71,26 @@ def test_confounded_ablations_have_single_factor_counterparts():
 
 
 def test_leakage_ablation_is_present_and_changes_only_the_split():
-    """Quantifying the crop-level leak is a result, not a cleanup step."""
+    """Quantifying the crop-level leak is a result, not a cleanup step.
+
+    The primary protocol is crop-level, so the leakage row must be the
+    photograph-disjoint one -- an arm that repeated the primary protocol would be
+    a byte-identical copy of `full_model` wearing a different name.
+    """
     from scripts.run_ablations import VARIANTS_BY_NAME
 
-    spec = VARIANTS_BY_NAME["leakage_ungrouped"]
-    assert spec.overrides == ["experiment.training.split_protocol=stratified"]
+    spec = VARIANTS_BY_NAME["leakage_grouped"]
+    assert spec.overrides == [
+        "experiment.training.split_protocol=grouped_cv",
+        "experiment.training.num_folds=5",
+    ]
+    assert "leakage_ungrouped" not in VARIANTS_BY_NAME
+    assert all(
+        not override.startswith("experiment.training.split_protocol")
+        for name, variant in VARIANTS_BY_NAME.items()
+        if name != "leakage_grouped"
+        for override in variant.overrides
+    ), "only the leakage row may move the split protocol"
 
 
 def test_seed_expansion_gives_every_variant_its_own_directory():

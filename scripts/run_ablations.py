@@ -25,7 +25,7 @@ Each run directory is self-contained: Hydra config snapshot, logs, checkpoints,
 figures, ``summary.json`` and ``test_predictions.npz``.
 
 **Pretraining is not repeated.** Every variant reads the single published
-encoder at ``outputs/checkpoints/dinov2_swinv2_pretrained.pth``. Re-running
+encoder at ``outputs/checkpoints/dino_pretrained_encoder.pth``. Re-running
 self-supervised pretraining per variant would make each row partly a function of
 its own initialisation, and would cost many times as much for a worse experiment.
 """
@@ -165,17 +165,29 @@ ABLATION_VARIANTS: list[VariantSpec] = [
         description="Submitted stage-2 pipeline: deterministic resize, no flip, no crop",
         overrides=[
             "experiment.training.horizontal_flip_prob=0.0",
+            "experiment.training.vertical_flip_prob=0.0",
             "experiment.training.random_resized_crop_scale=null",
         ],
     ),
     VariantSpec(
-        name="leakage_ungrouped",
-        description="Crop-level splitting: measures how much the source-photograph leak was worth",
-        # Not an architecture ablation. The full model under the submitted split
+        name="leakage_grouped",
+        description="Photograph-disjoint splitting: measures what the crop-level leak was worth",
+        # Not an architecture ablation. The full model under the OTHER split
         # protocol, so the delta against full_model quantifies the leakage
         # directly. That delta is a result, not an embarrassment -- reporting it
         # is what turns a fatal reviewer objection into a methods subsection.
-        overrides=["experiment.training.split_protocol=stratified"],
+        #
+        # `grouped_cv`, not `grouped`: `GroupShuffleSplit` takes 20 % of the 81
+        # photographs unstratified, so its test side holds 14 of the 27 classes
+        # and a 27-way macro-F1 on it is capped near 14/27 by the split. Note the
+        # consequence for the table -- this row is an estimate of the RECIPE
+        # (num_folds models contributed out-of-fold predictions), not of one
+        # trained model, and McNemar against `full_model` is not valid for it
+        # because the two do not share a test split.
+        overrides=[
+            "experiment.training.split_protocol=grouped_cv",
+            "experiment.training.num_folds=5",
+        ],
     ),
 ]
 
@@ -198,7 +210,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         default=None,
         help="Shared DINOv2-SwinV2 encoder checkpoint. "
-        "Defaults to $SEED_PRETRAIN_BACKBONE, else outputs/checkpoints/dinov2_swinv2_pretrained.pth.",
+        "Defaults to $SEED_PRETRAIN_BACKBONE, else outputs/checkpoints/dino_pretrained_encoder.pth.",
     )
     parser.add_argument(
         "--output-root",

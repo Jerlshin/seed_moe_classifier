@@ -131,7 +131,7 @@ algebraically identical ``F.scaled_dot_product_attention`` form, parity-checked
 per module at conversion time. See ``src/models/backbones/sdpa_attention.py``.
 
 Precision and compilation are configured under ``experiment.training`` -- see
-``conf/experiment/pretrain_swinv2_dino.yaml``. ``amp: auto`` selects bf16 on
+``conf/experiment/pretrain_dino.yaml``. ``amp: auto`` selects bf16 on
 Ampere and later, fp16 with a ``GradScaler`` on older CUDA cards (a T4 is one),
 and off on CPU/MPS. The Sinkhorn normaliser, the prototype log-softmax and the
 KoLeo distances are pinned to fp32 inside the autocast region by
@@ -142,7 +142,7 @@ Running on more than one GPU
 ============================
 
     torchrun --standalone --nproc_per_node=2 -m src.trainers.contrastive_pretrain \
-        experiment=pretrain_swinv2_dino
+        experiment=pretrain_dino
 
 or ``python main.py pretrain --gpus 2``, which is the same thing with the run id
 pinned so every rank shares one output directory.

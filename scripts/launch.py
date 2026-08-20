@@ -43,7 +43,7 @@ A notebook cell can shell out to this directly::
             experiment.training.resume=auto \
             experiment.training.max_runtime_minutes=520
 
-``resume=auto`` plus ``max_runtime_minutes`` is the pair that makes a 300-epoch
+``resume=auto`` plus ``max_runtime_minutes`` is the pair that makes a long
 run survive a session limit: the run stops itself with a complete checkpoint
 before the platform kills it, and the identical command continues from there.
 """
@@ -63,10 +63,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 #: Stage name -> the module that implements it, plus its experiment config.
 STAGES = {
-    "pretrain": ("src.trainers.contrastive_pretrain", "experiment=pretrain_swinv2_dino"),
-    "pretrain-v2": ("src.trainers.contrastive_pretrain", "experiment=pretrain_v2_swinv2_tiny"),
+    "pretrain": ("src.trainers.contrastive_pretrain", "experiment=pretrain_dino"),
     "finetune": ("src.trainers.moe_finetune", "experiment=finetune_hierarchical_moe"),
-    "finetune-v2": ("src.trainers.moe_finetune", "experiment=finetune_v2_crop_level"),
+    "finetune-grouped": ("src.trainers.moe_finetune", "experiment=finetune_grouped_diagnostic"),
     "ablation": ("src.trainers.moe_finetune", "experiment=ablation_flat_classifier"),
 }
 

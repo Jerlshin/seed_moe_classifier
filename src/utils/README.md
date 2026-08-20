@@ -232,11 +232,10 @@ NaN is preserved literally when it is the real value.
 
 ### `representation_probe.py`
 
-The mechanism that lets stage 1 choose its own checkpoint. Read
-`STAGE1_V2.md` §1.4 for the argument; the short version is that the DINO loss
-cannot rank checkpoints — it is a cross entropy against a moving teacher, 94.8 %
-of the shipped run's final loss was irreducible target entropy, its minimum was
-at epoch 90, and the *representation* peaked at epoch 50 of 100.
+The mechanism that lets stage 1 choose its own checkpoint. The DINO loss cannot
+rank checkpoints — it is a cross entropy against a moving teacher; measured on a
+100-epoch run, 94.8 % of the final loss was irreducible target entropy, its
+minimum was at epoch 90, and the *representation* peaked at epoch 50.
 
 * `RepresentationProbe.run(...)` extracts frozen features on an
   augmentation-free pass and scores three independently-failing families: the

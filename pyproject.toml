@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "seed-moe-classifier"
 version = "0.2.0"
-description = "Hierarchical seed classifier with DINOv2 pretraining and Mixture-of-Experts finetuning."
+description = "Hierarchical seed classifier: DINO self-supervised pretraining plus a Mixture-of-Experts head."
 requires-python = ">=3.11"
 dependencies = [
     "hydra-core",

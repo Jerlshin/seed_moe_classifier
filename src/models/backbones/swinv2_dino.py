@@ -383,7 +383,7 @@ class DINO(nn.Module):
 
         # ------------------------------------------------- auxiliary stage head
         #
-        # The C4 arm of STAGE1_CHANGES.md. `aux_stage=2` attaches a SECOND DINO
+        # An arm, not a default. `aux_stage=2` attaches a SECOND DINO
         # head to the mean-pooled output of `layers.2`, with its own prototypes,
         # and the trainer sums the two losses at `aux_weight`.
         #

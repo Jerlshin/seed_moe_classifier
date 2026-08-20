@@ -61,9 +61,10 @@ local/global distinction is carried by the crop *scale*, not the tensor size.
 The teacher sees only the 2 global crops; the student sees all 6. That
 asymmetry is enforced in the trainer, not here.
 
-## The v2 view policy, and how to measure any policy
+## The view policy, and how to measure any policy
 
-`conf/data/seed_crops_v2.yaml`. Read `STAGE1_V2.md` §1.1 before changing it.
+`conf/data/hierarchical_seeds.yaml` — the single data group. Its header carries
+the measurement behind every value; read it before changing one.
 
 The problem it solves is that `scale` is a fraction of the **source** area, and
 the source here is one seed at a median 52 × 51 px — not a scene. Measured over
@@ -107,16 +108,15 @@ single-factor:
 Colour is treated as signal rather than only as nuisance: brightness and contrast
 (illumination) stay at ±0.4, saturation and hue (pigmentation) drop to ±0.1 and
 ±0.02, and grayscale and solarization go to zero. Mean RGB alone scores 0.3169 on
-the 27-way task. Note the audit refuted the naive version of this — the cue
-*survived* the reference jitter — so it is a hypothesis with a control
-(`V2-noCOLOUR`), not a repair.
+the 27-way task. Note the naive version of this argument is already refuted — the
+cue *survived* the reference jitter — so it is a hypothesis with a control
+(`wo_colour_policy`), not a repair.
 
 To measure any policy without training anything:
 
 ```bash
-python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
-python scripts/report_view_geometry.py --data seed_crops_v2 \
-    data.augmentation.min_native_pixels=900
+python scripts/report_view_geometry.py --policy canonical reference
+python scripts/report_view_geometry.py data.augmentation.min_native_pixels=900
 ```
 
 `view_geometry_report(transform, sizes)` is the same measurement as a function;

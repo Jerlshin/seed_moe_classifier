@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """Run a stage-1 arm suite: train each arm, evaluate each arm, collect one table.
 
-    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase0.yaml
-    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml
-    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml --dry-run
-    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml \
-        --experiment pretrain_swinv2_tiny_dino --gpus 0,1
-    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase3.yaml --seeds 42 43 44
-    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/phase1.yaml -- \
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/screens.yaml
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --dry-run
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml \
+        --experiment pretrain_dino_base --gpus 0,1
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml --seeds 42 43 44
+    python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml -- \
         experiment.training.epochs=2 experiment.training.max_batches=4
 
 Why this exists, and why ``scripts/run_ablations.py`` could not be reused.
@@ -18,13 +18,14 @@ it, and both write to paths the other arms would otherwise overwrite. Without
 per-arm ``experiment.training.save_path``, ``shared_backbone_path`` and
 ``experiment.evaluation.save_path``, four arms silently overwrite each other's
 ``outputs/eval_pretrain/`` and each other's
-``outputs/checkpoints/dinov2_swinv2_pretrained.pth``, and the resulting table is
+``outputs/checkpoints/dino_pretrained_encoder.pth``, and the resulting table is
 a comparison of one encoder against itself.
 
 The arms are **data, not code**. A manifest under ``conf/stage1_arms/`` names a
 base Hydra experiment, a list of overrides applied to every arm, and one entry
-per arm; adding an arm is adding an entry. The manifests that ship correspond to
-Phases 0-3 of ``STAGE1_CHANGES.md``, and each one carries the sequence's own
+per arm; adding an arm is adding an entry. Two ship: ``screens.yaml`` (no
+training at all -- the trunk and readout-stage decisions) and ``view_design.yaml``
+(the primary recipe decomposed into single factors), and each carries its own
 rules about what may and may not be combined.
 
 Three arm shapes:
@@ -124,7 +125,7 @@ class ArmSuite:
     common: list[str]
     arms: list[ArmSpec]
     path: Path
-    evaluation: str = "eval_pretrain_representation"
+    evaluation: str = "eval_pretrain"
     frozen_evaluation: str = "eval_frozen_reference"
 
 
@@ -166,11 +167,11 @@ def load_suite(path: str | Path, experiment: str | None = None) -> ArmSuite:
         raise ValueError(f"{manifest_path}: duplicate arm names {sorted(names)}")
 
     return ArmSuite(
-        experiment=str(experiment or payload.get("experiment") or "pretrain_swinv2_dino"),
+        experiment=str(experiment or payload.get("experiment") or "pretrain_dino"),
         common=[str(item) for item in payload.get("common") or []],
         arms=arms,
         path=manifest_path,
-        evaluation=str(payload.get("evaluation") or "eval_pretrain_representation"),
+        evaluation=str(payload.get("evaluation") or "eval_pretrain"),
         frozen_evaluation=str(payload.get("frozen_evaluation") or "eval_frozen_reference"),
     )
 
@@ -179,7 +180,7 @@ def train_command(arm: ArmSpec, suite: ArmSuite, directory: Path, extra: list[st
     """The stage-1 command for one arm, with every path pinned per arm.
 
     ``shared_backbone_path`` is the one that matters most: left at its default,
-    every arm would publish over ``outputs/checkpoints/dinov2_swinv2_pretrained.pth``
+    every arm would publish over ``outputs/checkpoints/dino_pretrained_encoder.pth``
     and the last arm to finish would silently become the encoder every stage-2
     run reads.
     """
@@ -388,13 +389,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--arms",
-        default=str(PROJECT_ROOT / "conf" / "stage1_arms" / "phase1.yaml"),
-        help="Arm manifest to run (default: conf/stage1_arms/phase1.yaml).",
+        default=str(PROJECT_ROOT / "conf" / "stage1_arms" / "view_design.yaml"),
+        help="Arm manifest to run (default: conf/stage1_arms/view_design.yaml).",
     )
     parser.add_argument(
         "--experiment",
         default=None,
-        help="Override the manifest's base Hydra experiment, e.g. pretrain_swinv2_tiny_dino.",
+        help="Override the manifest's base Hydra experiment, e.g. pretrain_dino_base.",
     )
     parser.add_argument("--only", nargs="*", default=None, help="Run only these arm names.")
     parser.add_argument(

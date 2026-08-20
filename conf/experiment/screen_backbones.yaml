@@ -1,19 +1,19 @@
 # @package _global_
 #
-# Phase 0.5 -- the initialisation screen. NO TRAINING.
+# The initialisation screen. NO TRAINING.
 #
 #   python main.py screen-backbones
 #   python -m src.trainers.pretrain_eval experiment=screen_backbones
 #
 # Every row is a frozen, ImageNet-supervised timm trunk with zero in-domain
 # training, scored by the identical transform, folds, seed and probe as the
-# stage-1 evaluation. It is Appendix 2 of STAGE1_CHANGES.md as a config file.
+# stage-1 evaluation, so the rows are directly comparable with `eval_pretrain`.
 #
 # Why this exists at all. The stage-1 evaluation's own decomposition is
 # `random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO`: the INITIALISATION is
-# worth 79x what the 13.34-hour self-distillation run bought, and it was never
-# treated as a variable. An IN-22k SwinV2-Base beats the shipped DINO encoder by
-# +2.24 pp pooled (+2.50 pp at a matched PCA width) at zero training cost.
+# worth 79x what a 13.34-hour self-distillation run bought, and it was never
+# treated as a variable. An IN-22k SwinV2-Base beats that self-distilled encoder
+# by +2.24 pp pooled (+2.50 pp at a matched PCA width) at zero training cost.
 #
 # The control that decides the trunk. `swinv2_base_window16_256.ms_in1k` was
 # NOT in the original screen, so the Base advantage is not yet separated into
@@ -25,16 +25,17 @@
 #   ~0.61  ->  the effect is the corpus, and IN-22k Base is the trunk to build
 #              on.
 #
-# Do not adopt Base until that row has run. `D6` of STAGE1_CHANGES.md is
-# explicit that capacity is NOT the binding constraint here -- scene diversity
-# is -- and this screen exists to keep the two arguments apart.
+# Do not adopt Base until that row has run. Capacity is NOT the binding
+# constraint here -- scene diversity is, at 81 photographs -- and this screen
+# exists to keep the two arguments apart. `experiment=pretrain_dino_base` and
+# `experiment=pretrain_dino_base_in22k` are the two trained follow-ups.
 #
 # Cost: one frozen forward pass per row over the corpus, minutes each, cached by
 # checkpoint digest afterwards. Nothing here writes a checkpoint or touches the
 # published handoff.
 
 defaults:
-  - eval_pretrain_representation
+  - eval_pretrain
 
 experiment:
   name: "screen_backbones"
@@ -87,14 +88,14 @@ experiment:
         image_size: 256
         pretrained: true
         role: "primary"
-        description: "swinv2_small_window16_256.ms_in1k -- the trunk conf/model/backbone/swinv2.yaml currently selects"
+        description: "swinv2_small_window16_256.ms_in1k -- the previous default trunk"
 
       - label: "tiny_in1k"
         backbone: "swinv2_tiny_window16_256.ms_in1k"
         image_size: 256
         pretrained: true
         role: "control"
-        description: "half the FLOPs of Small; within 0.3 pp pooled and +0.7 pp at layers.2 in the audit"
+        description: "swinv2_tiny_window16_256.ms_in1k -- THE trunk this pipeline uses; half the FLOPs of Small, within 0.3 pp pooled and +0.7 pp at layers.2"
 
       # THE CONTROL THAT DECIDES B2: capacity or corpus?
       - label: "base_in1k"
@@ -109,7 +110,7 @@ experiment:
         image_size: 256
         pretrained: true
         role: "control"
-        description: "IN-22k -> IN-1k Base; +2.24 pp over the shipped DINO encoder in the audit, at zero training cost"
+        description: "IN-22k -> IN-1k Base; +2.24 pp over an in-domain self-distilled encoder, at zero training cost"
 
       # B5: the same corpus at 192 px. The data has no content above ~52 px per
       # side, so the extra output resolution is interpolation that costs
@@ -134,4 +135,4 @@ experiment:
         checkpoint: null
         pretrained: false
         role: "control"
-        description: "10 image statistics -- the floor a deep encoder must beat (0.5360 in the audit)"
+        description: "10 image statistics -- the floor a deep encoder must beat"

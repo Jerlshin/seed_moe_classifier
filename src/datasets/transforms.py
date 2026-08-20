@@ -29,21 +29,21 @@ object part. Here the source is already a tight crop of *one seed* at a median
 shredding the object.
 
 Measured over all 9,357 crops (``scripts/report_view_geometry.py`` reproduces
-this, and ``STAGE1_CHANGES.md`` 0.5 measured it independently):
+every row, 40,000 draws at seed 7):
 
 ===================================== ============================= =============
 view recipe                           native px behind it p5/50/95  upsample to 256
 ===================================== ============================= =============
 global ``scale=(0.40, 1.00)``         648 / 1,845 / 5,680           6.0x median
 local  ``scale=(0.05, 0.40)``         132 / **598** / 2,585         **10.5x**
-local  ``scale=(0.30, 0.70)`` (v2)    483 / **1,419** / 4,730       6.8x
+local  ``scale=(0.30, 0.70)`` canonical  483 / **1,419** / 4,730     6.8x
 ===================================== ============================= =============
 
-A local view under the submitted recipe is a median **24x24 px** fragment of a
+A local view under DINO's reference ranges is a median **24x24 px** fragment of a
 single seed inflated to 65,536 output pixels -- 0.9 % real content -- and **8 of
 the 10 cross-view terms** in Eq. 1 are anchored on one. That is the single
-largest mismatch between the objective and this data, and it is what the ``v2``
-augmentation policy in ``conf/data/seed_crops_v2.yaml`` exists to fix.
+largest mismatch between the objective and this data, and it is what the view
+policy in ``conf/data/hierarchical_seeds.yaml`` exists to fix.
 
 Three mechanisms carry the fix, and each is separately switchable so the arms
 stay single-factor:
@@ -65,7 +65,7 @@ stay single-factor:
     881x413 crop are shredded by the same factor. This raises the effective
     lower scale bound per image, ``max(scale_lo, min_native_pixels / area)``,
     and never lowers it -- so it can only make views less destructive. ``0``
-    disables it, which is the pre-v2 behaviour exactly.
+    disables it, which is a plain ``RandomResizedCrop`` exactly.
 
 ``rotation90_prob`` / ``vertical_flip_prob``
     Seeds photographed on a tray have no canonical orientation, so the dihedral
@@ -82,22 +82,22 @@ The standard SSL argument for aggressive colour jitter is that colour histograms
 are a shortcut. On this dataset mean RGB alone scores **0.3169** on the 27-way
 task and explains 78.5 % of the between-sub-variety variance, and only ~26.6 %
 of the within-class colour variance is photograph-specific -- so most of the
-colour cue *transfers* (``STAGE1_CHANGES.md`` C5).
+colour cue *transfers*.
 
-The v2 policy therefore splits the jitter by what it attacks rather than turning
-it down uniformly:
+The canonical policy therefore splits the jitter by what it attacks rather than
+turning it down uniformly:
 
 * **brightness and contrast** are illumination, which *is* photograph-specific
   nuisance. Left at the reference +-0.4.
 * **saturation and hue** are pigmentation, which is class signal. Cut to +-0.1
   and +-0.02; the submitted +-0.1 hue is +-36 degrees of the hue circle.
 * **grayscale** deletes the cue outright, and **solarization** inverts it. Both
-  go to 0 in v2 and both remain config keys, so ``wo_colour_preservation`` is a
-  one-line arm rather than a fork.
+  go to 0 here and both remain config keys, so ``wo_colour_policy`` is a one-line
+  arm rather than a fork.
 
-Note what this is *not* claiming. The audit refuted the obvious version of this
-argument: mean RGB is **more** linearly decodable after the shipped DINO run than
-before (pooled R^2 0.864 -> 0.908), so the jitter did not destroy the cue. The
+Note what this is *not* claiming. The obvious version of this argument is already
+refuted: mean RGB is **more** linearly decodable after an in-domain DINO run than
+before it (pooled R^2 0.864 -> 0.908), so the jitter did not destroy the cue. The
 change is about where capacity goes, and it is an arm, not a certainty.
 
 Local crops and a known confound
@@ -163,7 +163,7 @@ from PIL import Image, ImageFilter, ImageOps
 
 #: Aspect-ratio range ``RandomResizedCrop`` samples, as a config default.
 #:
-#: Torchvision's own default. Kept as a named constant because the v2 policy
+#: Torchvision's own default. Kept as a named constant because the canonical policy
 #: widens it and the *reason* is a measured property of this dataset rather than
 #: a preference -- see the module docstring's ``crop_ratio`` entry.
 TORCHVISION_CROP_RATIO = (3.0 / 4.0, 4.0 / 3.0)
@@ -676,8 +676,8 @@ class DataAugmentationDINO:
 
         ``partner_images`` replaces the **trailing** local views with local crops
         of those images instead of the anchor -- the provenance-derived positives
-        of ``STAGE1_CHANGES.md`` F1, where the partners are other crops of the
-        same source photograph. The view *count* is unchanged, so the loss's
+        (``data.augmentation.same_photo_local_views``), where the partners are
+        other crops of the same source photograph. The view *count* is unchanged, so the loss's
         cross-view pairing, ``view_ids`` and every shape downstream are untouched;
         only what view 2..V depict changes. Supplying more partners than there are
         local views is an error rather than a silent truncation, because the
@@ -838,7 +838,7 @@ def measure_view_geometry(
         "upsample_factor_median": float(np.median(float(output_size) / side)),
         "upsample_factor_p95": float(np.percentile(float(output_size) / side, 95)),
         # The share of the 65,536 output pixels of a 256 px view that correspond
-        # to a real sensor measurement. The headline number of STAGE1_CHANGES 0.5.
+        # to a real sensor measurement: 0.91 % for a reference-geometry local view.
         "real_content_fraction_median": float(
             np.median(native_array) / (float(output_size) ** 2)
         ),

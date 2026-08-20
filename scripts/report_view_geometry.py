@@ -2,16 +2,20 @@
 """What each DINO view is actually built from -- before spending a GPU-hour on it.
 
     python scripts/report_view_geometry.py
-    python scripts/report_view_geometry.py --data seed_crops_v2
-    python scripts/report_view_geometry.py --compare hierarchical_seeds seed_crops_v2
+    python scripts/report_view_geometry.py --policy canonical reference
     python scripts/report_view_geometry.py --csv outputs/reports/view_geometry.csv
+    python scripts/report_view_geometry.py data.augmentation.min_native_pixels=900
 
 ``RandomResizedCrop``'s ``scale`` is a fraction of the **source area**, so a
 configuration does not say how much of a seed a view contains -- only the product
 of the scale range and the source-size distribution does. On this corpus the
-source is one seed at a median 52 x 51 px, and the submitted recipe builds each
+source is one seed at a median 52 x 51 px, and DINO's reference ranges build each
 local view from a median **598 native pixels** rendered into 65,536 output
-pixels, with 8 of the 10 cross-view terms in Eq. 1 anchored on such a view.
+pixels, with 8 of the 10 cross-view terms in Eq. 1 anchored on such a view. The
+canonical policy in ``conf/data/hierarchical_seeds.yaml`` takes that to 1,419.
+
+``--policy`` measures named override sets against the one data group, so there is
+no second config file for the two policies to drift apart in.
 
 This reads the real file headers (~2 s for 9,357 files, no decode) and drives
 torchvision's own ``RandomResizedCrop.get_params``, so the numbers are what the
@@ -36,6 +40,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+#: Named view policies, as overrides on the single ``data`` group. ``canonical``
+#: is whatever ``conf/data/hierarchical_seeds.yaml`` currently says; ``reference``
+#: is DINO's ImageNet geometry, kept here as a MEASUREMENT baseline rather than as
+#: a runnable configuration -- it is what the ``wo_view_redesign`` arm trains.
+POLICIES: dict[str, list[str]] = {
+    "canonical": [],
+    "reference": [
+        "data.local_crop_size=101",
+        "data.augmentation.global_crops_scale=[0.40,1.00]",
+        "data.augmentation.local_crops_scale=[0.05,0.40]",
+        "data.augmentation.crop_ratio=[0.75,1.3333333333333333]",
+    ],
+}
+
 #: The columns worth putting side by side when comparing two policies. Ordered
 #: by what a reader should look at first.
 COMPARISON_ROWS = (
@@ -50,18 +68,15 @@ COMPARISON_ROWS = (
 )
 
 
-def load_transform(data_group: str, overrides: list[str]):
-    """Compose ``conf/config.yaml`` with one ``data`` group and build its transform."""
+def load_transform(overrides: list[str]):
+    """Compose ``conf/config.yaml`` with these overrides and build its transform."""
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
 
     from src.datasets.transforms import get_dino_transforms
 
     with initialize_config_dir(config_dir=str(PROJECT_ROOT / "conf"), version_base=None):
-        cfg = compose(
-            config_name="config",
-            overrides=[f"data={data_group}", *overrides],
-        )
+        cfg = compose(config_name="config", overrides=list(overrides))
     transform = get_dino_transforms(
         int(cfg.data.image_size),
         int(cfg.data.local_crop_size),
@@ -74,16 +89,15 @@ def load_transform(data_group: str, overrides: list[str]):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
-        "--data",
-        default="hierarchical_seeds",
-        help="Config group under conf/data/ to measure (default: hierarchical_seeds).",
-    )
-    parser.add_argument(
-        "--compare",
+        "--policy",
         nargs="+",
-        default=None,
-        metavar="GROUP",
-        help="Measure several data groups and print them side by side.",
+        default=["canonical"],
+        choices=sorted(POLICIES),
+        metavar="NAME",
+        help=(
+            "View policies to measure, printed side by side. "
+            f"One or more of: {', '.join(sorted(POLICIES))} (default: canonical)."
+        ),
     )
     parser.add_argument(
         "--root",
@@ -101,12 +115,13 @@ def main() -> int:
     from src.datasets.dataset import image_sizes
     from src.datasets.transforms import view_geometry_report
 
-    groups = args.compare or [args.data]
+    # dict.fromkeys keeps the order the user asked for and drops repeats.
+    groups = list(dict.fromkeys(args.policy))
     reports: dict[str, dict] = {}
     sizes: list[tuple[int, int]] = []
 
     for group in groups:
-        cfg, transform, policy = load_transform(group, list(args.overrides))
+        cfg, transform, policy = load_transform([*POLICIES[group], *args.overrides])
         root = args.root or os.environ.get("SEED_DATA_ROOT") or str(cfg.data.root_path)
         if not sizes:
             paths = sorted(
@@ -177,7 +192,7 @@ def main() -> int:
         destination = Path(args.csv)
         destination.parent.mkdir(parents=True, exist_ok=True)
         rows = [
-            {"data_group": group, "family": family, **reports[group][family]}
+            {"policy": group, "family": family, **reports[group][family]}
             for group in groups
             for family in ("global", "local")
         ]

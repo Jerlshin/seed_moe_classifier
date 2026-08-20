@@ -1,0 +1,52 @@
+# No-training screens: run these before spending a GPU-hour on stage 1.
+#
+#   python scripts/run_stage1_ablations.py --arms conf/stage1_arms/screens.yaml
+#
+# Everything here is a frozen forward pass plus a probe, so the whole manifest is
+# hours rather than days, and it decides two things that no amount of
+# self-distillation compensates for.
+#
+# Why it comes first. The stage-1 evaluation's own decomposition of an earlier
+# 13.34-hour run was `random 0.3804 -> +0.2449 ImageNet-1k -> +0.0031 DINO`: the
+# initialisation and the readout stage between them were worth two orders of
+# magnitude more than the objective, and neither had been treated as a variable.
+
+experiment: pretrain_dino
+evaluation: eval_pretrain
+frozen_evaluation: eval_frozen_reference
+
+common: []
+
+arms:
+  - name: readout-screen
+    description: >-
+      Probe pooled, `layers.2` and the 2x2-pooled `layers.2` for every encoder
+      that exists. Gate: confirm the ~+3-4 pp available at `layers.2` and pick
+      the stage stage 2 will consume (`model.backbone.feature_stage`). Needs no
+      retraining at all, which makes it the cheapest real gain available.
+    train: false
+    evaluate: true
+    eval_experiment: eval_pretrain
+    eval_overrides:
+      - experiment.evaluation.readout.stages=[pooled,stage3]
+      - experiment.evaluation.layerwise.all_encoders=true
+
+  - name: backbone-screen
+    description: >-
+      Every candidate trunk, frozen and ImageNet-supervised, including the
+      `swinv2_base_window16_256.ms_in1k` control that separates *capacity* from
+      the *IN-22k corpus*. Gate: pick the trunk and the input resolution. Do not
+      adopt Base until the IN-1k Base row has run -- this pipeline's Tiny default
+      is the outcome of exactly this screen.
+    train: false
+    evaluate: true
+    eval_experiment: screen_backbones
+    eval_overrides: []
+
+  - name: frozen-reference
+    description: >-
+      The chosen trunk, frozen, under the primary protocol. This is the bar every
+      trained arm is measured against, and the row a results table without it
+      invites the reader to assume was checked.
+    train: false
+    evaluate_frozen: true
