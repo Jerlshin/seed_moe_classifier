@@ -118,7 +118,7 @@ experiment:
       # Three probes (15 epochs) without a gain above `min_delta` ends the run.
       # 0.002 is below the probe's fold-to-fold spread on purpose -- it is a
       # guard against stopping on noise, not a target effect size.
-      patience: 20
+      patience: 30
       min_delta: 0.002
       folds: 3                # crop-level stratified, matching the primary protocol
       regularisation: 10.0
