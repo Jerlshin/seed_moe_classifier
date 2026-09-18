@@ -193,9 +193,45 @@ experiment:
   validation:
     enabled: true
     every_epochs: 1
-    # Metric used to select the best checkpoint. "loss" minimises;
-    # anything else maximises.
-    monitor: "loss"
+
+    # -----------------------------------------------------------------------
+    # CHECKPOINT SELECTION METRIC.
+    #
+    # Any key `run_epoch` emits: "loss", the per-term loss means, and every key
+    # of `HierarchicalEvaluation.scalar_metrics` ("sub_variety/accuracy",
+    # "sub_variety/f1_macro", "seed_type/accuracy", "kl_alignment/overall",
+    # ...). A key containing "loss" is MINIMISED; everything else is MAXIMISED.
+    #
+    # Why not "loss", which was the previous default. Evaluation passes no
+    # labels, so the ArcFace margin never reaches a validation forward and the
+    # validation loss is a margin-free NLL at every epoch -- it is not that the
+    # units change under the margin ramp. The problem is what the NLL tracks.
+    # The training objective ramps the margin over the first
+    # `margin_warmup_fraction` of the run and keeps sharpening the posterior
+    # afterwards, so NLL rises on the residual errors faster than it falls on
+    # the correct ones. The minimum therefore lands in the early,
+    # under-confident regime and is close to unrelated to the accuracy optimum.
+    #
+    # Measured on the shipped 100-epoch run (`outputs/finetune_hierarchical_moe`):
+    #
+    #     validation loss  min at epoch 6 (0.7626) -> epoch 100 (1.1247), +47.5 %
+    #     test accuracy    epoch 6 0.8159 -> epoch 100 0.8173   (+0.15 pp)
+    #     test macro F1    epoch 6 0.7910 -> epoch 100 0.7943   (+0.33 pp)
+    #     McNemar exact p = 0.87 -- the two are statistically indistinguishable
+    #     ECE             epoch 6 0.1381 -> epoch 100 0.0767    (IMPROVED)
+    #
+    # i.e. selecting on loss discarded 94 epochs of calibration improvement to
+    # buy nothing measurable, and reported epoch 6 as "best" on a criterion
+    # that had stopped tracking the quantity the results table reports.
+    #
+    # `sub_variety/f1_macro` rather than `sub_variety/accuracy`: the corpus runs
+    # 277 to 1,514 crops per class, so accuracy is dominated by LittleMillet and
+    # KodoMillet, and macro-F1 is the headline column of
+    # `scripts/generate_plots.py`'s table. Selecting on the metric the table
+    # leads with is the honest choice. Both are computed from margin-free
+    # `sub_logits`, so neither can be moved by the margin schedule.
+    # -----------------------------------------------------------------------
+    monitor: "sub_variety/f1_macro"
 
   # Computational efficiency measurement, run once against the best checkpoint.
   # Profiles encoder + head together, which is the only combination whose

@@ -1236,6 +1236,49 @@ def profile_run(
 # ----------------------------------------------------------------- checkpoints
 
 
+def clone_cpu_state_dict(module: nn.Module) -> dict[str, Any]:
+    """A detached CPU **copy** of ``module``'s state, safe to outlive training.
+
+    ``to_cpu_state_dict`` is not enough on its own: ``Tensor.cpu()`` returns
+    *self* for a tensor already on the CPU, so on a CPU (or post-transfer) run
+    the "snapshot" would alias the live parameter and keep changing underneath
+    the caller. ``clone()`` is what makes it a snapshot on every device.
+    """
+    return {
+        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else value
+        for key, value in module.state_dict().items()
+    }
+
+
+def resolve_monitor(cfg: DictConfig) -> tuple[str, bool]:
+    """``(metric key, higher_is_better)`` for best-checkpoint selection.
+
+    ``experiment.validation.monitor`` was documented as "``loss`` minimises;
+    anything else maximises" but no code read it -- selection was hard-wired to
+    the validation loss. That default is actively misleading on this recipe.
+    Evaluation passes no labels, so the ArcFace margin never reaches a
+    validation forward and the validation loss is a margin-free NLL throughout;
+    but the *training* objective ramps the margin over the first
+    ``margin_warmup_fraction`` of the run, and the model it produces grows
+    steadily more confident. NLL then rises on the residual errors faster than
+    it falls on the correct ones, so the validation-loss minimum lands in the
+    early, under-confident regime and has little to do with the accuracy
+    optimum. Measured on the shipped 100-epoch run: validation loss bottomed at
+    epoch 6 and finished 47.5 % higher, while test accuracy over the same span
+    moved by +0.15 pp (McNemar p = 0.87) and ECE *improved* from 0.138 to 0.077.
+
+    Selecting on a metric the margin cannot touch -- accuracy or macro-F1, both
+    computed from margin-free ``sub_logits`` -- removes that failure mode.
+
+    Any key ``run_epoch`` puts in its metrics dict is accepted, which is every
+    key of :meth:`HierarchicalEvaluation.scalar_metrics` plus ``loss`` and the
+    per-term means. A key containing ``loss`` minimises; everything else
+    maximises.
+    """
+    monitor = str(OmegaConf.select(cfg, "experiment.validation.monitor", default="loss"))
+    return monitor, "loss" not in monitor.lower()
+
+
 def save_checkpoint(
     checkpoint_manager: CheckpointManager,
     filename: str,
@@ -1599,7 +1642,12 @@ def main(cfg: DictConfig) -> None:
         )
 
         global_step = 0
-        best_val_loss = float("inf")
+        monitor_key, monitor_higher_is_better = resolve_monitor(cfg)
+        best_monitored = float("-inf") if monitor_higher_is_better else float("inf")
+        logger.info(
+            "Checkpoint selection | monitor=%s (%s is better).",
+            monitor_key, "higher" if monitor_higher_is_better else "lower",
+        )
         best_state: dict[str, Any] | None = None
         history = LossHistory()
         num_experts = 1
@@ -1636,14 +1684,21 @@ def main(cfg: DictConfig) -> None:
         resume_fold = int((resume_payload or {}).get("fold", 1))
         if resume_payload is not None:
             global_step = resume_progress.global_step
-            best_val_loss = resume_progress.best_metric
+            # `TrainingProgress.best_metric` defaults to +inf, which is the
+            # right sentinel only for a minimised monitor. Taking it verbatim
+            # under a maximised one would make every later epoch fail the
+            # comparison and the run would finish with no best checkpoint.
+            resumed_best = float(resume_progress.best_metric)
+            if not (monitor_higher_is_better and resumed_best == float("inf")):
+                best_monitored = resumed_best
             history = LossHistory(
                 train=list((resume_payload.get("history") or {}).get("train_loss", [])),
                 validation=list((resume_payload.get("history") or {}).get("validation_loss", [])),
             )
             logger.info(
-                "Resume | continuing at fold %s, epoch %s, step %s (best val loss %.5f).",
-                resume_fold, resume_progress.epoch + 1, global_step, best_val_loss,
+                "Resume | continuing at fold %s, epoch %s, step %s (best %s %.5f).",
+                resume_fold, resume_progress.epoch + 1, global_step,
+                monitor_key, best_monitored,
             )
             tracker.log_event(
                 "resume", {"path": resume_path, "fold": resume_fold, **resume_progress.as_dict()}
@@ -1850,18 +1905,45 @@ def main(cfg: DictConfig) -> None:
                     prefix="epoch",
                 )
 
-                if val_metrics["loss"] < best_val_loss:
-                    best_val_loss = val_metrics["loss"]
+                if monitor_key not in val_metrics:
+                    raise KeyError(
+                        f"experiment.validation.monitor={monitor_key!r} is not a key of the "
+                        f"validation metrics. Available: {sorted(val_metrics)}"
+                    )
+                monitored = float(val_metrics[monitor_key])
+                improved = (
+                    monitored > best_monitored if monitor_higher_is_better
+                    else monitored < best_monitored
+                )
+                if improved:
+                    best_monitored = monitored
                     checkpoint_path = save_checkpoint(
                         checkpoint_manager, "best_hierarchical_moe.pth", encoder, model, criterion,
                         optimizer, scheduler, epoch, fold, dataset, include_optimizer,
                     )
+                    # A SNAPSHOT, not the live modules. `encoder`, `model` and
+                    # `criterion` keep training for the remaining epochs, so
+                    # holding references here meant the held-out evaluation,
+                    # the efficiency profile and `hierarchical_moe_final.pth`
+                    # all described the LAST epoch while reporting the best
+                    # epoch's number -- silently, and with the checkpoint file
+                    # itself carrying the wrong `epoch` field. Measured on the
+                    # shipped run: `hierarchical_moe_final.pth` was labelled
+                    # epoch 6 and was tensor-identical to epoch 100.
                     best_state = {
-                        "encoder": encoder, "model": model, "criterion": criterion,
-                        "optimizer": optimizer, "scheduler": scheduler,
+                        "encoder_state": clone_cpu_state_dict(encoder),
+                        "model_state": clone_cpu_state_dict(model),
+                        "criterion_state": clone_cpu_state_dict(criterion),
                         "epoch": epoch, "fold": fold,
                     }
-                    tracker.log_event("checkpoint", {"type": "best", "path": checkpoint_path, "loss": best_val_loss})
+                    tracker.log_event(
+                        "checkpoint",
+                        {
+                            "type": "best", "path": checkpoint_path,
+                            "monitor": monitor_key, "value": best_monitored,
+                            "epoch": epoch, "fold": fold,
+                        },
+                    )
 
                 save_interval = int(cfg.experiment.training.save_interval)
                 if save_interval > 0 and epoch % save_interval == 0:
@@ -1898,7 +1980,7 @@ def main(cfg: DictConfig) -> None:
                                 epoch=epoch,
                                 global_step=global_step,
                                 micro_step=0,
-                                best_metric=best_val_loss,
+                                best_metric=best_monitored,
                                 completed=(fold == len(splits) and epoch == epochs),
                             ),
                             context=context,
@@ -1976,6 +2058,23 @@ def main(cfg: DictConfig) -> None:
         if best_state is None:
             raise RuntimeError("Training finished without producing a best checkpoint.")
 
+        # Restore the selected epoch's weights into the live modules, on EVERY
+        # rank, before anything reads them. From here the modules hold the
+        # selected parameters and nothing downstream has to know a snapshot was
+        # taken -- the held-out evaluation, `profile_run`, `write_run_summary`
+        # and `hierarchical_moe_final.pth` all see the same, correct weights.
+        #
+        # Every rank restores because DDP's guarantee is that the ranks agree,
+        # and letting rank 0 diverge here would break that for any collective
+        # after this point.
+        encoder.load_state_dict(best_state["encoder_state"], strict=True)
+        model.load_state_dict(best_state["model_state"], strict=True)
+        criterion.load_state_dict(best_state["criterion_state"], strict=True)
+        logger.info(
+            "Restored the selected checkpoint (fold %s, epoch %s, %s=%.5f) for evaluation.",
+            best_state["fold"], best_state["epoch"], monitor_key, best_monitored,
+        )
+
         # Everything from here is evaluation and reporting against parameters
         # every rank already holds identically, so it runs once. The barrier at
         # the end keeps the other ranks from tearing down the process group --
@@ -2016,7 +2115,7 @@ def main(cfg: DictConfig) -> None:
                 logger.info("Evaluating best checkpoint (fold %s, epoch %s) on %s held-out samples.",
                             best_state["fold"], best_state["epoch"], len(test_indices))
                 _, test_evaluation, test_accumulator, _ = run_epoch(
-                    best_state["encoder"], best_state["model"], best_state["criterion"],
+                    encoder, model, criterion,
                     make_loader(test_indices, shuffle=False), device, tracker, logger,
                     epoch=1, global_step=global_step, phase="test", dataset=dataset,
                     max_batches=max_batches, amp=AMP_DISABLED,
@@ -2033,9 +2132,9 @@ def main(cfg: DictConfig) -> None:
                 )
 
             final_path = save_checkpoint(
-                checkpoint_manager, "hierarchical_moe_final.pth", best_state["encoder"],
-                best_state["model"], best_state["criterion"], best_state["optimizer"],
-                best_state["scheduler"], best_state["epoch"], best_state["fold"], dataset,
+                checkpoint_manager, "hierarchical_moe_final.pth", encoder,
+                model, criterion, optimizer,
+                scheduler, best_state["epoch"], best_state["fold"], dataset,
                 include_optimizer,
             )
             tracker.log_artifact(final_path, name="hierarchical_moe_final", artifact_type="model")
@@ -2046,7 +2145,7 @@ def main(cfg: DictConfig) -> None:
             # topology was -- a "latency" that depended on the GPU count of the
             # training job would not be a number anyone could act on.
             efficiency = profile_run(
-                best_state["encoder"], best_state["model"], eval_dataset, cfg, device, logger,
+                encoder, model, eval_dataset, cfg, device, logger,
                 sample_indices=test_indices if len(test_indices) else None,
             )
             if efficiency is not None:
@@ -2056,8 +2155,8 @@ def main(cfg: DictConfig) -> None:
             summary_path = write_run_summary(
                 cfg=cfg,
                 output_dir=output_dir,
-                model=best_state["model"],
-                criterion=best_state["criterion"],
+                model=model,
+                criterion=criterion,
                 evaluation=test_evaluation,
                 accumulator=test_accumulator,
                 dataset=dataset,

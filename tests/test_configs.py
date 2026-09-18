@@ -13,6 +13,9 @@ from hydra import compose, initialize_config_dir
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
+from src.trainers.moe_finetune import resolve_monitor
+from src.utils.metrics import evaluate_hierarchical
+
 from tests.conftest import (
     ADACOS_SCALE_27,
     DATASET_NUM_CROPS,
@@ -697,3 +700,39 @@ def test_paper_result_artifacts_are_enabled(finetune_cfg):
     assert artifacts.log_expert_utilization is True
     assert artifacts.log_tsne is True
     assert artifacts.log_per_class_tables is True
+
+
+def test_stage_two_selects_the_checkpoint_on_macro_f1_not_the_loss(finetune_cfg):
+    """The primary stage-2 recipe must not select its checkpoint on the loss.
+
+    Evaluation passes no labels, so the ArcFace margin never reaches a
+    validation forward and the validation loss is a margin-free NLL at every
+    epoch -- the units do not change under the ramp. What changes is what the
+    NLL tracks: the training objective keeps sharpening the posterior, so NLL
+    rises on the residual errors faster than it falls on the correct ones, and
+    its minimum lands in the early, under-confident regime.
+
+    Measured on the shipped 100-epoch run (`outputs/finetune_hierarchical_moe`),
+    validation loss bottomed at epoch 6 and finished 47.5 % higher, while test
+    accuracy over epochs 6..100 moved +0.15 pp (McNemar exact p = 0.87) and ECE
+    *improved* from 0.138 to 0.077. Selecting on loss therefore reported epoch 6
+    as "best" on a criterion that had stopped tracking the quantity the results
+    table reports.
+
+    Macro-F1 rather than accuracy because the corpus runs 277 to 1,514 crops per
+    class, so accuracy is dominated by the two largest millets; macro-F1 is also
+    the headline column of `scripts/generate_plots.py`'s table.
+    """
+    key, higher_is_better = resolve_monitor(finetune_cfg)
+    assert key == "sub_variety/f1_macro"
+    assert higher_is_better is True
+    # And it must be a key the validation epoch actually emits. A typo here
+    # would raise at the first validation epoch, but only after the run had
+    # already paid for one, so it is worth catching in the config tests.
+    emitted = evaluate_hierarchical(
+        seed_true=[0, 1], seed_pred=[0, 1],
+        sub_true=[0, 1], sub_pred=[0, 1],
+        subvariety_to_seed_type=[0, 1],
+        num_seed_types=2, num_sub_varieties=2,
+    ).scalar_metrics()
+    assert key in emitted

@@ -138,9 +138,39 @@ class RunSummary:
 
     @classmethod
     def load(cls, path: str | Path) -> "RunSummary":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        """Read one ``summary.json``, rebasing its paths onto where it was found.
+
+        ``run_dir`` and ``artifacts`` are absolute paths recorded by the machine
+        that *trained* the run, and training and reporting routinely happen on
+        different machines -- a run produced under ``/kaggle/working/outputs/...``
+        and copied down to a laptop keeps pointing at a directory that does not
+        exist here. Every consumer then reads ``test_predictions.npz`` as absent
+        and silently reports zero figures, which looks exactly like a run that
+        never wrote one.
+
+        The recorded path wins whenever it still resolves, so a run analysed on
+        the machine that produced it is unaffected; only a path that does *not*
+        exist is retried against this summary's own directory, and only if the
+        file is actually there. Provenance is therefore preserved where it is
+        meaningful and repaired where it is merely stale.
+        """
+        summary_path = Path(path)
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
         known = {key: payload.get(key) for key in cls.__dataclass_fields__ if key in payload}
-        return cls(**known)
+        summary = cls(**known)
+
+        directory = summary_path.parent
+        if not summary.run_dir or not Path(summary.run_dir).exists():
+            summary.run_dir = str(directory)
+        summary.artifacts = {
+            name: (
+                recorded
+                if Path(recorded).exists() or not (directory / Path(recorded).name).exists()
+                else str(directory / Path(recorded).name)
+            )
+            for name, recorded in (summary.artifacts or {}).items()
+        }
+        return summary
 
     # ------------------------------------------------------------ table rows
 

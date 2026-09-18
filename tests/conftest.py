@@ -162,13 +162,22 @@ REVISED_DROP_PATH_RATE = 0.1
 # a test asserting one of these numbers is asserting the canonical run rather
 # than a number the reader assumed.
 #
-# 50 epochs, not 100: the budget is decided by the in-training representation
+# 70 epochs, not 100: the budget is decided by the in-training representation
 # probe, and on a 100-epoch run of the earlier recipe the probe peaked at epoch
 # 50 (0.6358) and fell to 0.6284 by epoch 100. The probe forces every epoch it
 # scores into `save_epochs`, so the milestone list is what it can select from.
-STAGE1_EPOCHS = 50
+#
+# The ceiling is 70 rather than 50 because the probe's own stopping rule, not
+# this number, is meant to end the run: `probe.patience` is 30 epochs, so a
+# 50-epoch ceiling could be reached before a plateau had been demonstrated and
+# the budget would have been cut by the config rather than by the measurement.
+# 70 leaves the patience window room to fire. These constants are the shipped
+# recipe, so they move WITH `conf/experiment/pretrain_dino.yaml` -- a test
+# asserting one of them is asserting the canonical run, which is exactly why
+# they may not be allowed to drift apart from it.
+STAGE1_EPOCHS = 70
 STAGE1_WARMUP_EPOCHS = 5
-STAGE1_SAVE_EPOCHS = [5, 10, 15, 20, 25, 30, 40, 50]
+STAGE1_SAVE_EPOCHS = [20, 25, 30, 40, 50, 60, 70]
 
 # Learning rate. Section 6.1's 0.0005 is DINO's rate at ITS reference batch of
 # 256; this pipeline derives the run's rate from the effective batch by the

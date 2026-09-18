@@ -22,6 +22,8 @@ from src.losses.hierarchical import build_combined_loss
 from src.models.builder import HierarchicalSeedClassifier, build_hierarchical_moe
 from src.trainers.moe_finetune import (
     build_optimizer,
+    clone_cpu_state_dict,
+    resolve_monitor,
     run_epoch,
     save_split_manifest,
     split_dataset,
@@ -370,3 +372,143 @@ def test_tracker_survives_missing_optional_backends(tmp_path):
         assert tracker.wandb_run is None
         tracker.log_metrics({"loss": 1.0}, step=0)
     assert (tmp_path / "run2" / "events.jsonl").exists()
+
+
+# ------------------------------------------- best-checkpoint state retention
+#
+# The defect these pin: `best_state` used to hold LIVE module references
+# (`{"encoder": encoder, "model": model, ...}`). Those modules kept training for
+# the remaining epochs, so the held-out evaluation, the efficiency profile and
+# `hierarchical_moe_final.pth` all described the FINAL epoch while reporting the
+# selected epoch's number -- and the checkpoint file carried the wrong `epoch`
+# field. Measured on `outputs/finetune_hierarchical_moe`, a run selected at
+# epoch 6: `hierarchical_moe_final.pth` was labelled epoch 6 and was
+# tensor-identical to `model_fold1_epoch0100.pth`.
+
+
+def _params(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def _assert_bit_identical(left, right, label: str) -> None:
+    assert set(left) == set(right), label
+    for key in left:
+        assert torch.equal(left[key], right[key]), f"{label}: tensor {key} differs"
+
+
+def test_clone_cpu_state_dict_does_not_alias_a_cpu_module():
+    """`Tensor.cpu()` returns *self* for a CPU tensor, so the clone is load-bearing.
+
+    Without it the "snapshot" aliases the live parameter on any CPU run and the
+    bug survives the fix on exactly the configuration the tests exercise.
+    """
+    model = torch.nn.Linear(4, 3)
+    snapshot = clone_cpu_state_dict(model)
+    with torch.no_grad():
+        model.weight.add_(1.0)
+    assert not torch.equal(snapshot["weight"], model.weight.detach().cpu())
+
+
+@pytest.mark.parametrize("num_folds", [1, 3])
+def test_selected_checkpoint_is_restored_bit_identically(dataset, num_folds):
+    """The restored weights are the selected epoch's, not the last epoch's.
+
+    Mirrors the trainer's own loop: modules are rebuilt per fold, a snapshot is
+    taken whenever the monitored metric improves, training continues, and the
+    snapshot is restored into the live modules before evaluation. The monitor
+    series is scripted so the winner is never the final epoch of the final fold
+    -- which is precisely the case the old reference-holding code got wrong.
+    """
+    epochs = 4
+    # Scripted validation macro-F1. The global maximum sits mid-run in every
+    # configuration, so a restore that silently yielded the last epoch fails.
+    scores = {
+        (1, 1): 0.10, (1, 2): 0.55, (1, 3): 0.30, (1, 4): 0.20,
+        (2, 1): 0.15, (2, 2): 0.40, (2, 3): 0.90, (2, 4): 0.25,  # global best
+        (3, 1): 0.05, (3, 2): 0.35, (3, 3): 0.45, (3, 4): 0.50,
+    }
+
+    best_monitored = float("-inf")
+    best_state = None
+    reference = None  # independent copy of the weights at the winning epoch
+    model = None
+
+    for fold in range(1, num_folds + 1):
+        torch.manual_seed(100 + fold)
+        # Rebuilt per fold, exactly as `moe_finetune` does.
+        model = torch.nn.Sequential(torch.nn.Linear(8, 8), torch.nn.Linear(8, 4))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+        for epoch in range(1, epochs + 1):
+            # A real parameter update, so every epoch's weights are distinct.
+            optimizer.zero_grad()
+            model(torch.randn(4, 8)).sum().backward()
+            optimizer.step()
+
+            monitored = scores[(fold, epoch)]
+            if monitored > best_monitored:
+                best_monitored = monitored
+                best_state = {
+                    "model_state": clone_cpu_state_dict(model),
+                    "epoch": epoch,
+                    "fold": fold,
+                }
+                reference = _params(model)
+
+    assert best_state is not None
+    expected_fold = 2 if num_folds >= 2 else 1
+    expected_epoch = 3 if num_folds >= 2 else 2
+    assert (best_state["fold"], best_state["epoch"]) == (expected_fold, expected_epoch)
+
+    # The winner is not the final epoch of the final fold, so a restore that
+    # returned the live weights would differ.
+    live = _params(model)
+    assert any(not torch.equal(live[key], reference[key]) for key in reference)
+
+    model.load_state_dict(best_state["model_state"], strict=True)
+    _assert_bit_identical(_params(model), reference, "restored selected checkpoint")
+
+
+def test_snapshot_is_unaffected_by_later_epochs(dataset):
+    """A snapshot taken at the best epoch must not track subsequent training."""
+    torch.manual_seed(7)
+    model = torch.nn.Linear(6, 6)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+
+    snapshot = clone_cpu_state_dict(model)
+    frozen = {key: value.clone() for key, value in snapshot.items()}
+
+    for _ in range(5):
+        optimizer.zero_grad()
+        model(torch.randn(3, 6)).sum().backward()
+        optimizer.step()
+
+    _assert_bit_identical(snapshot, frozen, "snapshot after further training")
+    assert not torch.equal(snapshot["weight"], model.weight.detach().cpu())
+
+
+# ----------------------------------------------------- monitor configuration
+
+
+@pytest.mark.parametrize(
+    ("monitor", "higher_is_better"),
+    [
+        ("sub_variety/f1_macro", True),
+        ("sub_variety/accuracy", True),
+        ("seed_type/f1_macro", True),
+        ("loss", False),
+        ("arcface_loss", False),
+    ],
+)
+def test_resolve_monitor_direction(monitor, higher_is_better):
+    """A key containing "loss" minimises; every other metric maximises.
+
+    `monitor` was documented in the config and read by nothing -- selection was
+    hard-wired to the validation loss. This pins the direction rule so a metric
+    cannot be selected in the wrong direction, which fails silently: the run
+    still produces a checkpoint, just consistently the worst one seen.
+    """
+    cfg = OmegaConf.create({"experiment": {"validation": {"monitor": monitor}}})
+    key, resolved = resolve_monitor(cfg)
+    assert key == monitor
+    assert resolved is higher_is_better

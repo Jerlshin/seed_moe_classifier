@@ -79,6 +79,34 @@ def image_sizes(paths: Sequence[str | os.PathLike[str]]) -> list[tuple[int, int]
     return sizes
 
 
+def _relative_to_root(item: str | os.PathLike[str], base: Path) -> str:
+    """One dataset-relative POSIX path, whatever spelling the caller used.
+
+    The fingerprint's whole value is that the same corpus digests the same on
+    every machine, so the root's spelling must not survive into the digest.
+    Testing ``is_absolute()`` was not enough: a *relative* ``root_path`` such as
+    ``../Dataset/Hierarchical_SeedData/Refined_Samples`` makes the dataset's own
+    sample paths relative too, and they were then hashed with that prefix still
+    attached. Measured on this corpus, the identical 13,492 files digest to
+    ``013c04c5...`` when the root is spelled absolutely and ``95ad3f2d...`` when
+    it is spelled ``../Dataset/...`` -- which is a *false* corpus mismatch, and
+    ``experiment.training.corpus_check: error`` would abort a perfectly valid run
+    on it.
+
+    Resolving both sides makes the comparison independent of spelling, including
+    ``..`` segments and symlink-free relative roots. Anything genuinely outside
+    ``base`` keeps its own posix form rather than raising, because a fingerprint
+    is a diagnostic and must not be the thing that fails a run.
+    """
+    path = Path(item)
+    for candidate, anchor in ((path, base), (Path(os.path.abspath(path)), Path(os.path.abspath(base)))):
+        try:
+            return candidate.relative_to(anchor).as_posix()
+        except ValueError:
+            continue
+    return path.as_posix()
+
+
 def corpus_fingerprint(
     root: str | os.PathLike[str],
     relative_paths: Sequence[str] | None = None,
@@ -121,14 +149,7 @@ def corpus_fingerprint(
         ]
         names = sorted(path.relative_to(base).as_posix() for path in candidates)
     else:
-        names = sorted(
-            (
-                Path(item).relative_to(base).as_posix()
-                if Path(item).is_absolute()
-                else Path(item).as_posix()
-            )
-            for item in relative_paths
-        )
+        names = sorted(_relative_to_root(item, base) for item in relative_paths)
 
     digest = hashlib.sha256()
     for name in names:
