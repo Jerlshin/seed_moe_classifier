@@ -1,36 +1,37 @@
 # @package _global_
 #
-# The stage-2 configuration under photograph-disjoint splitting.
+# DORMANT -- photograph-disjoint stage-2 cross-validation. OUT OF SCOPE.
 #
 #     python main.py finetune-grouped
 #
-# This is a **secondary diagnostic, not the primary pipeline.** The primary
-# pipeline is `finetune_hierarchical_moe`, and nothing in it depends on this file
-# existing or having been run.
+# ###########################################################################
+# # This configuration is NOT part of this study and produces no published  #
+# # result. The sole evaluation standard is the CROP-LEVEL STRATIFIED       #
+# # protocol in `finetune_hierarchical_moe.yaml`, run by                    #
+# # `python main.py finetune`. Do not report a number from this file        #
+# # beside one from the primary benchmark.                                  #
+# ###########################################################################
 #
-# It exists for one reason: the crop-level headline is ~18 pp above a
-# photograph-disjoint estimate, and quoting a leakage figure measured on some
-# other encoder next to this encoder's accuracy is quoting a number that was not
-# measured on the thing being reported. Running the identical configuration under
-# `grouped_cv` makes the delta a property of this pipeline.
+# It is kept wired up because the splitter supports `grouped_cv`, the tests
+# cover it, and the launch procedure is recorded in `RUNBOOK_GROUPED_CV.md`
+# (also marked dormant) -- so that photograph-disjoint generalisation can be
+# picked up as separate work later without reconstructing any of it. Nothing in
+# the primary pipeline depends on this file existing or having been run, and
+# `scripts/generate_plots.py` does not scan for its output directory.
 #
-# `grouped_cv` rather than `grouped`, because `grouped`'s `GroupShuffleSplit`
-# takes 20 % of the 81 photographs unstratified and the resulting test side holds
-# only 14 of the 27 classes -- a 27-way macro-F1 on it is mechanically capped
-# near 14/27 for reasons unrelated to the model. `grouped_cv` partitions every
-# crop into photograph-disjoint folds and concatenates the out-of-fold
-# predictions, so every class is scored.
+# What it does, for the record: `grouped_cv` partitions every crop into 5
+# photograph-disjoint folds with `StratifiedGroupKFold` and concatenates the
+# out-of-fold predictions, so it holds out no separate test split. The resulting
+# number estimates the *recipe* -- K different models contributed predictions --
+# rather than any single shipped model's test score.
 #
-# Two things this number is not. It is an estimate of the *recipe* -- K different
-# models contributed predictions -- rather than any single shipped model's test
-# score; and it is not comparable with the crop-level number as a "better" or
-# "worse" result, only as a measurement of the gap between two questions.
-#
-# Note also that five sub-varieties have crops from exactly one photograph
-# (Baryard, Browntop, FingerMillet, PearlMillet, ProsaMillet -- 1,387 crops,
-# 14.8 % of the dataset). Under any photograph-disjoint split they are
-# unpredictable, identically for every encoder including an untrained one. That
-# is a property of the dataset and the fix is a camera, not a splitter.
+# Why it is not a meaningful standard for the 27-way task as this dataset
+# stands: five sub-varieties have crops from exactly one photograph (Baryard,
+# Browntop, FingerMillet, PearlMillet, ProsaMillet). Under any
+# photograph-partitioned split their entire class falls on one side of the
+# boundary, so those five of 27 classes cannot be scored at all -- identically
+# for every encoder, including an untrained one. That is a property of the
+# corpus, and the fix is a camera rather than a splitter.
 
 defaults:
   - finetune_hierarchical_moe

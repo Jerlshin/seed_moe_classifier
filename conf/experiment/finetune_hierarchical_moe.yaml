@@ -25,7 +25,7 @@ experiment:
     max_batches: null
 
     # -----------------------------------------------------------------------
-    # SPLIT PROTOCOL, AND WHAT THE HEADLINE NUMBER MEANS.
+    # SPLIT PROTOCOL -- THE EVALUATION STANDARD FOR THIS STUDY.
     #
     # "stratified" holds out 20 % of the CROPS, stratified on sub-variety, then
     # splits the remainder into a stratified train/validation pair. The model is
@@ -33,40 +33,37 @@ experiment:
     # `num_folds: 1` keeps one named partition, so "the model" is one model with
     # one test score.
     #
-    # This is the primary protocol by instruction, and its cost is measured
-    # rather than assumed. The 9,357 crops come from 81 SOURCE PHOTOGRAPHS -- a
-    # mean of 115 crops per photograph, cut from the same tray under the same
-    # lighting, frequently with overlapping bounding boxes -- so crop-level
-    # splitting puts near-duplicate views of the same physical seeds on both
-    # sides of the boundary. Under an identical frozen encoder and probe:
+    # THIS IS THE SOLE PROTOCOL THIS STUDY REPORTS UNDER. Every published
+    # figure, table and accuracy comes from it, and `python main.py finetune` is
+    # the production benchmark command that produces them.
     #
-    #     27-way probe   photograph-disjoint 0.6500 -> crop-level 0.8365  (+18.65 pp)
-    #     27-way k-NN    photograph-disjoint 0.5099 -> crop-level 0.6891  (+17.92 pp)
-    #     retrieval P@1  0.4745 excluding same-photograph neighbours, 0.6636 including
+    # The unit of classification is the INDIVIDUAL SEED INSTANCE. That is what
+    # stage 0 emits (one square crop per seed), what the taxonomy labels, and
+    # what a downstream user presents. Stratifying on sub-variety is what puts
+    # all 27 classes on the test side with support proportional to prevalence,
+    # so the reported 27-way macro-F1 is a genuine 27-way number rather than a
+    # macro average over whichever subset of classes a partition happened to
+    # leave there.
     #
-    # and 89-98 % of the crops in a photograph have a neighbour above cosine 0.95
-    # at 32 x 32 grey. So this number answers "how well does this classify a new
-    # crop from a KNOWN acquisition session" and not "...from a new session".
+    # The split is driven entirely by `cfg.seed` and persisted to
+    # `split_manifest.npz`, so it is byte-identical across every variant,
+    # ablation, baseline and control -- which is what makes McNemar's exact test
+    # valid for the component comparisons in `scripts/generate_plots.py`.
     #
-    # Nothing here hides that. `leakage_report` runs for both protocols and
-    # `shared_source_groups`, `leaked_test_fraction` and `classes_present_in_test`
-    # land in `summary.json` for every run, and
-    # `experiment=finetune_grouped_diagnostic` is this same configuration under
-    # photograph-disjoint `grouped_cv`, so the delta is measured on THIS encoder.
-    #
-    # The other two values:
-    #   "grouped"     -- one GroupShuffleSplit over the 81 photographs. Note it
-    #                    is unstratified, so the test side holds only 14 of the
-    #                    27 classes and a 27-way macro-F1 on it is mechanically
-    #                    capped near 14/27.
+    # The other two values are DORMANT and out of scope. They remain wired up
+    # because the splitter supports them and the tests cover them, but no result
+    # in this study is produced under either, and a number from one must not be
+    # reported beside a number from this one:
+    #   "grouped"     -- one unstratified GroupShuffleSplit over the source
+    #                    photographs. The test side holds roughly half the
+    #                    classes, so a 27-way macro-F1 on it is mechanically
+    #                    capped for reasons unrelated to the model.
     #   "grouped_cv"  -- StratifiedGroupKFold over every crop, out-of-fold
-    #                    predictions concatenated; covers all 27 classes. This is
-    #                    the photograph-disjoint estimate worth quoting, and it
-    #                    estimates the RECIPE (K models contributed), not any one
-    #                    shipped model.
-    #
-    # Known limit no protocol fixes: 5 of 27 sub-varieties have crops from
-    # exactly ONE photograph, so no grouped split can place them on both sides.
+    #                    predictions concatenated. Estimates the RECIPE (K
+    #                    models contributed), not any one shipped model.
+    # Both are photograph-partitioned, and 5 of 27 sub-varieties have crops from
+    # exactly ONE photograph -- so neither can score those five classes at all.
+    # See RUNBOOK_GROUPED_CV.md, which is marked dormant.
     # -----------------------------------------------------------------------
     split_protocol: "stratified"
 

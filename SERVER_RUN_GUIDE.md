@@ -178,9 +178,6 @@ python main.py eval-pretrain
 export SEED_PRETRAIN_BACKBONE="${SEED_OUTPUT_DIR}/checkpoints/dino_pretrained_encoder.pth"
 python main.py finetune --gpus 2
 
-# --- the photograph-disjoint diagnostic, for the leakage delta -------------
-python main.py finetune-grouped
-
 # --- the arms, if the budget allows ---------------------------------------
 python scripts/run_stage1_ablations.py --arms conf/stage1_arms/view_design.yaml
 ```
@@ -606,7 +603,7 @@ background expecting them to race safely.
 | Stage 2 `epochs` | 100 | — |
 | Stage 2 `weight_decay` | 0.0001 | — |
 | Stage 2 `clip_grad` | 3.0 | — |
-| `split_protocol` | **`stratified`** (crop level, primary) / `grouped` / `grouped_cv` | the diagnostic is `experiment=finetune_grouped_diagnostic` |
+| `split_protocol` | **`stratified`** — crop level, the sole evaluation standard | `grouped` / `grouped_cv` are wired up but dormant and out of scope |
 | `test_size` | 0.2 (0.0 under `grouped_cv`) | — |
 | `num_folds` | 1 (set >1 for `StratifiedGroupKFold`) | — |
 | `margin_warmup_fraction` | 0.15 | ArcFace margin ramps 0 -> m |
@@ -709,7 +706,6 @@ ${SEED_OUTPUT_DIR}/
   baselines/
     {model}/seed{42..46}/              # same contract as above
     suite_manifest.json
-  finetune_grouped_diagnostic/        # `main.py finetune-grouped`, the leakage delta
   reports/
     summary_metrics.csv               # Model/Variant, Accuracy, Precision, Recall,
                                        # Macro F1, Micro F1, KL Alignment Rate (%),

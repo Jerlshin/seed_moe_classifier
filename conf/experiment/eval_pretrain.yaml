@@ -19,11 +19,12 @@
 #    encoder the in-training probe selected and the one stage 2 is handed. That
 #    row is the headline; the numbered milestones are what make "did the probe
 #    pick the right one" checkable rather than assumed.
-# 2. The headline split is **crop-level stratified**, matching the primary
-#    pipeline, and `grouped_cv` is off. The photograph-disjoint estimate is
-#    reported beside it (`split.also_stratified` is inverted here: the grouped
-#    single split is the companion, not the headline) and measured end-to-end by
-#    `experiment=finetune_grouped_diagnostic`.
+# 2. The split is **crop-level stratified**, matching the primary pipeline and
+#    this study's sole evaluation standard, so the stage-1 and stage-2 numbers
+#    are directly comparable. Both photograph-partitioned companions are OFF
+#    (`grouped_cv.enabled: false`, `split.also_stratified: false`): they are out
+#    of scope here and reporting one beside the headline would invite averaging
+#    two different questions.
 # 3. `random_init` and `imagenet_init` use the same trunk as the run under test,
 #    so the "+X pp from self-distillation" figure is not partly an architecture
 #    delta.
@@ -90,14 +91,17 @@ experiment:
     teacher:
       enabled: false
     split:
-      # Crop-level is the primary protocol for this pipeline.
+      # Crop-level stratified -- this study's sole evaluation standard, and the
+      # same protocol stage 2 reports under, so the two stages are comparable.
       protocol: "stratified"
       test_size: 0.2
       num_folds: 5
-      # Report the photograph-disjoint single split alongside, so the ~18 pp gap
-      # is measured on THIS encoder rather than quoted from the previous one.
-      # It is a reported diagnostic, never an input to a headline number.
-      also_stratified: true
+      # When `protocol` is "stratified" this flag adds a PHOTOGRAPH-DISJOINT
+      # companion split to the report. Off: photograph-partitioned evaluation is
+      # out of scope for this study, and a companion column invites averaging
+      # two different questions into one. The code default is `true`, so this
+      # key must stay explicit.
+      also_stratified: false
     grouped_cv:
       enabled: false
     reuse_cached_features: true

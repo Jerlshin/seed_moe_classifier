@@ -178,7 +178,7 @@ single-override ablation, and each file's header says which.
 | `eval_frozen_reference.yaml` | The bar: the frozen trunk, no in-domain training. Run it *before* stage 1 |
 | `screen_backbones.yaml` | Frozen-feature screen across candidate trunks. No training |
 | `finetune_hierarchical_moe.yaml` | **Stage 2.** Crop-level stratified train/val/test. Every ablation, control and baseline inherits from it |
-| `finetune_grouped_diagnostic.yaml` | The same under photograph-disjoint `grouped_cv`. A **diagnostic**, not the primary path |
+| `finetune_grouped_diagnostic.yaml` | The same under photograph-disjoint `grouped_cv`. **DORMANT** — out of scope, produces no published result |
 | `pretrain_dino_base.yaml` | Capacity control: the same recipe on SwinV2-Base at the same IN-1k corpus |
 | `pretrain_dino_base_in22k.yaml` | Corpus control: SwinV2-Base pretrained on IN-22k. A *different* question from the line above |
 | `control_imagenet_frozen.yaml` | The stage-1 control: ImageNet, frozen, straight to stage 2 |

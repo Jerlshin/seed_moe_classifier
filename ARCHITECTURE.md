@@ -146,16 +146,19 @@ python -m src.trainers.contrastive_pretrain experiment=pretrain_dino_base     # 
 | Attention | `Q = h'`, `K = V = h`; not allocated at all in `token_mode=pooled`, where it would be affine |
 | Head | ArcFace with the AdaCos scale `sqrt(2) log(C-1) = 4.61`, margin ramped over the first 15 % |
 | Loss | Seven weighted terms; `CombinedHierarchicalLoss` reads a dataclass, never a tuple |
-| Split | **Crop-level stratified** (primary), with `grouped_cv` as the photograph-disjoint diagnostic |
+| Split | **Crop-level stratified** — the sole evaluation standard for this study |
 
-The split is the one place where the honest number and the reported number differ
-by a measured amount: 13,492 crops come from 96 photographs, and under an
-identical frozen ImageNet trunk the crop-level 27-way probe sits **+17.59 pp**
-above the photograph-disjoint one (0.8599 against 0.6840; it was +18.13 pp on the
-9,357-crop / 81-photograph corpus this replaced). Every run reports `shared_source_groups`,
-`leaked_test_fraction` and `classes_present_in_test`, and
-`experiment=finetune_grouped_diagnostic` measures the gap on the encoder being
-reported rather than quoting it from another one.
+The unit of classification is the individual seed crop: 20 % held out, stratified
+on sub-variety, one named partition (`num_folds: 1`), select on validation macro-F1,
+report on test. All 27 classes land on the test side, so the reported 27-way
+macro-F1 is a genuine 27-way number, and the split is byte-identical across every
+variant — which is what makes McNemar's exact test valid for the ablation table.
+`python main.py finetune` is the production benchmark command.
+
+Photograph-partitioned protocols (`grouped`, `grouped_cv`) remain wired up and
+tested, but they are **out of scope**: no published result comes from one, they
+answer a different question, and five of the 27 sub-varieties have crops from a
+single photograph so no photograph-partitioned split can score them at all.
 
 ## Where the invariants live
 

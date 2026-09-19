@@ -7,8 +7,7 @@
     python main.py eval-frozen        # the frozen-trunk bar stage 1 must clear
     python main.py pretrain           # stage 1: DINO self-distillation
     python main.py eval-pretrain      # stage 1.5: score the representation
-    python main.py finetune           # stage 2: hierarchical MoE
-    python main.py finetune-grouped   # stage 2 under photograph-disjoint folds
+    python main.py finetune           # stage 2: hierarchical MoE -- THE production benchmark
     python main.py screen-backbones   # no-training initialisation screen
     python main.py ablation           # flat-classifier ablation
     python main.py smoke              # 2-batch dry run of both stages
@@ -34,7 +33,7 @@ it, because ``resume=auto`` starts fresh when there is nothing to continue:
 the milestone encoders the pretraining stage already published:
 
     python main.py eval-pretrain
-    python main.py eval-pretrain experiment.evaluation.split.protocol=grouped
+    python main.py eval-pretrain experiment.evaluation.probe.low_shot_shots=[1,5,25]
 
 Stage 0 builds the corpus itself and takes ``conf/segmentation.yaml`` overrides:
 
@@ -75,9 +74,16 @@ PRETRAIN = [sys.executable, "-m", "src.trainers.contrastive_pretrain", "experime
 FINETUNE = [sys.executable, "-m", "src.trainers.moe_finetune", "experiment=finetune_hierarchical_moe"]
 ABLATION = [sys.executable, "-m", "src.trainers.moe_finetune", "experiment=ablation_flat_classifier"]
 
-# Stage 2 under photograph-disjoint folds. A *secondary diagnostic*: the primary
-# protocol is crop-level, and this measures the ~18 pp that costs, on this
-# encoder rather than on a quoted one.
+# DORMANT -- stage 2 under photograph-disjoint folds. OUT OF SCOPE for this
+# study and it produces no published result.
+#
+# `finetune` above is the sole production benchmark: crop-level stratified
+# splitting over individual seed crops, which is the evaluation standard every
+# figure and table in the paper and `MODEL_EVALUATION_REPORT.md` is produced
+# under. This stage stays wired up only so that photograph-disjoint
+# generalisation can be taken up as separate work later without reconstructing
+# it -- see `conf/experiment/finetune_grouped_diagnostic.yaml` and the dormant
+# `RUNBOOK_GROUPED_CV.md`. `scripts/generate_plots.py` does not scan its output.
 FINETUNE_GROUPED = [
     sys.executable, "-m", "src.trainers.moe_finetune",
     "experiment=finetune_grouped_diagnostic",

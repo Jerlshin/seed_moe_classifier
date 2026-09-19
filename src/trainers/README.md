@@ -318,9 +318,14 @@ Three log lines that are easy to misread:
   sorted directory names, so a corpus with a different class set produces an
   encoder whose downstream indices refer to different classes.
 
-## `split_protocol: grouped_cv` in stage 2
+## `split_protocol: grouped_cv` in stage 2 — DORMANT
 
-The photograph-disjoint counterpart of the crop-level primary, reached as
+Stage 2's evaluation standard is the crop-level `stratified` protocol, and every
+published result comes from it. What follows documents a code path that is wired
+up and tested but **out of scope**: nothing in the pipeline reports under it, and
+a number from it must not be placed beside a crop-level one.
+
+The photograph-disjoint counterpart, reached as
 `experiment=finetune_grouped_diagnostic` or as one override. There is no held-out
 test split at all. `StratifiedGroupKFold` partitions every crop into
 photograph-disjoint folds, each fold's finished model scores its own held-out

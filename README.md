@@ -406,8 +406,7 @@ python main.py pretrain                                # or: --gpus 2
 python main.py eval-pretrain
 
 # ---- 4. stage 2: the hierarchical MoE head ------------------------------
-python main.py finetune
-python main.py finetune-grouped       # the photograph-disjoint diagnostic
+python main.py finetune                # THE production benchmark
 
 # ---- 5. analysis --------------------------------------------------------
 python scripts/run_ablations.py --gpus 0,1
@@ -432,8 +431,7 @@ The full stage list:
 | `python main.py screen-backbones` | frozen-feature screen across candidate trunks | no |
 | `python main.py pretrain` | stage 1: DINO self-distillation | **yes** |
 | `python main.py eval-pretrain` | stage 1.5: score the representation | no |
-| `python main.py finetune` | stage 2: hierarchical MoE, crop-level split | **yes** |
-| `python main.py finetune-grouped` | stage 2 under photograph-disjoint folds | **yes** |
+| `python main.py finetune` | **stage 2: hierarchical MoE — the production benchmark** | **yes** |
 | `python main.py ablation` | flat-classifier ablation | **yes** |
 | `python main.py smoke` | 2-batch dry run of both stages | trivially |
 
@@ -469,9 +467,11 @@ Three readings that shape everything downstream:
    is +3.95 pp available from the *readout stage* alone, which is what
    `model.backbone.feature_stage=stage3_pooled_2x2` and the `stage3_readout` arm
    exist to chase.
-2. **The crop-level headline sits +18.95 pp above the photograph-disjoint
-   estimate** on the identical encoder (0.8243 vs 0.6347). See §"Stage 2" for
-   what that means for the reported accuracy.
+2. **The readout protocol moves the absolute number a long way** — 0.8243
+   crop-level against 0.6347 photograph-disjoint on the identical encoder — so a
+   frozen-probe accuracy is only ever comparable against another one measured
+   the same way. Every number this study reports is crop-level; see
+   §"Stage 2".
 3. **Nuisance is not yet informative.** ImageNet (+11.4 pp) and an *untrained*
    trunk (+11.6 pp) are indistinguishable, so at this point the number reflects
    the images rather than the encoder. It becomes a discriminator only once
@@ -539,10 +539,11 @@ stage 2. `patience` ends the run on a plateau.
 *The probe is fitted on the whole corpus*, so publishing on it is a mild form of
 selection on the evaluation. It is disclosed in `summary.json` under
 `config.selection`, and `experiment.training.publish=final` is the alternative.
-Its readout is crop-level stratified, matching the primary protocol, which means
-its absolute value sits ~18 pp above a photograph-disjoint estimate. It ranks
-checkpoints *of one run*, where that offset cancels — never quote it as a
-generalisation number.
+Its readout is crop-level stratified, matching the evaluation standard, so it is
+on the same scale as every reported number. It exists to rank checkpoints *of one
+run* against each other, not to be quoted as a headline: the reported figures
+come from stage 2's held-out test split, not from a probe fitted on the whole
+corpus.
 
 **`train/loss` is not a learning curve.** Same decomposition, same consequence:
 the raw curve was flat from epoch 20 while the learnable part was still improving
@@ -704,47 +705,47 @@ projection: Top-2-of-6 routing over the `8×8` token grid, the Eq. 9 residual
 fusion, the Eq. 11–12 cross-attention, and an ArcFace head over 27 sub-varieties
 with the analytic AdaCos scale `√2·log(C−1) = 4.61`.
 
-### What the headline number measures, stated once
+### The evaluation standard, stated once
 
-The primary protocol is **crop-level stratified**: 20 % of the *crops* held out,
-stratified on sub-variety, then a stratified train/validation pair; select on
-validation, report on test.
+The sole protocol this study reports under is **crop-level stratified**: 20 % of
+the *crops* held out, stratified on sub-variety, then a stratified
+train/validation pair; select on validation, report on test.
 
-Its cost is measured rather than assumed. Under an identical frozen encoder and
-probe:
+The unit of classification is the **individual seed instance**. That is what
+stage 0 emits (one square crop per seed), what the taxonomy labels, and what a
+downstream user presents to the model. Stratifying on sub-variety is what puts
+all 27 classes on the test side with support proportional to their prevalence,
+so the reported 27-way macro-F1 is a genuine 27-way number.
 
-| | photograph-disjoint | crop-level | delta |
-| --- | --- | --- | --- |
-| 27-way probe accuracy | 0.6500 | 0.8365 | **+18.65 pp** |
-| 27-way k-NN accuracy | 0.5099 | 0.6891 | +17.92 pp |
-| retrieval P@1 | 0.4745 (same-photo neighbours excluded) | 0.6636 | +18.91 pp |
+| Property | Value |
+| --- | --- |
+| Protocol | `stratified`, crop-level, `num_folds: 1` |
+| Train / validation / test | 8,634 / 2,159 / **2,699** |
+| Stratification key | `seed_label × 1000 + sub_label` |
+| Classes present in test | **27 of 27** |
+| Selection metric | `sub_variety/f1_macro` on validation |
 
-and 89–98 % of the crops in a photograph have a neighbour above cosine 0.95 at
-32 × 32 grey. **So a crop-level number answers "how well does this classify a new
-crop from a *known* acquisition session" and not "…from a new session."**
+The split is driven entirely by `cfg.seed` and persisted to
+`split_manifest.npz`, so it is byte-identical across every variant, ablation,
+baseline and control — which is what makes McNemar's exact test valid for the
+component comparisons in `scripts/generate_plots.py`.
 
-Nothing hides that. `leakage_report` runs for both protocols and
-`shared_source_groups`, `leaked_test_fraction` and `classes_present_in_test` land
-in `summary.json` for every run, and:
+`python main.py finetune` is **the production benchmark command**, and
+`outputs/finetune_hierarchical_moe/` is the run every published figure and table
+comes from. See [`MODEL_EVALUATION_REPORT.md`](MODEL_EVALUATION_REPORT.md) for
+the full analysis of that run.
 
-```bash
-python main.py finetune-grouped     # experiment=finetune_grouped_diagnostic
-```
-
-is the identical configuration under photograph-disjoint `grouped_cv`, so the gap
-is a property of *this* encoder rather than a figure quoted from another one.
-
-Two things the diagnostic number is not: it estimates the **recipe** (K different
-models contributed out-of-fold predictions), not any single shipped model's test
-score; and it is not comparable with the crop-level number as "better" or
-"worse", only as a measurement of the gap between two questions.
-
-`grouped_cv` rather than `grouped` for the diagnostic, because `grouped`'s
-`GroupShuffleSplit` takes 20 % of the 81 photographs *unstratified* — the test
-side then holds 14 of the 27 classes and a 27-way macro-F1 on it is mechanically
-capped near 14/27 for reasons unrelated to the model. `grouped_cv` partitions
-every crop into photograph-disjoint folds and concatenates the out-of-fold
-predictions, so every class is scored. Both remain one override away:
+**Photograph-partitioned protocols are out of scope for this study.** The
+splitter still supports `grouped` and `grouped_cv`, and the tests still cover
+them, but no published result is produced under either and a number from one
+must not be reported beside a number from the benchmark — they answer a
+different question (generalisation to a new acquisition session) that this study
+does not pose. They are also not scoreable on this corpus as it stands: five of
+the 27 sub-varieties have crops from exactly one photograph, so any
+photograph-partitioned split leaves their whole class on one side of the
+boundary. The dormant launch procedure is kept in
+[`RUNBOOK_GROUPED_CV.md`](RUNBOOK_GROUPED_CV.md) in case that question is taken
+up as separate work, and both remain one override away:
 
 ```bash
 python main.py finetune experiment.training.split_protocol=grouped
@@ -774,7 +775,7 @@ python scripts/generate_plots.py              # figures + outputs/reports/summar
 | `resnet50` | ImageNet ResNet-50, supervised end to end | `experiment=baseline_resnet50` |
 | `swin_tiny` | ImageNet Swin-T, supervised end to end | `experiment=baseline_swin_tiny` |
 | `hierarchical_cce` | two-stage hierarchy, plain CCE, no MoE/attn/ArcFace | `experiment=baseline_hierarchical_cce` |
-| `leakage_grouped` | nothing architectural — the full model under photograph-disjoint folds | `experiment.training.split_protocol=grouped_cv` |
+| `leakage_grouped` *(dormant, opt-in)* | nothing architectural — the full model under photograph-disjoint folds; **not in the default suite and not a reported result** | `--variants leakage_grouped` |
 
 `scripts/run_ablations.py` carries more variants than the table above
 (`wo_moe_capacity_matched`, `moe_fixed_router`, `moe_uniform_router`,
@@ -783,9 +784,11 @@ python scripts/generate_plots.py              # figures + outputs/reports/summar
 states **every** factor it changes, which is the rule for adding one. `list` them
 with `python scripts/run_ablations.py --dry-run`.
 
-`leakage_grouped` is the one row that is not comparable by McNemar against
-`full_model`: it does not share a test split, and it estimates the recipe rather
-than one trained model.
+`leakage_grouped` is registered but **excluded from the default suite**, because
+every row of the published table must share the crop-level split byte for byte —
+that is what makes the McNemar column valid. It runs only when named explicitly
+(`--variants leakage_grouped`), its output belongs in its own table, and this
+study reports nothing from it.
 
 A disabled component is **not allocated**, so an ablation's parameter count
 describes the model actually trained. `wo_moe` keeps one dense block of identical
@@ -823,10 +826,12 @@ Everything after the stage name is a Hydra override.
 **Protocol and evaluation**
 
 ```bash
-python main.py finetune experiment.training.split_protocol=grouped_cv experiment.training.num_folds=5
 python main.py finetune experiment.training.test_size=0.3
-python main.py eval-pretrain experiment.evaluation.split.protocol=grouped
+python main.py finetune experiment.training.num_folds=5                 # stratified K-fold
 python main.py eval-pretrain experiment.evaluation.max_samples=270      # plumbing check
+
+# Dormant, out of scope for this study -- see "The evaluation standard" above:
+python main.py finetune experiment.training.split_protocol=grouped_cv experiment.training.num_folds=5
 ```
 
 **Architecture**
@@ -1006,7 +1011,6 @@ $SEED_OUTPUT_DIR/
   finetune_hierarchical_moe/
     best_hierarchical_moe.pth  hierarchical_moe_final.pth
     split_manifest.npz  summary.json  test_predictions.npz
-  finetune_grouped_diagnostic/         # the photograph-disjoint counterpart
   ablations/{full_model,wo_moe,wo_margin_only,wo_angular_head,wo_residual,wo_kl,wo_cross_attn}/
   baselines/{linear_probe,swinv2_supervised,resnet50,swin_tiny,hierarchical_cce}/
   controls/imagenet_frozen/

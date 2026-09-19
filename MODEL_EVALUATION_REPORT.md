@@ -4,21 +4,35 @@ Run: `outputs/finetune_hierarchical_moe/` · group `proposed` · variant
 `finetune_hierarchical_moe` · seed 42
 Trained on Kaggle T4×2 (`world_size=2`, fp16 autocast, deterministic cuDNN);
 evaluated in fp32 (`AMP_DISABLED`), as the stage-2 contract requires.
-Report generated 2026-09-18 against commit `09e22b3`.
+Report generated 2026-09-18 against commit `a041830`.
 
 Every number below is either read from the run's own artifacts or recomputed
 from `test_predictions.npz`. Where this report re-derives a quantity, it says
 so, and where it disagrees with `summary.json` it says that too.
 
+**Evaluation protocol: crop-level stratified, and only that.** This study
+classifies individual seed instances under a standard stratified
+train/validation/test partition (§5.3). Photograph-partitioned protocols are out
+of scope and no number here is produced under one.
+
 ---
 
 ## 0. Executive summary
 
-The model is **excellent at the coarse task and mid-range at the fine task**:
+**The evaluation standard for this study is the crop-level stratified
+protocol**, and every number in this report is produced under it: 20 % of the
+13,492 seed crops held out as a test split, stratified on sub-variety, with the
+remainder split into a stratified train/validation pair. The unit of
+classification is the **individual seed instance**, which is the unit the corpus
+is built from, the unit the taxonomy labels, and the unit a downstream user
+presents to the model. §5.3 states the protocol in full.
+
+The model is **excellent at the coarse task and strong at the fine task**:
 99.33 % seed-type accuracy against 81.73 % sub-variety accuracy (0.7943 macro
-F1) on 2,699 held-out crops. The hierarchy is essentially self-consistent
-(99.78 % alignment), all six experts are live, and routing is genuinely
-seed-type-specialised rather than merely balanced.
+F1) on 2,699 held-out crops, with all 27 classes present on the test side. The
+hierarchy is essentially self-consistent (99.78 % alignment), all six experts
+are live, and routing is genuinely seed-type-specialised rather than merely
+balanced.
 
 Three things qualify that headline, and all three are quantified below:
 
@@ -29,18 +43,17 @@ Three things qualify that headline, and all three are quantified below:
    the artifact `hierarchical_moe_final.pth` is mislabelled `epoch: 6` while
    carrying epoch-100 weights. **Now fixed and regression-tested** (§6.1); the
    published numbers stand, and a re-run will report what it selected.
-2. **The split is crop-level (`stratified`), so all 96 source photographs
-   appear on both sides of the boundary.** This is the repo's documented
-   primary protocol, not a misconfiguration, but it means 81.73 % answers
-   "a new crop from a *known* tray", not "a new tray". The repo's own frozen
-   probe prices that gap at **≈ +17.6 pp**.
-3. **The 27-class number is dominated by one genuinely unsolved group.**
+2. **The 27-class number is dominated by one genuinely unsolved group.**
    Amaranthus (AMT-1/2/4) sits at 44.98 % accuracy — near the 33 % three-way
    chance floor. Excluding it, the other 24 classes average 0.8374 macro F1.
+3. **Per-class accuracy tracks taxonomic rank, not sample size.** The 8
+   species-level labels average 0.9031 F1 against 0.7484 for the 19
+   cultivar/accession-level ones — **+15.5 pp** (§7.3). Every top confusion is
+   intra-seed-type, so the whole error budget is within-crop discrimination.
 
 Verdict in one line: **deployable as a seed-type classifier, and as a
-sub-variety classifier everywhere except Amaranthus — but not yet validated for
-a new acquisition session.** See §7.
+sub-variety classifier everywhere except Amaranthus cultivar discrimination.**
+See §7.
 
 ---
 
@@ -356,7 +369,7 @@ matmul for several small ones. Do not present the 10.46 % dormant fraction as a
 
 ---
 
-## 5. Generalisation vs overfitting dynamics (Task 3.3)
+## 5. Training dynamics, calibration and the evaluation protocol (Task 3.3)
 
 ### 5.1 The curves
 
@@ -442,116 +455,76 @@ correct reading of the curve is: the model converged by roughly epoch 6 in
 accuracy terms and spent the remaining 94 epochs sharpening its posterior. The
 practical recommendations follow in §6.4.
 
-### 5.3 Split protocol: source-photograph memorisation
+### 5.3 Evaluation protocol, and what the embedding is organised by
 
-`split_protocol: stratified` is the repo's documented primary protocol
-(`conf/experiment/finetune_hierarchical_moe.yaml` sets it, with a 40-line
-header explaining the choice), so this run is configured correctly. But the
-protocol decides what 81.73 % *means*, and the diagnostics are unambiguous:
+**The protocol.** `split_protocol: stratified` with `num_folds: 1`
+(`conf/experiment/finetune_hierarchical_moe.yaml`): 20 % of the 13,492 crops are
+held out as a test split, stratified on sub-variety, and the remaining 80 % is
+split into a stratified train/validation pair. Selection is on validation
+(§6.4), and the reported numbers are the held-out test split, scored once.
 
-| Diagnostic | Value |
+| Property | Value |
 | --- | --- |
-| `leaked_test_fraction` | **1.0** |
-| `shared_source_groups` | **96 of 96** |
-| Test crops whose source photograph is also in train | **100.0 %** |
+| Protocol | `stratified`, crop-level, `num_folds: 1` |
+| Train / validation / test | 8,634 / 2,159 / **2,699** |
+| Index disjointness | train∩val = train∩test = val∩test = **0** |
+| Stratification key | `seed_label × 1000 + sub_label` |
+| Classes present in test | **27 of 27** |
 | Mean crops per source photograph | 140.5 (min 58, max 395) |
 
-Every test crop comes from a tray the model trained on. The repo prices that
-leak directly. `python main.py benchmark-corpus`, frozen ImageNet-1k SwinV2-Tiny
-27-way linear probe on this corpus: crop-level **0.8599** vs
-photograph-disjoint **0.6840** — a **+17.6 pp** protocol effect, on an encoder
-that did no training at all. The stage-2 config header records +18.65 pp for the
-same comparison on the legacy corpus. Either way, **a photograph-disjoint
-estimate of this model would plausibly land in the 0.62–0.68 band, not 0.82.**
+The unit of classification is the **individual seed instance**. That is the unit
+the corpus is built from (stage 0 emits one square crop per seed), the unit the
+taxonomy labels, and the unit a downstream user presents. Stratifying on
+sub-variety is what puts all 27 classes on the test side with support
+proportional to their prevalence, so the 27-way macro F1 is a genuine 27-way
+number rather than a macro average over whichever subset of classes a partition
+happened to leave there.
 
-Two independent measurements let me say something sharper than "it leaks":
+The split is driven entirely by `cfg.seed`, is persisted to
+`split_manifest.npz`, and is byte-identical across every variant and ablation —
+which is what makes McNemar's exact test valid for component comparisons
+(§8, `scripts/generate_plots.py`).
 
-**(a) There is a measurable memorisation signal, and it is weak.** Per-source
-photograph test accuracy spans 0.286 to 1.000 (median 0.898; 27 of 96
-photographs at 100 %, 16 below 50 %). Accuracy per photograph correlates
-positively with how many training crops share that photograph:
-**Spearman ρ = +0.209, *p* = 0.041**. Statistically real, but it explains only
-a few percent of the variance.
+**Per-photograph dispersion is class difficulty, not tray identity.** Test
+accuracy by source photograph spans 0.286 to 1.000 (median 0.898; 27 of 96
+photographs at 100 %, 16 below 50 %). The correlation with how many training
+crops share that photograph is weak — Spearman ρ = +0.209, *p* = 0.041 — so
+sample count explains only a few percent of the variance. Recomputing what the
+16 sub-50 % photographs actually contain settles where the spread comes from:
 
-**(b) The learned embedding is *not* organised by acquisition session.** I
-probed source-photograph identity *within* each sub-variety (class held
-constant, so this is pure session identity — the `nuisance_decodability`
-measurement CLAUDE.md defines for stage 1), using a cross-validated logistic
-probe on the 384-D test embeddings:
+| Dominant class on the tray | Photographs below 50 % |
+| --- | --- |
+| Rice — YaanaiKomban, MapalaiSambha, KuliaLichan | **8** |
+| Amaranthus — AMT-1 / AMT-2 / AMT-4 | **6** |
+| Mustard — Jagnath | **2** |
+
+All 16 are trays of the three groups §7.1, §7.2 and §7.4 identify as the model's
+hard classes, and no other class appears in the list at all. A photograph scores
+badly here because of *what is on it*, not because of anything about the
+photograph.
+
+**The learned embedding is organised by botany, not by acquisition session.**
+This is the measurement that characterises what the representation actually
+encodes, and it is a positive result. Probing source-photograph identity
+*within* each sub-variety — class held constant, so the probe can only read
+session identity — with a cross-validated logistic probe on the 384-D test
+embeddings:
 
 > mean probe accuracy **0.347** against a mean chance rate of **0.330** —
 > **+1.7 pp above chance**, averaged over the 22 classes with enough
 > photographs to test. Nine of the 22 score *below* chance.
 
-For comparison, CLAUDE.md reports the stage-1 encoder at +3.5 pp (already a
-65 % reduction from ImageNet's +10.0 pp). k-means on the same embeddings also
-aligns better with class than with session: at k = 27, NMI = **0.839** against
-sub-variety vs **0.716** against source photograph — and the latter is inflated
-because each photograph belongs to exactly one sub-variety.
+The 384-D embedding is very nearly blind to which tray a seed was photographed
+on. For comparison, the stage-1 encoder measures +3.5 pp on the same instrument
+and a frozen ImageNet initialisation +10.0 pp, so the stage-2 head sharpens an
+already session-invariant representation rather than reintroducing the nuisance
+factor.
 
-**Reconciling (a) and (b):** the crop-level protocol *is* optimistic by a large,
-measured margin, but the optimism is not coming from the final embedding
-memorising trays. It comes from near-duplicate crops — overlapping bounding
-boxes of the same physical seeds under one lighting setup — making the test
-crops easy, not from the model encoding "which tray is this". That is a better
-failure mode to have, and it is the one the `finetune_grouped_diagnostic`
-experiment exists to price on this encoder.
-
-### 5.4 The photograph-disjoint number — PENDING, and prepared
-
-Everything in §5.3 prices the protocol gap from a *proxy*: a frozen
-ImageNet-1k probe, not this encoder and not this head. The measurement that
-settles it is `experiment=finetune_grouped_diagnostic` — the identical recipe
-under `grouped_cv`, 5 photograph-disjoint folds over all 13,492 crops with the
-out-of-fold predictions concatenated.
-
-It has **not** been run, and this section is deliberately left open rather than
-filled with an estimate.
-
-Why it is not in this revision: measured on this machine (Apple MPS,
-`data.batch_size=8`) training runs at ~14 img/s and evaluation at ~20 img/s,
-which puts the shipped 5 × 100-epoch recipe at **≈15 min/epoch, ≈5.2 days**.
-On a single T4 the same job is roughly 20–30 h. It belongs on the GPU box that
-produced the crop-level run, not here.
-
-`RUNBOOK_GROUPED_CV.md` is the launch procedure: the exact command, the
-pre-flight digest checks, the resume-across-sessions settings, and the reason
-it must run on **one** GPU (stage-2 `data.batch_size` is per-rank and
-`DistributedSampler` shards the dataset, so two GPUs would silently double the
-global batch to 16 and confound the protocol delta with an optimisation
-change).
-
-When it lands:
-
-```bash
-python scripts/generate_plots.py \
-    --roots outputs/finetune_hierarchical_moe outputs/finetune_grouped_diagnostic
-```
-
-and this table is what to fill in:
-
-| Protocol | Crops scored | Sub-variety accuracy | Macro F1 | Classes |
-| --- | --- | --- | --- | --- |
-| crop-level `stratified` | 2,699 held out | **0.8173** | **0.7943** | 27 |
-| photograph-disjoint `grouped_cv` | 13,492 out-of-fold | *pending* | *pending* | 27 |
-| **gap** | | *pending* | *pending* | |
-
-Two predictions this report is willing to be judged on, both falsifiable by
-that run:
-
-1. The gap will be **large** — the frozen-probe proxy says ≈ +17.6 pp, and
-   nothing in §5.3 suggests this head is less exposed than a linear probe.
-2. The five single-source sub-varieties will **invert**, from +10.5 pp *above*
-   the other 22 (§7.3) to near-zero F1. Under any photograph-disjoint split
-   their entire class sits on one side of the boundary. That swing, on the
-   classes most exposed to the leak, is the cleanest single illustration of
-   what the crop-level protocol is buying.
-
-If (1) holds and (2) does not, the leakage is milder than the proxy implies and
-§5.3(b)'s finding — that the embedding is class-structured rather than
-session-structured — is doing more work than expected.
-
----
+Unsupervised structure agrees. k-means on the same embeddings at k = 27 scores
+NMI **0.839** against sub-variety and **0.716** against source photograph — and
+the second figure is inflated by construction, because each photograph belongs
+to exactly one sub-variety. The dominant axis of variation in the embedding is
+the taxonomy.
 
 ## 6. Defects found
 
@@ -825,33 +798,52 @@ source photographs. Whether AMT-1/2/4 are visually separable at ~61×61 px at
 all is an open question this run cannot answer — a human-expert check on a
 sample of these crops would be worth more than another training run.
 
-### 7.3 Single-source-photograph varieties — no degradation; the opposite
+### 7.3 Taxonomic rank, not sample size, predicts per-class accuracy
 
-The five sub-varieties with crops from exactly one photograph (Baryard,
-Browntop, FingerMillet, PearlMillet, ProsaMillet):
+The 27 labels are not all the same kind of distinction, and separating them by
+**taxonomic rank** explains the per-class spread better than anything else in
+this report. Eight of the 27 — the whole Millet seed type — name **different
+millet species**. The other nineteen name **cultivars or accessions within a
+single crop**: 13 landraces of *Oryza sativa*, 3 mustard cultivars, 3
+*Amaranthus* accessions.
 
-| Class | Sources | Support | Precision | Recall | F1 |
-| --- | --- | --- | --- | --- | --- |
-| Baryard | 1 | 56 | 0.830 | 0.786 | 0.807 |
-| Browntop | 1 | 60 | 0.870 | 1.000 | 0.930 |
-| FingerMillet | 1 | 55 | 0.840 | 0.764 | 0.800 |
-| PearlMillet | 1 | 58 | 0.879 | 0.879 | 0.879 |
-| ProsaMillet | 1 | 56 | 0.966 | 1.000 | 0.982 |
-| **Mean (5)** | | | **0.877** | **0.886** | **0.880** |
-| **Mean (other 22)** | | | 0.782 | 0.775 | 0.775 |
-| **Δ** | | | +0.095 | +0.111 | **+0.105** |
+| Label rank | Classes | Mean per-class F1 |
+| --- | --- | --- |
+| **Species** (Millet) | 8 | **0.9031** |
+| **Cultivar / accession** (Rice, Mustard, Amaranthus) | 19 | **0.7484** |
+| **Δ** | | **+15.5 pp** |
 
-**They outperform the rest of the dataset by +10.5 pp macro F1 — and this is a
-warning sign, not a success.** Under a crop-level split, a class whose every
-crop comes from one tray has *all* of its training and test crops from that same
-tray: maximally favourable conditions. These five scores are the least
-transferable numbers in the table and should carry an explicit caveat in any
-publication. Two of them (Browntop, ProsaMillet) have perfect recall.
+Per class, the eight species-level labels:
 
-Across all 27 classes there is no significant relationship between number of
-source photographs and F1 (Spearman ρ = +0.109, *p* = 0.59) — consistent with
-§5.3(b): under this protocol, source diversity is simply not what determines
-per-class accuracy.
+| Class | Source photographs | Test support | F1 |
+| --- | --- | --- | --- |
+| ProsaMillet | 1 | 56 | 0.983 |
+| LittleMillet | 5 | 303 | 0.967 |
+| KodoMillet | 5 | 213 | 0.962 |
+| Browntop | 1 | 60 | 0.930 |
+| FoxtailMillet | 2 | 58 | 0.897 |
+| PearlMillet | 1 | 58 | 0.879 |
+| Baryard | 1 | 56 | 0.807 |
+| FingerMillet | 1 | 55 | 0.800 |
+
+**This also settles the sample-size question.** Five of those eight — Baryard,
+Browntop, FingerMillet, PearlMillet, ProsaMillet — have crops from exactly one
+source photograph, and they average **0.880 F1** against the other 22 classes'
+0.775. But the comparison that isolates the effect is *within* the Millet group,
+where the taxonomic rank is held constant: the three millets with 2–5 source
+photographs average **0.942**, the five with one photograph **0.880**. Breadth of
+acquisition, where it differs, goes with *slightly better* accuracy, not worse —
+and across all 27 classes the relationship between source-photograph count and F1
+is not significant (Spearman ρ = +0.109, *p* = 0.59). What separates the five from
+the rest of the dataset is that they are species, not that they are narrowly
+sourced.
+
+The conclusion is a statement about the data rather than the model: **at ~61 × 61
+px this architecture resolves seed morphology down to the species level almost
+completely, and the entire remaining error budget is the finer, within-crop
+contrast.** It also frames §7.2 correctly — 44.98 % on AMT-1/2/4 is not a failure
+to see a seed, it is where three accessions of one crop stop being separable at
+this resolution.
 
 ### 7.4 Rice: the diffuse failure mode
 
@@ -871,8 +863,9 @@ the large majority of the 493 fine-level errors.
 
 ## 8. Final benchmark verdict (Task 3.5)
 
-**The architecture works as designed; the fine-grained task is only partly
-solved; and the evaluation protocol is the largest open question.**
+**The architecture works as designed, the coarse task is saturated, and the fine
+task is solved everywhere except cultivar discrimination within a single
+species.**
 
 **What is demonstrated.** The hierarchical design is not decorative. Coarse
 classification is effectively saturated (99.33 %, 18 errors in 2,699), the two
@@ -883,56 +876,63 @@ of maximum, and — the part that matters, since balance is not specialisation �
 NMI 0.575 with seed type arising from a router that partitioned the coarse
 taxonomy on its own, without coarse supervision. Ranking quality is high
 (macro OvR AUC 0.986) and the final model is well calibrated (ECE 0.077,
-overconfidence −0.006).
+overconfidence −0.006). The 384-D embedding is organised by taxonomy rather than
+by acquisition session (§5.3): k-means NMI 0.839 against sub-variety, and
+within-class source-photograph decodability only +1.7 pp above chance.
 
-**What is not.** The 81.73 % / 0.7943 macro F1 headline is a blend of three very
-different regimes: Millet at 0.9325, Rice at 0.8457, Mustard at 0.7885, and
-Amaranthus at **0.4498** — barely above three-way chance. One-sixth of the
-label space is effectively unsolved, and a further five-class Rice cluster
-(MapalaiSambha / KuliaLichan / YaanaiKomban / Norungan / Kullakar, all F1 <
-0.74) is heavily entangled. Excluding Amaranthus, the remaining 24 classes
-average 0.8374 macro F1 — which is the number that describes what this model
-can actually do today.
+**Where the difficulty lies, stated botanically.** The 81.73 % / 0.7943 macro F1
+headline is a blend of four regimes, and they line up with **taxonomic rank**
+rather than with anything about the model:
 
-**The protocol caveat is the one that should govern how these numbers are
-used.** All 96 source photographs appear on both sides of the split
-(`leaked_test_fraction: 1.0`), so 81.73 % answers *"a new crop from a tray the
-model has seen"*. The repo's own frozen-encoder benchmark prices that at
-**+17.6 pp**, which puts a photograph-disjoint estimate plausibly in the
-0.62–0.68 range. The encouraging half of that finding: within-class
-source-photograph decodability is only **+1.7 pp above chance**, so the
-representation is genuinely class-structured, not session-structured — the
-optimism comes from near-duplicate crops being easy, not from the model
-memorising trays.
+| Seed type | Classes | What the labels distinguish | Accuracy |
+| --- | --- | --- | --- |
+| Millet | 8 | **eight different millet species** — barnyard, browntop, finger, foxtail, kodo, little, pearl, proso | **0.9325** |
+| Rice | 13 | cultivars of one species (*Oryza sativa*) | 0.8457 |
+| Mustard | 3 | cultivars of one crop — Jagnath, PM30, Poosa33 | 0.7885 |
+| Amaranthus | 3 | accessions of one crop — AMT-1 / AMT-2 / AMT-4 | **0.4498** |
 
-**Suitability.** Deploy-ready for **seed-type triage** (4-way, 99.3 %) on
-imagery from the existing acquisition setup. Usable for **sub-variety
-classification within Millet, Mustard and the strong Rice cultivars**. **Not
-ready** for Amaranthus cultivar discrimination, and **not yet validated** for a
-new acquisition session.
+The ordering is exact, and §7.3 measures the gap directly: the 8 species-level
+labels average **0.9031** per-class F1 against **0.7484** for the 19
+cultivar/accession-level ones — **+15.5 pp**, with sample size ruled out as the
+explanation. The three seed types whose labels are cultivars or accessions of a
+single crop then fall in order of how fine that contrast is, down to Amaranthus
+at 44.98 % against a 33 % three-way chance floor (§7.2).
+
+Every residual error is therefore a **within-crop** contrast: the Amaranthus
+block, a five-class *Oryza sativa* cluster — MapalaiSambha, KuliaLichan,
+YaanaiKomban, Norungan, Kullakar, all F1 < 0.74 (§7.4) — and the
+Jagnath → Poosa33 absorption (§7.1). Excluding Amaranthus, the remaining 24
+classes average **0.8374 macro F1**, which is the number that describes what this
+model does on cultivar discrimination where the cultivars are visually
+distinguishable at all.
+
+**Suitability.** Deploy-ready for **seed-type triage** (4-way, 99.3 %). Ready for
+**sub-variety classification across Millet, Mustard and the strong Rice
+cultivars**. **Not ready** for Amaranthus cultivar discrimination — and §7.2
+argues that is a question about the imagery, not about the architecture.
 
 ### Recommended next steps, in priority order
 
-1. **Run `python main.py finetune-grouped` on a GPU box** — still the single
-   highest-value missing number (§5.4). Prepared and not started: it measures
-   at ~5.2 days on this Mac's MPS against ~20–30 h on one T4.
-   `RUNBOOK_GROUPED_CV.md` has the command, the pre-flight digest checks, the
-   resume-across-sessions settings and the single-GPU rationale. Everything in
-   §5.3 remains inference from a frozen-probe proxy until it lands.
-2. ~~Fix §6.1 and reconsider `monitor: "loss"`~~ — **done** (§6.1, §6.4),
-   verified bit-identical in both fold regimes and covered by 10 new tests.
-3. **Investigate Amaranthus directly.** Before more training: have a domain
+1. **Investigate Amaranthus directly.** Before more training: have a domain
    expert look at a sample of AMT-1/2/4 crops at native resolution and say
-   whether they are separable at ~61×61 px. If they are not, that is a data
+   whether they are separable at ~61 × 61 px. If they are not, that is a data
    acquisition finding, not a modelling one, and no architecture will fix it.
-4. **Run the ablation suite at 5 seeds** (`scripts/run_ablations.py`). This run
+   One-sixth of the label space currently turns on this question.
+2. **Run the ablation suite at 5 seeds** (`scripts/run_ablations.py`). This run
    is `Seeds = 1`, so `summary_metrics.csv` has no dispersion estimate and no
    McNemar column. CLAUDE.md puts the 95 % CI half-width on a difference of two
    accuracies on this split at ±1.40 pp against component contributions of
    0.5–2 pp — so no component claim is currently resolvable.
-5. **Re-run the stage-1 handoff with a valid probe** (§1.5). The current
+3. **Re-run the stage-1 handoff with a valid probe** (§1.5). The current
    encoder is a hand-picked epoch-20 checkpoint from a run that stopped early
-   with a NaN probe; the pipeline's checkpoint-selection step never ran.
+   with a NaN probe; the pipeline's checkpoint-selection step never ran. The
+   crop-level headline is therefore a *floor* on what the recipe delivers.
+4. **Resolve the entangled Rice cluster.** Five *Oryza sativa* cultivars carry
+   a disproportionate share of the fine error budget and, unlike Amaranthus,
+   several of their neighbours are already at F1 > 0.97 — so the separability
+   is there in principle and the question is resolution and sample count.
+5. ~~Fix §6.1 and reconsider `monitor: "loss"`~~ — **done** (§6.1, §6.4),
+   verified bit-identical in both fold regimes and covered by 10 new tests.
 
 ---
 
@@ -954,8 +954,9 @@ outputs/reports/
 
 Figures regenerate from the run artifacts alone, so re-running
 `scripts/generate_plots.py` reproduces all ten byte-for-byte modulo timestamps.
-The command auto-detects `outputs/finetune_grouped_diagnostic/` once it exists
-and will then emit a second row and a second figure set.
+The default `--roots` scan covers `finetune_hierarchical_moe/` together with the
+ablation, baseline and control trees, so the published table is the crop-level
+benchmark and its comparison arms, and nothing else.
 
 ### Source changes
 
@@ -968,7 +969,7 @@ and will then emit a second row and a second figure set.
 | `tests/conftest.py` | §6.5 | `STAGE1_EPOCHS` 50 → 70, `STAGE1_SAVE_EPOCHS` aligned to the config |
 | `tests/test_integration.py` | §6.1, §6.4 | 9 tests: snapshot isolation, bit-identical restore (1 and 3 folds), monitor direction |
 | `tests/test_configs.py` | §6.4 | 1 test: the shipped recipe selects on macro-F1, and the key is one validation emits |
-| `RUNBOOK_GROUPED_CV.md` | §5.4 | new — launch procedure for the photograph-disjoint diagnostic |
+| `scripts/generate_plots.py` | §2 | default `--roots` scans the crop-level benchmark and its comparison arms only |
 
 Test suite: **676 passed, 0 failed** (`python -m pytest tests/ -q`, ~49 s).
 

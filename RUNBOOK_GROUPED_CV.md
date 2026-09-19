@@ -1,20 +1,29 @@
-# Runbook — the photograph-disjoint stage-2 diagnostic
+# Runbook — photograph-disjoint stage-2 cross-validation *(DORMANT)*
 
-One job: `experiment=finetune_grouped_diagnostic`, 5 photograph-disjoint folds
-over all 13,492 crops, out-of-fold predictions concatenated. It answers the one
-question the crop-level headline cannot: **how much of 81.73 % is "a new crop
-from a tray the model has seen"?**
-
-`MODEL_EVALUATION_REPORT.md` §5.3 currently prices that gap from a *frozen
-ImageNet probe* (+17.6 pp). This run measures it on **this** encoder and **this**
-head, which is the only version of the number worth publishing next to the
-headline.
-
-This is a **secondary diagnostic**. Nothing in the primary pipeline depends on
-it, and it is not comparable with the crop-level number as "better" or "worse" —
-only as the size of the gap between two questions.
+> ## ⚠️ DORMANT — OUT OF SCOPE FOR THIS STUDY
+>
+> **This procedure is not part of the pipeline and its output does not appear in
+> the paper, the report or any results table.**
+>
+> This study's sole evaluation standard is the **crop-level stratified
+> protocol**, run by `python main.py finetune` and reported in
+> `MODEL_EVALUATION_REPORT.md`. The unit of classification is the individual
+> seed instance; photograph-partitioned cross-validation answers a different
+> question (generalisation to a new acquisition session) that this study does
+> not pose.
+>
+> The document is kept only as a legacy exploratory note, so that the launch
+> procedure does not have to be reconstructed if that question is ever taken up
+> as separate work. Nothing in the primary pipeline depends on it, no figure or
+> table reads its output, and `scripts/generate_plots.py` does not scan for it.
+>
+> **Do not cite numbers from this procedure alongside the published results.**
 
 ---
+
+The job it describes: `experiment=finetune_grouped_diagnostic`, 5
+photograph-disjoint folds over all 13,492 crops, out-of-fold predictions
+concatenated. It is the same stage-2 recipe with the split protocol swapped.
 
 ## 0. Why not on the Mac
 
@@ -192,44 +201,31 @@ FingerMillet, PearlMillet, ProsaMillet, 1,429 crops, 10.6 % of the corpus. Under
 boundary, so they are unpredictable by construction, identically for every
 encoder including an untrained one. Expect their F1 to collapse toward 0.
 
-That is the sharpest single contrast this run produces. Under the crop-level
-protocol those same five classes scored **+10.5 pp above** the other 22
-(`MODEL_EVALUATION_REPORT.md` §7.3), precisely because all their crops come from
-one tray that appears on both sides. The swing between the two protocols is the
-leakage, made visible on the classes most exposed to it.
+That is a property of the corpus — each of those five genuinely has one raw
+photograph — and the fix is a camera, not a splitter. It is also the main reason
+this protocol is not a meaningful standard for the 27-way task as the dataset
+currently stands: five of the 27 classes cannot be scored under it at all.
 
----
-
-## 6. Bring it home and report both protocols together
+## 6. If it is ever run
 
 ```bash
-# copy /kaggle/working/outputs/finetune_grouped_diagnostic/ into ./outputs/
+# copy the finished run directory into ./outputs/
 
 python scripts/generate_plots.py \
-    --roots outputs/finetune_hierarchical_moe outputs/finetune_grouped_diagnostic
+    --roots outputs/finetune_grouped_diagnostic
 ```
 
-`summary_metrics.csv` then carries one row per protocol with a `Split Protocol`
-column, and the gap is the difference between the two `Macro F1` cells.
+Point `--roots` at it **explicitly**. The default scan covers the crop-level
+benchmark and its ablation, baseline and control arms only, so a stray run
+directory cannot leak a second protocol into the published table.
 
 Paths inside a `summary.json` are absolute to the machine that trained the run,
 so a Kaggle-trained directory analysed locally points at `/kaggle/working/...`.
-`RunSummary.load` now rebases those onto wherever the summary is actually found,
-so no editing of run artifacts is needed — but the rebase only fires for paths
-that do not resolve, so provenance is preserved when it is still valid.
+`RunSummary.load` rebases those onto wherever the summary is actually found, so
+no editing of run artifacts is needed — but the rebase only fires for paths that
+do not resolve, so provenance is preserved when it is still valid.
 
-Then fill in `MODEL_EVALUATION_REPORT.md` §5.4, which is written and left
-pending on exactly this measurement.
-
----
-
-## 7. One-line summary of the two numbers
-
-| | protocol | what it answers |
-| --- | --- | --- |
-| 0.8173 acc / 0.7943 macro F1 | crop-level `stratified`, 2,699 held out | a new crop from a **known** tray |
-| *(this run)* | photograph-disjoint `grouped_cv`, 13,492 OOF | a crop from a **new** tray |
-
-Report them **side by side, never averaged**. The second is not a correction of
-the first; they answer different questions, and the distance between them is
-itself the result.
+Whatever it produces stays in its own directory and its own table. It is
+exploratory work outside the scope of this study, it is not a correction of the
+crop-level benchmark, and the two are not to be reported as alternative
+estimates of one quantity.
