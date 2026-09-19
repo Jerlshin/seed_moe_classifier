@@ -11,7 +11,9 @@
 | `report_raw_photographs.py` | Which source photographs exist and were never cropped (reports only; never touches the data) |
 | `report_view_geometry.py` | What each DINO view is actually built from, per named view policy |
 | `run_ablations.py` | The component-wise ablation variants, five seeds each, optionally one per GPU |
-| `run_baselines.py` | Linear-probe, SwinV2-supervised, ResNet-50, Swin-T and hierarchical-CCE baselines |
+| `run_baselines.py` | Linear-probe, the ViT/SwinV2/ConvNeXt/EfficientNet/ResNet backbone comparison, and the hierarchical-CCE and ImageNet controls |
+| `run_experiments_suite.py` | **Both of the above as one resumable job**: skip what finished, retry what did not, stop before a session limit |
+| `estimate_suite_cost.py` | Price that suite on *this* machine by measuring a real step, before spending GPU hours |
 | `generate_plots.py` | Publication figures + `summary_metrics.csv` |
 | `extract_features.py` | Dump frozen-backbone embeddings to an `.npz` |
 | `train_distributed.sh` | Launch any stage or suite with server environment defaults, single- or multi-GPU |
@@ -26,9 +28,17 @@ python scripts/verify_runtime.py      # verify the fast paths are exact HERE
 python scripts/bench_pretrain_step.py --scaling 1,2   # pick the launch geometry
 python main.py pretrain --gpus 2      # produce the shared encoder, once
 python main.py eval-pretrain          # is that encoder worth finetuning on?
-python scripts/run_ablations.py --gpus 0,1   # 18 variants x 5 seeds
-python scripts/run_baselines.py --gpus 0,1   # five baselines
+python scripts/estimate_suite_cost.py  # what will stage 2 cost on this machine?
+python scripts/run_experiments_suite.py --all --gpus 0,1   # ablations + baselines, resumable
 python scripts/generate_plots.py      # collect everything into outputs/reports/
+```
+
+The last two lines can also be run as the two separate suites, which is what
+`run_experiments_suite.py` delegates to:
+
+```bash
+python scripts/run_ablations.py --gpus 0,1   # 17 variants x 5 seeds
+python scripts/run_baselines.py --gpus 0,1   # eleven baselines and controls
 ```
 
 ## `launch.py`
@@ -102,7 +112,13 @@ that the pipeline *runs*, not that it learns.
 
 ## `run_ablations.py`
 
-Six variants, each removing exactly one architectural ingredient:
+The arms the results table needs. The six below are the ones the submitted
+manuscript named — `wo_arcface` renamed to `wo_margin_only`/`wo_angular_head`,
+because swapping ArcFace for a plain `Linear` removes the margin *and* the
+embedding normalisation *and* the centre normalisation *and* the logit scale, so
+that gap was never a margin measurement. `python scripts/run_ablations.py
+--help` lists the full set, including the capacity-matched and fixed-router
+controls that split the confounded toggles into single factors.
 
 | Variant | Override |
 | --- | --- |
@@ -131,6 +147,109 @@ had its own self-supervised initialisation, the table would partly measure that
 instead of the architectural change under test — and the resulting numbers would
 look entirely normal. `--allow-missing-checkpoint` waives the requirement for
 smoke runs and prints a warning; results from such a run are not comparable.
+
+## `run_experiments_suite.py`
+
+One command for the whole stage-2 campaign, built to survive a Kaggle or
+vast.ai session ending mid-run.
+
+```bash
+python scripts/run_experiments_suite.py --all                 # everything, 5 seeds
+python scripts/run_experiments_suite.py --all --kaggle        # T4 x2 preset
+python scripts/run_experiments_suite.py --all --dry-run       # print the commands, spend nothing
+python scripts/run_experiments_suite.py --preset reviewer     # the minimum that answers the review
+python scripts/run_experiments_suite.py --variants wo_moe wo_kl --seeds 42
+python scripts/run_experiments_suite.py --status              # progress, no side effects
+python scripts/run_experiments_suite.py --list                # every arm and preset
+```
+
+It **defines nothing**. `ABLATION_VARIANTS` and `BASELINE_VARIANTS` are imported
+from the two suites above, so an arm added there appears here automatically and
+the three cannot drift apart in what they think the experiment is.
+
+**The artifacts on disk are the truth; `suite_status.json` is a cache.** Before
+launching a cell the runner opens that run's `summary.json` and
+`test_predictions.npz` and checks they are present, parseable and mutually
+consistent. Three things follow, and each is a failure this pipeline actually
+has on a preemptible platform:
+
+* a session killed **between** the two writes leaves a complete-looking
+  `summary.json` and no predictions. `generate_plots.py` re-scores every row
+  from the raw predictions, so that run would silently vanish from the results
+  table while the suite reported it done. It is re-run.
+* a session killed **during** the `.npz` write leaves a file that exists and
+  raises on read. Also re-run.
+* a run finished by hand with a bare `python -m src.trainers.moe_finetune` is
+  recognised and skipped. Deleting `suite_status.json` loses the attempt counts
+  and the timings and nothing that decides what gets launched.
+
+Within a cell, `experiment.training.resume=auto` is passed by default, so a
+variant killed at epoch 70 of 100 continues from its own epoch-boundary
+checkpoint rather than restarting.
+
+**Two budgets, and they are not the same one.** `--max-runtime-minutes` is
+per run and is honoured *inside* the trainer, which checkpoints and exits
+cleanly at it. `--max-session-minutes` is the suite's, and stops **between**
+runs once the remaining time is less than the mean run so far — deliberately
+never starting a variant that cannot finish, because being killed inside one is
+what produces the half-written state above. `--kaggle` sets both, plus
+`--amp fp16` (a T4 is `sm_75` and has no hardware bf16) and `--gpus 0,1`.
+
+**Provenance is checked, not assumed.** Completed runs are grouped by the corpus
+SHA-256 and by the test-split identity recorded in their own `summary.json`, and
+a suite spanning two of either prints a warning on every launch. Two corpora in
+one table is the `Refined_Samples`/`Cropped_Samples` re-baseline; two splits
+makes McNemar's paired test undefined rather than merely weaker. The shared
+encoder's SHA-256 is recorded once and compared on every relaunch.
+
+## `estimate_suite_cost.py`
+
+```bash
+python scripts/estimate_suite_cost.py                       # default suite, this device
+python scripts/estimate_suite_cost.py --preset reviewer --seeds 42
+python scripts/estimate_suite_cost.py --arms full_model vit_small --iterations 30
+python scripts/estimate_suite_cost.py --gpus 2              # sharded wall clock
+```
+
+Measures a real forward + backward + optimiser step and a real evaluation
+forward, once per distinct *model shape* in the suite, then derives the per-run
+and whole-suite wall clock. Measured and derived figures are labelled apart, as
+`src/utils/training/budget.py` does for stage 1.
+
+Measured on an **Apple M5 (10-core, 16 GB), PyTorch MPS, fp32**, batch 16, at the
+configured 100 epochs over 13,492 crops — the whole default suite is
+**28 arms × 5 seeds ≈ 1,042 h**, so a laptop is not the machine for it:
+
+| arm | ms/step | per run [EST] |
+| --- | --- | --- |
+| `linear_probe` | 264 | 4 h 58 m |
+| `hierarchical_cce` | 280 | 5 h 13 m |
+| `wo_moe` | 283 | 5 h 15 m |
+| `vit_small` | 360 | 5 h 44 m |
+| `swin_tiny` | 359 | 5 h 49 m |
+| `full_model` | 439 | 7 h 36 m |
+| `imagenet_frozen` | 464 | 7 h 59 m |
+| `convnext_tiny` | 506 | 8 h 04 m |
+| `swinv2_tiny` | 872 | 14 h 05 m |
+| `swinv2_supervised` | 993 | 15 h 55 m |
+
+The shape of that table is the useful part and it holds across devices: the two
+arms that **unfreeze the SwinV2 trunk** cost roughly 2× everything else, and
+`wo_moe` and `linear_probe` are the cheapest because they carry the least head.
+The absolute numbers are this machine's; re-measure on the machine that will run
+the suite — that is the entire point of the script, and it costs minutes.
+
+**MLX and CoreML cannot run this suite, and the script says so rather than
+pretending to model them.** MLX is a separate array framework with its own
+modules and optimisers — this repository is PyTorch end to end (timm,
+`torch.compile`, DDP, `GradScaler`, SDPA), so "run it on MLX" means
+reimplementing stage 2, at which point the numbers stop being about this code.
+CoreML is an inference runtime with no backward pass at all; it could serve the
+latency row of the efficiency table for a finished checkpoint and cannot produce
+a single ablation row. The Apple-silicon path that *does* work is PyTorch's
+**MPS** backend, which `select_device` already resolves and this script
+measures. AMP is CUDA-gated throughout, so on MPS and CPU the suite runs fp32
+and `--amp fp16` is inert.
 
 ## `run_stage1_ablations.py`
 

@@ -1,7 +1,7 @@
 # `tests/` — pytest suite
 
 ```bash
-python -m pytest tests/ -q             # all 666, ~60s
+python -m pytest tests/ -q             # all 725, ~45s
 python -m pytest tests/ -k arcface     # one topic
 python -m pytest tests/test_models.py  # one file
 ```
@@ -22,6 +22,7 @@ No network access, no weight downloads, no dependency on the real dataset.
 | `test_efficiency.py` | Total vs. active parameters, Top-2 vs. Top-4, FLOPs, latency |
 | `test_evaluation.py` | Prediction dumps, `summary.json`, the comparison CSV, publication figures |
 | `test_runner.py` | Suite definitions, command construction, shared-checkpoint handling |
+| `test_suite.py` | The resumable runner: what counts as a finished run (both artifacts present, parseable and consistent), state-file round-trip and atomicity, corpus/split/encoder provenance conflicts, and the Kaggle preset |
 | `test_datasets.py` | Label hierarchy, global sub-variety indices, multi-crop pipeline |
 | `test_configs.py` | Hydra composition and agreement with Table 1 / Section 5 |
 | `test_integration.py` | Splits, epoch loop, checkpoint round-trip, tracker artifacts |

@@ -23,6 +23,12 @@ num_sub_varieties: ${data.num_sub_varieties}
 embed_dim: 384
 dropout_rate: 0.1
 
+# Extra kwargs for `timm.create_model`. Empty for every CNN; the ViT arms set
+# `img_size: 256` so the backbone comparison holds the input resolution fixed at
+# the proposed model's, rather than comparing a 224 px ViT with a 256 px SwinV2
+# on a corpus whose crops are a median 61 x 61 px and are upsampled either way.
+backbone_kwargs: {}
+
 # Declared so anything interpolating the component toggles resolves. A baseline
 # has none of these blocks by definition.
 use_moe: false

@@ -1,0 +1,36 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained EfficientNetV2-S, trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_efficientnetv2_s
+#   python scripts/run_baselines.py --models efficientnetv2_s
+#
+# REVIEWER 1: "computational efficiency analysis ... whether the proposed
+# framework is both effective and deployable in realistic agricultural
+# settings."
+#
+# The accuracy-per-FLOP reference point. At 20.2 M parameters it is the
+# smallest arm in the table, and the efficiency block profiles it on the same
+# device with the same batch sweep as every other row, so the cost columns
+# (GFLOPs/sample, latency, throughput) are directly comparable. If the proposed
+# framework cannot clear it on accuracy by more than it costs in latency, that
+# is a finding the deployment claim has to account for.
+#
+# Fully convolutional, so it takes 256 px natively.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_efficientnetv2_s"
+  group: "baseline"
+  variant: "efficientnetv2_s"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/efficientnetv2_s"
+    learning_rate: 0.00003
+
+model:
+  head:
+    baseline_model: "efficientnetv2_s"

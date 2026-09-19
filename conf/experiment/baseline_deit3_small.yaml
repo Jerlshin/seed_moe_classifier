@@ -1,0 +1,36 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained DeiT III Small (ViT-S/16), trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_deit3_small
+#   python scripts/run_baselines.py --models deit3_small
+#
+# The control on `baseline_vit_small`. Identical geometry -- ViT-S/16, 21.7 M
+# parameters, the same 256 px input -- and a different supervised training
+# recipe (Touvron et al., 2022: LayerScale, stochastic depth, 3-augment, BCE).
+#
+# It exists so one specific rebuttal is unavailable. If the ViT row simply loses
+# to the SwinV2 row, the reading "the ViT arm was under-trained / used a 2020
+# recipe" is open, and Reviewer 1's "claims are stronger than the evidence"
+# would apply to the comparison itself. Two independently trained ViT-S/16
+# checkpoints agreeing closes it: the gap is then about the architecture on this
+# corpus, not about whose ImageNet run it came from.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_deit3_small"
+  group: "baseline"
+  variant: "deit3_small"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/deit3_small"
+    learning_rate: 0.00003
+
+model:
+  head:
+    baseline_model: "deit3_small"
+    backbone_kwargs:
+      img_size: 256

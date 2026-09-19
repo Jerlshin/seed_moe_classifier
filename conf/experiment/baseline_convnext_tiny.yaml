@@ -1,0 +1,34 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained ConvNeXt-Tiny, trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_convnext_tiny
+#   python scripts/run_baselines.py --models convnext_tiny
+#
+# REVIEWER 1: "the paper compared against more competitive and diverse
+# baselines, including ... recent fine-grained classification approaches."
+#
+# ConvNeXt-Tiny is the modern-CNN reference point and it is parameter-matched to
+# the proposed trunk almost exactly -- 27.8 M against SwinV2-Tiny's 27.58 M --
+# so the comparison is not confounded by capacity, which is the objection
+# ResNet-50 (25.6 M, but a 2015 recipe) leaves open.
+#
+# Fully convolutional, so it takes the pipeline's native 256 px with no
+# interpolation and no kwargs.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_convnext_tiny"
+  group: "baseline"
+  variant: "convnext_tiny"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/convnext_tiny"
+    learning_rate: 0.00003
+
+model:
+  head:
+    baseline_model: "convnext_tiny"

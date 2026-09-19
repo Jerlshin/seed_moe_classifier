@@ -1,0 +1,49 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained ViT-S/16, trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_vit_small
+#   python scripts/run_baselines.py --models vit_small
+#
+# REVIEWER 2, MAJOR COMMENT 1. "The Abstract and Introduction heavily emphasize
+# the use of SwinV2. However, Section 4 and Table 1 explicitly define the
+# backbone as ViT-S/14. ... If both were tested, provide a comparative table
+# (ViT vs. SwinV2)."
+#
+# This is the ViT arm of that table and `baseline_swinv2_tiny` is the SwinV2
+# arm. The two are identical in every respect a comparison can be confounded by:
+# the same flat two-head classifier, the same 256 px input, the same ImageNet-1k
+# supervised initialisation, the same optimiser, schedule, augmentation, split
+# and seeds. The only thing that differs is the trunk.
+#
+# ViT-S/16, not ViT-S/14. timm ships no ImageNet-1k *supervised* ViT-S/14 --
+# /14 is DINOv2's patch size, and its weights are self-supervised, which would
+# put an SSL encoder in a row whose purpose is to hold pretraining fixed. The
+# patch size is therefore the one part of Table 1's claim that cannot be
+# reproduced, and the revision should say "ViT-S/16" rather than repeat /14.
+#
+# `img_size: 256` interpolates the pretrained position embedding from the 14x14
+# grid it was trained on to 16x16. That is standard timm practice and it is what
+# holds the input resolution fixed across the comparison.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_vit_small"
+  group: "baseline"
+  variant: "vit_small"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/vit_small"
+    # The whole network trains from ImageNet weights, so the rate that suits a
+    # small head on a frozen encoder would be far too high. Matches every other
+    # end-to-end baseline.
+    learning_rate: 0.00003
+
+model:
+  head:
+    baseline_model: "vit_small"
+    backbone_kwargs:
+      img_size: 256

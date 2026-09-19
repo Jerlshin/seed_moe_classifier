@@ -122,6 +122,15 @@ ALL_EXPERIMENTS = [
     "baseline_hierarchical_cce",
     "baseline_linear_probe",
     "baseline_swinv2_supervised",
+    # The comparison backbones the review asked for. `vit_small` and
+    # `swinv2_tiny` are the two arms of Reviewer 2's ViT-vs-SwinV2 table and are
+    # matched in everything but the trunk; the other three answer Reviewer 1's
+    # "more competitive and diverse baselines".
+    "baseline_vit_small",
+    "baseline_swinv2_tiny",
+    "baseline_deit3_small",
+    "baseline_convnext_tiny",
+    "baseline_efficientnetv2_s",
 ]
 
 
@@ -546,6 +555,11 @@ def test_kl_toggle_propagates_from_the_head_to_the_loss(conf_dir):
     [
         ("baseline_resnet50", "resnet50"),
         ("baseline_swin_tiny", "swin_tiny"),
+        ("baseline_vit_small", "vit_small"),
+        ("baseline_swinv2_tiny", "swinv2_tiny"),
+        ("baseline_deit3_small", "deit3_small"),
+        ("baseline_convnext_tiny", "convnext_tiny"),
+        ("baseline_efficientnetv2_s", "efficientnetv2_s"),
     ],
 )
 def test_supervised_baselines_select_their_backbone(conf_dir, experiment, expected):
@@ -556,6 +570,67 @@ def test_supervised_baselines_select_their_backbone(conf_dir, experiment, expect
     assert cfg.model.loss.name == "flat_cce"
     # Same embedding width as the proposed model, so t-SNE panels stay comparable.
     assert cfg.model.head.embed_dim == PAPER_EMBED_DIM
+
+
+def test_the_backbone_comparison_differs_only_in_the_trunk(conf_dir):
+    """Reviewer 2, major comment 1: "provide a comparative table (ViT vs. SwinV2)".
+
+    The comparison is only a *backbone* comparison if nothing else moves. These
+    two arms are checked field for field against each other, because every one
+    of these is a plausible accidental difference that would turn the row into a
+    measurement of something else -- and the 256 px match in particular is not
+    free: a ViT arrives pinned to the resolution it was pretrained at, and this
+    corpus upsamples a median 61 x 61 px crop either way.
+    """
+    vit = build(conf_dir, "experiment=baseline_vit_small")
+    swin = build(conf_dir, "experiment=baseline_swinv2_tiny")
+    for cfg in (vit, swin):
+        OmegaConf.resolve(cfg)
+
+    assert vit.data.image_size == swin.data.image_size == 256
+    assert vit.model.head.name == swin.model.head.name == "flat_supervised"
+    assert vit.model.loss.name == swin.model.loss.name == "flat_cce"
+    assert vit.model.head.embed_dim == swin.model.head.embed_dim == PAPER_EMBED_DIM
+    assert (
+        vit.experiment.training.learning_rate == swin.experiment.training.learning_rate
+    )
+    assert vit.experiment.training.epochs == swin.experiment.training.epochs
+    assert (
+        vit.experiment.training.split_protocol
+        == swin.experiment.training.split_protocol
+        == "stratified"
+    )
+    assert vit.experiment.validation.monitor == swin.experiment.validation.monitor
+    # The ViT reaches 256 px by interpolating its position embedding; the SwinV2
+    # is native there and takes no kwarg.
+    assert vit.model.head.backbone_kwargs.img_size == 256
+    assert not swin.model.head.backbone_kwargs
+
+    # And they must be different trunks, or the table has one arm.
+    assert vit.model.head.baseline_model != swin.model.head.baseline_model
+
+
+def test_no_comparison_baseline_consumes_stage_one(conf_dir):
+    """The revision's compute constraint: not one of these costs a pretraining run.
+
+    Each owns an ImageNet backbone built by timm inside the head, so the stage-1
+    encoder is never read. `run_baselines.py` and `run_experiments_suite.py`
+    additionally refuse to *pass* one; this pins the config side of the same
+    rule, which is what would silently partially-load a shape-compatible trunk.
+    """
+    for experiment in (
+        "baseline_vit_small",
+        "baseline_swinv2_tiny",
+        "baseline_deit3_small",
+        "baseline_convnext_tiny",
+        "baseline_efficientnetv2_s",
+        "baseline_resnet50",
+        "baseline_swin_tiny",
+    ):
+        cfg = build(conf_dir, f"experiment={experiment}")
+        OmegaConf.resolve(cfg)
+        assert cfg.model.head.name == "flat_supervised", experiment
+        assert cfg.model.head.pretrained is True, experiment
 
 
 def test_hierarchical_cce_baseline_removes_the_proposed_machinery(conf_dir):

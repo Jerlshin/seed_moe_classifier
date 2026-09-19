@@ -9,6 +9,7 @@
 #   scripts/train_distributed.sh finetune data.batch_size=32
 #   GPUS=0,1 scripts/train_distributed.sh ablations        # one variant per GPU
 #   scripts/train_distributed.sh baselines
+#   GPUS=0,1 scripts/train_distributed.sh suite            # both, resumable
 #   scripts/train_distributed.sh verify                    # numerical checks
 #   scripts/train_distributed.sh report
 #
@@ -31,7 +32,7 @@ set -euo pipefail
 
 STAGE="${1:-}"
 if [[ -z "${STAGE}" ]]; then
-  echo "Usage: [GPUS=n] scripts/train_distributed.sh pretrain|finetune|finetune-grouped|ablation|ablations|baselines|eval-pretrain|eval-frozen|verify|report [overrides...]"
+  echo "Usage: [GPUS=n] scripts/train_distributed.sh pretrain|finetune|finetune-grouped|ablation|ablations|baselines|suite|eval-pretrain|eval-frozen|verify|report [overrides...]"
   exit 2
 fi
 shift || true
@@ -66,6 +67,15 @@ case "${STAGE}" in
       python scripts/run_baselines.py -- "$@"
     else
       python scripts/run_baselines.py --gpus "${GPUS}" -- "$@"
+    fi
+    ;;
+  suite)
+    # Both suites as one resumable job. Relaunch this identical line after a
+    # preempted session: finished runs are skipped, interrupted ones resume.
+    if [[ "${GPUS}" == "1" ]]; then
+      python scripts/run_experiments_suite.py --all "$@"
+    else
+      python scripts/run_experiments_suite.py --all --gpus "${GPUS}" "$@"
     fi
     ;;
   eval-pretrain|eval-frozen)

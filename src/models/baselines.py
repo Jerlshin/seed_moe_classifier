@@ -56,6 +56,7 @@ comparable with the proposed model's.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import timm
@@ -65,9 +66,38 @@ import torch.nn.functional as F
 
 from src.models.builder import PAPER_EMBED_DIM, HierarchicalOutput
 
+#: Short names for the supervised comparison backbones, mapped to timm ids.
+#
+# The first two are the historical pair. The five below them were added for the
+# revision, and every one answers a comment on the submitted manuscript:
+#
+#   vit_small        Reviewer 2's first major comment. The abstract and the
+#                    introduction say SwinV2; Table 1 says ViT-S/14. This is the
+#                    ViT arm of the comparison they asked for, at ViT-S/16 --
+#                    timm has no /14 ViT-S with ImageNet-1k supervised weights,
+#                    and the patch size is the one axis of Table 1's claim that
+#                    cannot be honoured exactly. State it as ViT-S/16.
+#   swinv2_tiny      the *matched* SwinV2 arm of that same comparison: the
+#                    proposed trunk, same flat head, same 256 px input, same
+#                    schedule. `swinv2_supervised` is NOT this row -- it carries
+#                    the full hierarchical head, so it cannot isolate a backbone.
+#   deit3_small      the same ViT-S/16 geometry under a modern supervised
+#                    recipe, so "ViT loses" cannot be read as "ViT's 2020
+#                    training recipe loses".
+#   convnext_tiny    Reviewer 1's "recent fine-grained approaches": a modern CNN
+#                    at SwinV2-Tiny's parameter count (27.8 M vs 27.6 M).
+#   efficientnetv2_s the efficiency-oriented reference point, for the cost table.
+#
+# Every one of these is ImageNet-supervised and trains end to end. None of them
+# reads the stage-1 encoder, so none of them costs any pretraining compute.
 BASELINE_MODELS = {
     "resnet50": "resnet50",
     "swin_tiny": "swin_tiny_patch4_window7_224",
+    "vit_small": "vit_small_patch16_224",
+    "deit3_small": "deit3_small_patch16_224",
+    "convnext_tiny": "convnext_tiny",
+    "efficientnetv2_s": "tf_efficientnetv2_s",
+    "swinv2_tiny": "swinv2_tiny_window16_256",
 }
 
 
@@ -113,6 +143,8 @@ class FlatSupervisedBaseline(nn.Module):
         pretrained: Load ImageNet weights (the point of a supervised baseline).
         embed_dim: Shared embedding width (384).
         dropout_rate: Dropout before each classification head.
+        backbone_kwargs: Extra keyword arguments for ``timm.create_model``,
+            in practice ``{"img_size": 256}`` for the fixed-resolution ViT arms.
     """
 
     def __init__(
@@ -123,14 +155,27 @@ class FlatSupervisedBaseline(nn.Module):
         pretrained: bool = True,
         embed_dim: int = PAPER_EMBED_DIM,
         dropout_rate: float = 0.1,
+        backbone_kwargs: Mapping[str, Any] | None = None,
     ):
         super().__init__()
         self.model_name = BASELINE_MODELS.get(str(model_name), str(model_name))
         self.num_seed_types = int(num_seed_types)
         self.num_sub_varieties = int(num_sub_varieties)
         self.embed_dim = int(embed_dim)
+        self.backbone_kwargs = dict(backbone_kwargs or {})
 
-        self.backbone = timm.create_model(self.model_name, pretrained=pretrained, num_classes=0)
+        # `backbone_kwargs` exists for exactly one reason: `img_size`. A ViT
+        # arrives pinned to the resolution it was trained at, and comparing a
+        # 224 px ViT against a 256 px SwinV2 would answer "which backbone" with
+        # a number that is partly "which input size" -- on a corpus whose crops
+        # are a median 61 x 61 px, so the upsampling factor is the dominant
+        # thing the resolution changes. timm interpolates the position
+        # embedding when `img_size` is passed, which is what lets the ViT arm
+        # run at the proposed model's 256 and makes the comparison a backbone
+        # comparison. A CNN accepts any size and takes no kwarg at all.
+        self.backbone = timm.create_model(
+            self.model_name, pretrained=pretrained, num_classes=0, **self.backbone_kwargs
+        )
         backbone_dim = getattr(self.backbone, "num_features", None)
         if backbone_dim is None:
             raise ValueError(f"timm model {self.model_name!r} does not expose num_features")
@@ -154,7 +199,14 @@ class FlatSupervisedBaseline(nn.Module):
         return 1
 
     def component_flags(self) -> dict[str, Any]:
-        return _baseline_component_flags(self.model_name)
+        flags = _baseline_component_flags(self.model_name)
+        # The ViT arms run at an interpolated resolution, and that is a factor
+        # of the comparison. Recording it here is what makes a 224 px row
+        # machine-distinguishable from a 256 px one in `summary.json`, rather
+        # than distinguishable only by reading the experiment file back.
+        if self.backbone_kwargs:
+            flags["backbone_kwargs"] = dict(self.backbone_kwargs)
+        return flags
 
     def forward(
         self,
@@ -183,10 +235,14 @@ class FlatSupervisedBaseline(nn.Module):
         return output.seed_type_logits.argmax(dim=-1), output.sub_logits.argmax(dim=-1)
 
     def extra_repr(self) -> str:
-        return (
-            f"model_name={self.model_name}, backbone_dim={self.backbone_dim}, "
-            f"embed_dim={self.embed_dim}"
-        )
+        parts = [
+            f"model_name={self.model_name}",
+            f"backbone_dim={self.backbone_dim}",
+            f"embed_dim={self.embed_dim}",
+        ]
+        if self.backbone_kwargs:
+            parts.append(f"backbone_kwargs={self.backbone_kwargs}")
+        return ", ".join(parts)
 
 
 class LinearProbeHead(nn.Module):
@@ -314,6 +370,24 @@ def _degenerate_output(
     )
 
 
+def _as_plain_mapping(value: Any) -> dict[str, Any]:
+    """A plain ``dict`` from an OmegaConf node, a mapping, or ``None``.
+
+    ``timm.create_model(**node)`` on a ``DictConfig`` passes ``ValueNode``
+    wrappers rather than ints, and timm compares ``img_size`` against an int.
+    """
+    if value is None:
+        return {}
+    try:  # OmegaConf is a hard dependency of the trainers, not of this module.
+        from omegaconf import DictConfig, OmegaConf
+
+        if isinstance(value, DictConfig):
+            return dict(OmegaConf.to_container(value, resolve=True))  # type: ignore[arg-type]
+    except ImportError:  # pragma: no cover - notebook use without Hydra
+        pass
+    return dict(value)
+
+
 def build_baseline(cfg: Any) -> FlatSupervisedBaseline:
     """Instantiate :class:`FlatSupervisedBaseline` from a ``model.head`` node."""
 
@@ -328,6 +402,7 @@ def build_baseline(cfg: Any) -> FlatSupervisedBaseline:
         pretrained=bool(get("pretrained", True)),
         embed_dim=int(get("embed_dim", PAPER_EMBED_DIM)),
         dropout_rate=float(get("dropout_rate", 0.1)),
+        backbone_kwargs=_as_plain_mapping(get("backbone_kwargs", None)),
     )
 
 

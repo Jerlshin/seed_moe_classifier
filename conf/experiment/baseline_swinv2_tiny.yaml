@@ -1,0 +1,45 @@
+# @package _global_
+#
+# Baseline: ImageNet-pretrained SwinV2-Tiny + the FLAT head, trained end to end.
+#
+#   python -m src.trainers.moe_finetune experiment=baseline_swinv2_tiny
+#   python scripts/run_baselines.py --models swinv2_tiny
+#
+# The SwinV2 arm of Reviewer 2's ViT-vs-SwinV2 table, matched to
+# `baseline_vit_small` in everything but the trunk.
+#
+# NOT the same row as `baseline_swinv2_supervised`, and the distinction is the
+# whole point. That one carries the FULL hierarchical head, so the gap between
+# it and a ViT would be a backbone difference plus a head difference. This one
+# carries the same two-linear-head classifier every other end-to-end baseline
+# carries, which is what isolates the backbone.
+#
+# It also lands the third leg of a clean decomposition, all at 256 px with one
+# head and one schedule:
+#
+#   swinv2_tiny            ImageNet SwinV2-T,        flat head   <- this file
+#   swinv2_supervised      ImageNet SwinV2-T,        full head
+#   full_model             stage-1 SwinV2-T frozen,  full head
+#
+# i.e. backbone -> head -> in-domain self-supervision, one factor at a time.
+#
+# The trunk is built by timm directly rather than through `model/backbone`,
+# which `validate_swinv2_name` reserves for the self-supervised path. No stage-1
+# checkpoint is read.
+
+defaults:
+  - finetune_hierarchical_moe
+  - override /model/head: flat_supervised
+  - override /model/loss: flat_cce
+
+experiment:
+  name: "baseline_swinv2_tiny"
+  group: "baseline"
+  variant: "swinv2_tiny"
+  training:
+    save_path: "${oc.env:SEED_OUTPUT_DIR,outputs}/baselines/swinv2_tiny"
+    learning_rate: 0.00003
+
+model:
+  head:
+    baseline_model: "swinv2_tiny"

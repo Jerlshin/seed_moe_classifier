@@ -485,7 +485,46 @@ python main.py finetune
 python main.py finetune model.head.top_k=4 model.head.token_mode=pooled
 ```
 
-### 3.5 Full ablation suite — 18 variants x 5 seeds = 90 runs
+### 3.5a The whole stage-2 campaign as one resumable job
+
+This is the command to use on a preemptible box. It runs both suites below,
+skips what is already finished, resumes what is not, and stops **between** runs
+before the session limit rather than being killed inside one.
+
+```bash
+# See exactly what would run, and where, before spending anything:
+python scripts/run_experiments_suite.py --all --dry-run
+
+# Price it on THIS machine first (minutes, not a guess):
+python scripts/estimate_suite_cost.py --gpus 2
+
+# Kaggle T4 x2: fp16, both cards, session and per-run budgets set:
+python scripts/run_experiments_suite.py --all --kaggle
+
+# ...and after the session ends, relaunch the IDENTICAL line:
+python scripts/run_experiments_suite.py --all --kaggle
+
+# Where did it get to?
+python scripts/run_experiments_suite.py --status
+
+# If compute is short, the subset that still answers the review:
+python scripts/run_experiments_suite.py --preset reviewer --kaggle
+```
+
+Completion is decided from each run's own `summary.json` and
+`test_predictions.npz`, not from the state file, so a session killed between the
+two writes is correctly re-run rather than reported done — and a run you
+finished by hand is skipped. `outputs/suite_status.json` is a cache; deleting it
+loses the timings and nothing else.
+
+It also warns, on every launch, if completed runs disagree on the corpus digest,
+on the test split, or if the stage-1 encoder changed underneath the suite. Any
+of the three invalidates the comparison table rather than degrading it.
+
+**Neither `--kaggle` nor anything else here can start Stage 1.** Every arm reads
+the published encoder or builds its own ImageNet backbone.
+
+### 3.5 Full ablation suite — 17 variants x 5 seeds = 85 runs
 
 ```bash
 # Verify command construction first, no training:
@@ -503,18 +542,31 @@ refuses to start otherwise). Runs land in
 `${SEED_OUTPUT_DIR}/ablations/{variant}/seed{n}/`, each self-contained
 (Hydra snapshot, logs, checkpoint, `summary.json`, `test_predictions.npz`).
 
-### 3.6 Full baseline suite — 5 models x 5 seeds = 25 runs (+ optional LR sweep)
+### 3.6 Full baseline suite — 11 models x 5 seeds = 55 runs (+ optional LR sweep)
 
 ```bash
 python scripts/run_baselines.py --dry-run
 python scripts/run_baselines.py
-python scripts/run_baselines.py --lr-sweep   # +6 runs: resnet50/swin_tiny x {1e-5,3e-5,1e-4}
+python scripts/run_baselines.py --lr-sweep   # sweeps {1e-5,3e-5,1e-4} per end-to-end backbone
+python scripts/run_baselines.py --models vit_small swinv2_tiny   # the backbone comparison alone
 ```
 
 Run `linear_probe` first if you only have time for one — its outcome bounds
-what the rest of the paper can claim. `resnet50`, `swin_tiny` and
-`swinv2_supervised` own their own ImageNet backbones and deliberately do
-**not** read the Stage 1 checkpoint; `linear_probe` and `hierarchical_cce` do.
+what the rest of the paper can claim.
+
+`vit_small` and `swinv2_tiny` are **one row pair**: same flat head, same 256 px
+input, same ImageNet-1k initialisation, same schedule, split and seeds, so the
+trunk is the only difference. That is the ViT-vs-SwinV2 table the review asked
+for. `swinv2_supervised` is *not* the SwinV2 arm of it — it carries the full
+hierarchical head.
+
+Every end-to-end backbone (`resnet50`, `swin_tiny`, `vit_small`, `swinv2_tiny`,
+`deit3_small`, `convnext_tiny`, `efficientnetv2_s`, `swinv2_supervised`) owns
+its ImageNet weights and deliberately does **not** read the Stage 1 checkpoint;
+only `linear_probe` and `hierarchical_cce` do. `swinv2_tiny` is the one that
+matters most here: it is shape-compatible with the published encoder, so handing
+it the checkpoint would silently load it and turn the ImageNet arm into a second
+self-supervised row.
 
 ### 3.7 Report generation
 
@@ -556,6 +608,8 @@ mkdir -p "${SEED_OUTPUT_DIR}/logs"
 nohup bash -c '
   set -e
   python main.py pretrain
+  python scripts/run_experiments_suite.py --all --kaggle
+  # ...or the two suites separately:
   python scripts/run_ablations.py
   python scripts/run_baselines.py
   python scripts/generate_plots.py
@@ -657,8 +711,8 @@ background expecting them to race safely.
 | Hyperparameter | Value | Notes |
 | --- | --- | --- |
 | `seeds` | `(42, 43, 44, 45, 46)` — `DEFAULT_SEEDS` in `src/trainers/runner.py` | every variant repeats over all 5 |
-| Ablation variants | 18 (see `scripts/run_ablations.py`) | `full_model` is the reference |
-| Baseline models | 5: `linear_probe`, `swinv2_supervised`, `resnet50`, `swin_tiny`, `hierarchical_cce` | see `scripts/run_baselines.py` |
+| Ablation variants | 17 crop-level + 1 opt-in (see `scripts/run_ablations.py`) | `full_model` is the reference |
+| Baseline models | 11: `linear_probe`, `hierarchical_cce`, `imagenet_frozen`, `swinv2_supervised`, `resnet50`, `swin_tiny`, `vit_small`, `swinv2_tiny`, `deit3_small`, `convnext_tiny`, `efficientnetv2_s` | see `scripts/run_baselines.py` |
 | LR sweep (optional) | `{1e-5, 3e-5, 1e-4}` for `resnet50`/`swin_tiny` | `--lr-sweep` flag |
 
 To reproduce the **submitted manuscript's** configuration point-for-point

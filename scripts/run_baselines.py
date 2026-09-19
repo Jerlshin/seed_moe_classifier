@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """Run the supervised and simple-hierarchical baselines.
 
-    python scripts/run_baselines.py                          # all six
+    python scripts/run_baselines.py                          # all eleven
     python scripts/run_baselines.py --models resnet50
     python scripts/run_baselines.py --models imagenet_frozen  # the stage-1 control
     python scripts/run_baselines.py --dry-run
     python scripts/run_baselines.py -- experiment.training.epochs=30
 
-Six reference points, each answering a different question:
+Eleven reference points, each answering a different question:
 
 ``linear_probe``
     Frozen self-supervised encoder plus two linear heads, plain CE. The
@@ -43,12 +43,37 @@ Six reference points, each answering a different question:
     proposed model's encoder and code path with toggles flipped, so it is the
     tightest of the five controls.
 
+``vit_small`` / ``swinv2_tiny``
+    **The comparative table Reviewer 2 asked for.** The submitted abstract and
+    introduction say SwinV2 while Table 1 says ViT-S/14, and the results section
+    never says which produced the numbers. These two rows settle it: ViT-S/16
+    and SwinV2-Tiny, both ImageNet-1k supervised, both at 256 px, both behind
+    the same flat two-head classifier, same optimiser, same split, same seeds.
+    The trunk is the only difference. (ViT-S/16 rather than /14: timm ships no
+    supervised ImageNet-1k ViT-S/14 -- /14 is DINOv2's patch size and its
+    weights are self-supervised, which would change the pretraining axis this
+    row holds fixed.)
+
+    ``swinv2_supervised`` is *not* the SwinV2 arm of that pair -- it carries the
+    full hierarchical head, so its gap to a ViT would mix backbone with head.
+
+``deit3_small``
+    ViT-S/16 again, same geometry and resolution, under DeiT III's supervised
+    recipe. Closes the "the ViT arm was under-trained" reading of the ViT row.
+
+``convnext_tiny``
+    Modern CNN, parameter-matched to the proposed trunk (27.8 M vs 27.58 M), so
+    its gap is not a capacity gap the way ResNet-50's could be argued to be.
+
+``efficientnetv2_s``
+    The accuracy-per-FLOP reference point for the efficiency table.
+
 Results land in ``outputs/baselines/{model}/`` (``imagenet_frozen`` writes to
-``outputs/controls/imagenet_frozen/``). ``resnet50``, ``swin_tiny``,
-``swinv2_supervised`` and ``imagenet_frozen`` own their backbones and therefore
-ignore the stage-1 checkpoint by design; ``linear_probe`` and
-``hierarchical_cce`` read the same shared encoder as the ablation suite, which is
-what keeps them comparable with the full model.
+``outputs/controls/imagenet_frozen/``). Every end-to-end baseline owns its
+backbone and therefore ignores the stage-1 checkpoint by design; only
+``linear_probe`` and ``hierarchical_cce`` read the shared encoder, which is what
+keeps those two comparable with the full model. **No baseline here costs any
+pretraining compute.**
 
 Build the combined table afterwards with ``python scripts/generate_plots.py``.
 """
@@ -112,6 +137,36 @@ BASELINE_VARIANTS: list[VariantSpec] = [
         experiment="baseline_swin_tiny",
     ),
     VariantSpec(
+        name="vit_small",
+        description="ImageNet ViT-S/16 at 256 px, supervised end to end (the ViT arm)",
+        group="baseline",
+        experiment="baseline_vit_small",
+    ),
+    VariantSpec(
+        name="swinv2_tiny",
+        description="ImageNet SwinV2-T + the FLAT head, end to end (the matched SwinV2 arm)",
+        group="baseline",
+        experiment="baseline_swinv2_tiny",
+    ),
+    VariantSpec(
+        name="deit3_small",
+        description="ImageNet DeiT III-S/16 at 256 px: the same ViT geometry, a modern recipe",
+        group="baseline",
+        experiment="baseline_deit3_small",
+    ),
+    VariantSpec(
+        name="convnext_tiny",
+        description="ImageNet ConvNeXt-T, supervised end to end (parameter-matched modern CNN)",
+        group="baseline",
+        experiment="baseline_convnext_tiny",
+    ),
+    VariantSpec(
+        name="efficientnetv2_s",
+        description="ImageNet EfficientNetV2-S, supervised end to end (the cost reference)",
+        group="baseline",
+        experiment="baseline_efficientnetv2_s",
+    ),
+    VariantSpec(
         name="hierarchical_cce",
         description="Two-stage hierarchy, plain CCE at both levels, no MoE/cross-attn/ArcFace",
         group="baseline",
@@ -125,14 +180,32 @@ VARIANTS_BY_NAME = {spec.name: spec for spec in BASELINE_VARIANTS}
 #: encoder. A SwinV2 state dict would at best be ignored by a ResNet and at worst
 #: partially loaded; `swinv2_supervised` is the shape-compatible case and is
 #: excluded deliberately, since its whole purpose is to NOT read stage 1.
-END_TO_END_BASELINES = {"resnet50", "swin_tiny", "swinv2_supervised", "imagenet_frozen"}
+END_TO_END_BASELINES = {
+    "resnet50",
+    "swin_tiny",
+    "vit_small",
+    "swinv2_tiny",
+    "deit3_small",
+    "convnext_tiny",
+    "efficientnetv2_s",
+    "swinv2_supervised",
+    "imagenet_frozen",
+}
 
 #: Learning rates swept per end-to-end baseline. A single shared value cannot be
 #: right for both end-to-end ImageNet fine-tuning and frozen-encoder head
 #: training, and "our method wins against an under-tuned baseline" is the most
 #: common objection any comparison table attracts. Six extra runs remove it.
 LR_SWEEP = (1e-5, 3e-5, 1e-4)
-SWEEPABLE = {"resnet50", "swin_tiny"}
+SWEEPABLE = {
+    "resnet50",
+    "swin_tiny",
+    "vit_small",
+    "swinv2_tiny",
+    "deit3_small",
+    "convnext_tiny",
+    "efficientnetv2_s",
+}
 
 
 def parse_args() -> argparse.Namespace:

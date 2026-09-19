@@ -384,7 +384,7 @@ export SEED_DATA_ROOT=$SEED_REFINED_DATA_ROOT
 export SEED_OUTPUT_DIR=/path/to/outputs
 
 # ---- 0. check the machine ------------------------------------------------
-python -m pytest tests/ -q            # 666 tests, no network, ~60 s
+python -m pytest tests/ -q            # 725 tests, no network, ~45 s
 python scripts/dry_run.py             # synthetic end-to-end pipeline check, no dataset
 python scripts/verify_runtime.py      # are the fast paths exact on THIS machine?
 
@@ -409,10 +409,19 @@ python main.py eval-pretrain
 python main.py finetune                # THE production benchmark
 
 # ---- 5. analysis --------------------------------------------------------
-python scripts/run_ablations.py --gpus 0,1
-python scripts/run_baselines.py --gpus 0,1
+python scripts/estimate_suite_cost.py                      # what will it cost here?
+python scripts/run_experiments_suite.py --all --gpus 0,1   # ablations + baselines, resumable
 python scripts/generate_plots.py
 ```
+
+Step 5 needs no pretraining compute of its own: every arm reads the encoder
+step 2 published, or builds its own ImageNet backbone. On a preemptible platform
+launch it as `python scripts/run_experiments_suite.py --all --kaggle` and
+relaunch the identical command line after each session — it skips what finished,
+resumes what did not, and stops *between* runs before the limit rather than
+being killed inside one. The two suites also still run separately
+(`scripts/run_ablations.py`, `scripts/run_baselines.py`), which is what the
+unified runner delegates to.
 
 Every stage forwards anything after its name to Hydra verbatim, so the same
 command line takes overrides:
@@ -755,9 +764,13 @@ python main.py finetune experiment.training.split_protocol=grouped_cv experiment
 ## 10. Analysis: ablations, baselines, figures
 
 ```bash
-python scripts/run_ablations.py               # component-wise variants, 5 seeds each
-python scripts/run_baselines.py               # linear probe, ImageNet frozen/unfrozen, ResNet-50, Swin-T, hierarchical CCE
+python scripts/run_experiments_suite.py --all # BOTH suites, resumable, one command
+python scripts/run_experiments_suite.py --status   # what is done, what is left
 python scripts/generate_plots.py              # figures + outputs/reports/summary_metrics.csv
+
+# ...or the two suites separately, which is what the unified runner delegates to
+python scripts/run_ablations.py               # component-wise variants, 5 seeds each
+python scripts/run_baselines.py               # the probe, the backbone comparison, the controls
 ```
 
 | Variant | What it removes | Selected by |
@@ -774,8 +787,32 @@ python scripts/generate_plots.py              # figures + outputs/reports/summar
 | `imagenet_frozen` | the self-supervised stage (ImageNet SwinV2, trunk frozen) | `experiment=control_imagenet_frozen` |
 | `resnet50` | ImageNet ResNet-50, supervised end to end | `experiment=baseline_resnet50` |
 | `swin_tiny` | ImageNet Swin-T, supervised end to end | `experiment=baseline_swin_tiny` |
+| `vit_small` | ImageNet **ViT-S/16 at 256 px**, supervised end to end | `experiment=baseline_vit_small` |
+| `swinv2_tiny` | ImageNet **SwinV2-T at 256 px** with the same flat head | `experiment=baseline_swinv2_tiny` |
+| `deit3_small` | the same ViT-S/16 geometry under DeiT III's recipe | `experiment=baseline_deit3_small` |
+| `convnext_tiny` | ImageNet ConvNeXt-T, parameter-matched to the trunk | `experiment=baseline_convnext_tiny` |
+| `efficientnetv2_s` | ImageNet EfficientNetV2-S, the accuracy-per-FLOP point | `experiment=baseline_efficientnetv2_s` |
 | `hierarchical_cce` | two-stage hierarchy, plain CCE, no MoE/attn/ArcFace | `experiment=baseline_hierarchical_cce` |
 | `leakage_grouped` *(dormant, opt-in)* | nothing architectural — the full model under photograph-disjoint folds; **not in the default suite and not a reported result** | `--variants leakage_grouped` |
+
+**`vit_small` and `swinv2_tiny` are one row pair, not two baselines.** The
+submitted abstract and introduction say SwinV2 while Table 1 says ViT-S/14, and
+the results section never says which produced the numbers. These two settle it:
+same flat two-head classifier, same 256 px input, same ImageNet-1k supervised
+initialisation, same optimiser, schedule, augmentation, split and seeds — the
+trunk is the only difference. `swinv2_supervised` is *not* the SwinV2 arm of
+that pair; it carries the full hierarchical head, so its gap to a ViT would mix
+backbone with head. Three legs together decompose the claim one factor at a
+time: `swinv2_tiny` (ImageNet trunk, flat head) → `swinv2_supervised` (ImageNet
+trunk, full head) → `full_model` (stage-1 trunk, full head).
+
+ViT-**S/16**, not S/14: timm ships no supervised ImageNet-1k ViT-S/14 — /14 is
+DINOv2's patch size and its weights are self-supervised, which would change the
+pretraining axis this row exists to hold fixed. The revision should say S/16.
+The ViT arms reach 256 px by interpolating their position embedding, so the
+input resolution is held fixed across the comparison rather than confounding it
+— which matters here because the crops are a median 61 × 61 px and are upsampled
+either way.
 
 `scripts/run_ablations.py` carries more variants than the table above
 (`wo_moe_capacity_matched`, `moe_fixed_router`, `moe_uniform_router`,
@@ -1012,7 +1049,7 @@ $SEED_OUTPUT_DIR/
     best_hierarchical_moe.pth  hierarchical_moe_final.pth
     split_manifest.npz  summary.json  test_predictions.npz
   ablations/{full_model,wo_moe,wo_margin_only,wo_angular_head,wo_residual,wo_kl,wo_cross_attn}/
-  baselines/{linear_probe,swinv2_supervised,resnet50,swin_tiny,hierarchical_cce}/
+  baselines/{linear_probe,swinv2_supervised,resnet50,swin_tiny,vit_small,swinv2_tiny,deit3_small,convnext_tiny,efficientnetv2_s,hierarchical_cce}/
   controls/imagenet_frozen/
   reports/summary_metrics.csv          # one row per variant, all metrics + cost
   metadata/seed_dataset.csv
@@ -1086,7 +1123,7 @@ as a measured one.
 ## 14. Testing and verification
 
 ```bash
-python -m pytest tests/ -q                 # 666 tests, no network access, ~60 s
+python -m pytest tests/ -q                 # 725 tests, no network access, ~45 s
 python -m pytest tests/test_segmentation.py -q        # stage 0: detection, splitting, crop policy, audit
 python -m pytest tests/test_stage1_pipeline.py -q     # view geometry, protocol, artifacts
 python -m pytest tests/test_stage1_correctness.py -q  # KoLeo, loss decomposition, provenance

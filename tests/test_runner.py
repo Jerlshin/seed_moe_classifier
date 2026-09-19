@@ -133,7 +133,8 @@ def test_each_ablation_disables_exactly_one_component(variant, flag):
 
 
 def test_baseline_suite_covers_the_requested_models_plus_the_missing_controls():
-    """The three submitted baselines, plus the three the suite could not do without.
+    """The submitted baselines, the controls the suite could not do without, and
+    the comparison backbones the review asked for.
 
     ``linear_probe`` answers the question a reviewer asks before any other --
     does the head machinery beat a linear layer on the same frozen features? --
@@ -145,16 +146,28 @@ def test_baseline_suite_covers_the_requested_models_plus_the_missing_controls():
     one and unfrozen in the other, neither reading a stage-1 checkpoint. Stage 1
     is the most expensive thing in the pipeline, and without the frozen arm there
     is no measurement of what it bought.
+
+    ``vit_small`` and ``swinv2_tiny`` are Reviewer 2's ViT-vs-SwinV2 table --
+    matched in head, resolution, schedule, split and seeds, so the trunk is the
+    only difference. ``deit3_small``, ``convnext_tiny`` and
+    ``efficientnetv2_s`` are Reviewer 1's "more competitive and diverse
+    baselines". An exact set rather than a subset check, because a comparison
+    table quietly losing a row is exactly the objection the review raised.
     """
     from scripts.run_baselines import BASELINE_VARIANTS
 
     assert sorted(spec.name for spec in BASELINE_VARIANTS) == [
+        "convnext_tiny",
+        "deit3_small",
+        "efficientnetv2_s",
         "hierarchical_cce",
         "imagenet_frozen",
         "linear_probe",
         "resnet50",
         "swin_tiny",
         "swinv2_supervised",
+        "swinv2_tiny",
+        "vit_small",
     ]
     for spec in BASELINE_VARIANTS:
         # The control is a control, not a baseline, and is named and grouped as
@@ -172,6 +185,42 @@ def test_the_imagenet_controls_never_receive_the_stage_one_checkpoint():
     from scripts.run_baselines import END_TO_END_BASELINES
 
     assert {"imagenet_frozen", "swinv2_supervised"} <= END_TO_END_BASELINES
+
+
+def test_every_supervised_backbone_baseline_owns_its_trunk():
+    """None of the comparison backbones may be handed the stage-1 encoder.
+
+    For a ResNet or an EfficientNet a SwinV2 state dict is merely ignored. The
+    dangerous one is ``swinv2_tiny``: it is shape-compatible with the published
+    encoder, so under ``checkpoint_strict: false`` it would load it, log one
+    line about it, and turn the "ImageNet SwinV2" arm of the backbone comparison
+    into a second self-supervised row.
+    """
+    from scripts.run_baselines import END_TO_END_BASELINES
+
+    assert {
+        "resnet50",
+        "swin_tiny",
+        "vit_small",
+        "swinv2_tiny",
+        "deit3_small",
+        "convnext_tiny",
+        "efficientnetv2_s",
+    } <= END_TO_END_BASELINES
+
+
+def test_the_vit_and_swinv2_arms_are_a_matched_pair():
+    """Reviewer 2 asked for a comparative table; a table needs both arms present
+    and differing in exactly one thing."""
+    from scripts.run_baselines import VARIANTS_BY_NAME
+
+    vit = VARIANTS_BY_NAME["vit_small"]
+    swin = VARIANTS_BY_NAME["swinv2_tiny"]
+    assert vit.group == swin.group == "baseline"
+    assert vit.experiment != swin.experiment
+    # Neither carries suite-level overrides: everything that differs lives in
+    # the experiment file, where it is recorded in the run's config snapshot.
+    assert vit.overrides == swin.overrides == []
 
 
 # ------------------------------------------------------- command construction
